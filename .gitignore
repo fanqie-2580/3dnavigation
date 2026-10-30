@@ -1,0 +1,32 @@
+# build artifacts
+build/
+install/
+log/
+devel/
+.colcon/
+*.pyc
+__pycache__/
+.cache/
+node_modules/
+
+# data / bags / models
+*.bag
+*.db3
+*.mcap
+*.onnx
+*.pt
+*.pth
+*.engine
+*.pcd
+*.ply
+rosbag2_*/
+data/
+
+# media / dumps
+*.mp4
+*.gif
+ros_logs/
+*_2026*/
+.DS_Store
+.env
+*.pem

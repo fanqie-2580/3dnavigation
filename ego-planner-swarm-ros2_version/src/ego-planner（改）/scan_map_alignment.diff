@@ -1,0 +1,678 @@
+diff --git a/planner/plan_env/include/plan_env/grid_map.h b/planner/plan_env/include/plan_env/grid_map.h
+index 9572506..55c4b04 100644
+--- a/planner/plan_env/include/plan_env/grid_map.h
++++ b/planner/plan_env/include/plan_env/grid_map.h
+@@ -58,6 +58,7 @@ struct MappingParameters
+   Eigen::Vector3d map_origin_, map_size_;
+   Eigen::Vector3d map_min_boundary_, map_max_boundary_; // map range in pos
+   Eigen::Vector3i map_voxel_num_;                       // map range in index
++  Eigen::Vector3i map_origin_idx_, map_bound_min_idx_, map_bound_max_idx_;
+   Eigen::Vector3d local_update_range_;
+   double resolution_, resolution_inv_;
+   double obstacles_inflation_;
+@@ -97,6 +98,9 @@ struct MappingParameters
+   double pointcloud_self_filter_z_down_;
+   double pointcloud_self_filter_z_up_;
+   double rolling_map_recenter_margin_;
++  bool map_sliding_en_;
++  int map_sliding_thresh_vox_;
++  std::string sensor_frame_;
+   bool project_pointcloud_to_ground_;
+ 
+   /* local map update and clear */
+@@ -118,6 +122,7 @@ struct MappingData
+ 
+   std::vector<double> occupancy_buffer_;
+   std::vector<char> occupancy_buffer_inflate_;
++  std::vector<int> occupancy_buffer_inflate_cnt_;
+ 
+   // camera position and pose data
+ 
+@@ -135,7 +140,10 @@ struct MappingData
+   bool occ_need_update_, local_updated_;
+   bool has_first_depth_;
+   bool has_odom_, has_cloud_;
++  bool use_cloud_update_;
+   uint64_t map_revision_;
++  Eigen::Vector3d ray_pos_;
++  Eigen::Matrix3d ray_r_m_;
+ 
+   // odom_depth_timeout_
+   rclcpp::Time last_occ_update_time_;
+@@ -245,6 +253,7 @@ private:
+   MappingParameters mp_;
+   MappingData md_;
+   std::vector<Eigen::Vector3i> footprint_offsets_;
++  std::vector<Eigen::Vector3i> inflation_offsets_;
+ 
+   // get depth image and camera pose
+   void depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+@@ -263,6 +272,15 @@ private:
+   void raycastProcess();
+   void clearAndInflateLocalMap();
+   void buildFootprintOffsets();
++  void buildInflationOffsets();
++  void updateSlidingMap(const Eigen::Vector3d &center);
++  void updateMapBoundaryFromIndex();
++  void resetAllMapData();
++  void resetCellByAddress(int address);
++  void hashAddressToGlobalIndex(int address, Eigen::Vector3i &id) const;
++  void applyOccupancyUpdate(const Eigen::Vector3i &id, double log_odds);
++  void updateInflation(const Eigen::Vector3i &id, int delta);
++  void raycastCloudProcess();
+ 
+   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
+   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
+@@ -271,6 +289,8 @@ private:
+                            const rclcpp::Time &stamp, geometry_msgs::msg::TransformStamped &transform);
+   bool getOdomPoseInMap(const nav_msgs::msg::Odometry &odom, Eigen::Vector3d &pos,
+                         Eigen::Quaterniond &orientation);
++  int getLocalIndex(int id, int dimension) const;
++  int toAddressLocal(const Eigen::Vector3i &id) const;
+ 
+   // typedef message_filters::sync_policies::ExactTime<sensor_msgs::Image,
+   // nav_msgs::Odometry> SyncPolicyImageOdom; typedef
+@@ -314,20 +334,22 @@ private:
+ 
+ inline int GridMap::toAddress(const Eigen::Vector3i &id)
+ {
+-  return id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + id(1) * mp_.map_voxel_num_(2) + id(2);
++  return getLocalIndex(id(0), 0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
++         getLocalIndex(id(1), 1) * mp_.map_voxel_num_(2) + getLocalIndex(id(2), 2);
+ }
+ 
+ inline int GridMap::toAddress(int &x, int &y, int &z)
+ {
+-  return x * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + y * mp_.map_voxel_num_(2) + z;
++  return getLocalIndex(x, 0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
++         getLocalIndex(y, 1) * mp_.map_voxel_num_(2) + getLocalIndex(z, 2);
+ }
+ 
+ inline void GridMap::boundIndex(Eigen::Vector3i &id)
+ {
+   Eigen::Vector3i id1;
+-  id1(0) = max(min(id(0), mp_.map_voxel_num_(0) - 1), 0);
+-  id1(1) = max(min(id(1), mp_.map_voxel_num_(1) - 1), 0);
+-  id1(2) = max(min(id(2), mp_.map_voxel_num_(2) - 1), 0);
++  id1(0) = max(min(id(0), mp_.map_bound_max_idx_(0)), mp_.map_bound_min_idx_(0));
++  id1(1) = max(min(id(1), mp_.map_bound_max_idx_(1)), mp_.map_bound_min_idx_(1));
++  id1(2) = max(min(id(2), mp_.map_bound_max_idx_(2)), mp_.map_bound_min_idx_(2));
+   id = id1;
+ }
+ 
+@@ -373,8 +395,7 @@ inline void GridMap::setOccupied(Eigen::Vector3d pos)
+   Eigen::Vector3i id;
+   posToIndex(pos, id);
+ 
+-  md_.occupancy_buffer_inflate_[id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
+-                                id(1) * mp_.map_voxel_num_(2) + id(2)] = 1;
++  applyOccupancyUpdate(id, mp_.clamp_max_log_);
+ }
+ 
+ inline void GridMap::setOccupancy(Eigen::Vector3d pos, double occ)
+@@ -391,7 +412,7 @@ inline void GridMap::setOccupancy(Eigen::Vector3d pos, double occ)
+   Eigen::Vector3i id;
+   posToIndex(pos, id);
+ 
+-  md_.occupancy_buffer_[toAddress(id)] = occ;
++  applyOccupancyUpdate(id, occ > 0.5 ? mp_.clamp_max_log_ : mp_.clamp_min_log_);
+ }
+ 
+ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
+@@ -407,8 +428,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
+ 
+ inline int GridMap::getOccupancy(Eigen::Vector3i id)
+ {
+-  if (id(0) < 0 || id(0) >= mp_.map_voxel_num_(0) || id(1) < 0 || id(1) >= mp_.map_voxel_num_(1) ||
+-      id(2) < 0 || id(2) >= mp_.map_voxel_num_(2))
++  if (!isInMap(id))
+     return -1;
+ 
+   return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+@@ -432,12 +452,13 @@ inline bool GridMap::isInMap(const Eigen::Vector3d &pos)
+ 
+ inline bool GridMap::isInMap(const Eigen::Vector3i &idx)
+ {
+-  if (idx(0) < 0 || idx(1) < 0 || idx(2) < 0)
++  if (idx(0) < mp_.map_bound_min_idx_(0) || idx(1) < mp_.map_bound_min_idx_(1) ||
++      idx(2) < mp_.map_bound_min_idx_(2))
+   {
+     return false;
+   }
+-  if (idx(0) > mp_.map_voxel_num_(0) - 1 || idx(1) > mp_.map_voxel_num_(1) - 1 ||
+-      idx(2) > mp_.map_voxel_num_(2) - 1)
++  if (idx(0) > mp_.map_bound_max_idx_(0) || idx(1) > mp_.map_bound_max_idx_(1) ||
++      idx(2) > mp_.map_bound_max_idx_(2))
+   {
+     return false;
+   }
+@@ -447,13 +468,13 @@ inline bool GridMap::isInMap(const Eigen::Vector3i &idx)
+ inline void GridMap::posToIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &id)
+ {
+   for (int i = 0; i < 3; ++i)
+-    id(i) = floor((pos(i) - mp_.map_origin_(i)) * mp_.resolution_inv_);
++    id(i) = floor(pos(i) * mp_.resolution_inv_);
+ }
+ 
+ inline void GridMap::indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos)
+ {
+   for (int i = 0; i < 3; ++i)
+-    pos(i) = (id(i) + 0.5) * mp_.resolution_ + mp_.map_origin_(i);
++    pos(i) = (id(i) + 0.5) * mp_.resolution_;
+ }
+ 
+ inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts)
+
+diff --git a/planner/plan_env/src/grid_map.cpp b/planner/plan_env/src/grid_map.cpp
+index 683c97b..4b39893 100644
+--- a/planner/plan_env/src/grid_map.cpp
++++ b/planner/plan_env/src/grid_map.cpp
+@@ -51,6 +51,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->declare_parameter("grid_map/pointcloud_self_filter_z_down", 0.0);
+   node_->declare_parameter("grid_map/pointcloud_self_filter_z_up", 0.0);
+   node_->declare_parameter("grid_map/rolling_map_recenter_margin", 1.0);
++  node_->declare_parameter("grid_map/map_sliding_en", true);
++  node_->declare_parameter("grid_map/map_sliding_thresh_vox", 20);
++  node_->declare_parameter("grid_map/sensor_frame", std::string(""));
+   node_->declare_parameter("grid_map/project_pointcloud_to_ground", false);
+   node_->declare_parameter("grid_map/visualization_truncate_height", -0.1);
+   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
+@@ -104,6 +107,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->get_parameter("grid_map/pointcloud_self_filter_z_down", mp_.pointcloud_self_filter_z_down_);
+   node_->get_parameter("grid_map/pointcloud_self_filter_z_up", mp_.pointcloud_self_filter_z_up_);
+   node_->get_parameter("grid_map/rolling_map_recenter_margin", mp_.rolling_map_recenter_margin_);
++  node_->get_parameter("grid_map/map_sliding_en", mp_.map_sliding_en_);
++  node_->get_parameter("grid_map/map_sliding_thresh_vox", mp_.map_sliding_thresh_vox_);
++  node_->get_parameter("grid_map/sensor_frame", mp_.sensor_frame_);
+   node_->get_parameter("grid_map/project_pointcloud_to_ground", mp_.project_pointcloud_to_ground_);
+   node_->get_parameter("grid_map/visualization_truncate_height", mp_.visualization_truncate_height_);
+   node_->get_parameter("grid_map/virtual_ceil_height", mp_.virtual_ceil_height_);
+@@ -135,7 +141,12 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+         "grid_map footprint parameters must be finite and explicitly positive "
+         "(offset and obstacle inflation may be zero)");
+   }
++  if (mp_.map_sliding_thresh_vox_ <= 0)
++    throw std::runtime_error("grid_map/map_sliding_thresh_vox must be positive");
++  if (mp_.sensor_frame_.empty())
++    throw std::runtime_error("grid_map/sensor_frame must name the physical ray origin frame");
+   buildFootprintOffsets();
++  buildInflationOffsets();
+ 
+   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
+   {
+@@ -143,7 +154,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   }
+ 
+   mp_.resolution_inv_ = 1 / mp_.resolution_;
+-  mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
+   mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
+ 
+   mp_.prob_hit_log_ = logit(mp_.p_hit_);
+@@ -162,8 +172,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   for (int i = 0; i < 3; ++i)
+     mp_.map_voxel_num_(i) = ceil(mp_.map_size_(i) / mp_.resolution_);
+ 
+-  mp_.map_min_boundary_ = mp_.map_origin_;
+-  mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
++  mp_.map_origin_idx_ = Eigen::Vector3i(
++      0, 0, static_cast<int>(std::floor((mp_.ground_height_ + 0.5 * mp_.map_size_(2)) * mp_.resolution_inv_)));
++  updateMapBoundaryFromIndex();
+ 
+   // initialize data buffers
+ 
+@@ -171,6 +182,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+ 
+   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
+   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
++  md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
+ 
+   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
+   md_.count_hit_ = vector<short>(buffer_size, 0);
+@@ -255,7 +267,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   md_.has_first_depth_ = false;
+   md_.has_odom_ = false;
+   md_.has_cloud_ = false;
++  md_.use_cloud_update_ = false;
+   md_.map_revision_ = 0;
++  md_.ray_pos_.setZero();
++  md_.ray_r_m_.setIdentity();
+   md_.image_cnt_ = 0;
+   md_.last_occ_update_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+ 
+@@ -349,15 +364,169 @@ void GridMap::buildFootprintOffsets()
+     throw std::runtime_error("Go2 footprint sampling produced no collision-check offsets");
+ }
+ 
+-void GridMap::resetBuffer()
++void GridMap::buildInflationOffsets()
++{
++  inflation_offsets_.clear();
++  const int xy_steps = static_cast<int>(std::ceil(mp_.obstacles_inflation_ / mp_.resolution_));
++  const int z_steps = static_cast<int>(std::ceil(mp_.pointcloud_vertical_inflation_ / mp_.resolution_));
++  for (int dx = -xy_steps; dx <= xy_steps; ++dx)
++    for (int dy = -xy_steps; dy <= xy_steps; ++dy)
++    {
++      if (std::hypot(dx * mp_.resolution_, dy * mp_.resolution_) >
++          mp_.obstacles_inflation_ + 0.5 * mp_.resolution_)
++        continue;
++      for (int dz = -z_steps; dz <= z_steps; ++dz)
++        inflation_offsets_.emplace_back(dx, dy, dz);
++    }
++
++  if (inflation_offsets_.empty())
++    throw std::runtime_error("grid_map obstacle inflation produced no offsets");
++}
++
++int GridMap::getLocalIndex(int id, int dimension) const
++{
++  int local = id % mp_.map_voxel_num_(dimension);
++  if (local < 0)
++    local += mp_.map_voxel_num_(dimension);
++  return local;
++}
++
++int GridMap::toAddressLocal(const Eigen::Vector3i &id) const
++{
++  return id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
++         id(1) * mp_.map_voxel_num_(2) + id(2);
++}
++
++void GridMap::updateMapBoundaryFromIndex()
++{
++  mp_.map_bound_min_idx_ = mp_.map_origin_idx_ - mp_.map_voxel_num_ / 2;
++  mp_.map_bound_max_idx_ = mp_.map_bound_min_idx_ + mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
++  mp_.map_min_boundary_ = mp_.map_bound_min_idx_.cast<double>() * mp_.resolution_;
++  mp_.map_max_boundary_ = (mp_.map_bound_max_idx_.cast<double>() + Eigen::Vector3d::Ones()) * mp_.resolution_;
++  mp_.map_origin_ = mp_.map_min_boundary_;
++}
++
++void GridMap::resetAllMapData()
++{
++  std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(),
++            mp_.clamp_min_log_ - mp_.unknown_flag_);
++  std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
++  std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
++  std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
++  std::fill(md_.count_hit_and_miss_.begin(), md_.count_hit_and_miss_.end(), 0);
++  std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
++  std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), -1);
++  std::queue<Eigen::Vector3i> empty;
++  std::swap(md_.cache_voxel_, empty);
++}
++
++void GridMap::hashAddressToGlobalIndex(int address, Eigen::Vector3i &id) const
++{
++  Eigen::Vector3i local;
++  local(0) = address / (mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2));
++  local(1) = (address - local(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2)) /
++             mp_.map_voxel_num_(2);
++  local(2) = address - local(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) -
++             local(1) * mp_.map_voxel_num_(2);
++  for (int dimension = 0; dimension < 3; ++dimension)
++  {
++    int distance = local(dimension) - getLocalIndex(mp_.map_bound_min_idx_(dimension), dimension);
++    if (distance < 0)
++      distance += mp_.map_voxel_num_(dimension);
++    id(dimension) = mp_.map_bound_min_idx_(dimension) + distance;
++  }
++}
++
++void GridMap::updateInflation(const Eigen::Vector3i &id, int delta)
++{
++  for (const Eigen::Vector3i &offset : inflation_offsets_)
++  {
++    const Eigen::Vector3i inflated = id + offset;
++    if (!isInMap(inflated))
++      continue;
++    const int address = toAddress(inflated);
++    md_.occupancy_buffer_inflate_cnt_[address] += delta;
++    if (md_.occupancy_buffer_inflate_cnt_[address] < 0)
++      throw std::runtime_error("grid_map inflation reference count underflow");
++    md_.occupancy_buffer_inflate_[address] =
++        md_.occupancy_buffer_inflate_cnt_[address] > 0 ? 1 : 0;
++  }
++}
++
++void GridMap::applyOccupancyUpdate(const Eigen::Vector3i &id, double log_odds)
+ {
+-  Eigen::Vector3d min_pos = mp_.map_min_boundary_;
+-  Eigen::Vector3d max_pos = mp_.map_max_boundary_;
++  if (!isInMap(id) || !std::isfinite(log_odds))
++    return;
++  const int address = toAddress(id);
++  const bool was_occupied = md_.occupancy_buffer_[address] > mp_.min_occupancy_log_;
++  const double clamped = std::clamp(log_odds, mp_.clamp_min_log_, mp_.clamp_max_log_);
++  const bool is_occupied = clamped > mp_.min_occupancy_log_;
++  md_.occupancy_buffer_[address] = clamped;
++  if (was_occupied != is_occupied)
++    updateInflation(id, is_occupied ? 1 : -1);
++}
+ 
+-  resetBuffer(min_pos, max_pos);
++void GridMap::resetCellByAddress(int address)
++{
++  Eigen::Vector3i id;
++  hashAddressToGlobalIndex(address, id);
++  if (md_.occupancy_buffer_[address] > mp_.min_occupancy_log_)
++    updateInflation(id, -1);
++  md_.occupancy_buffer_[address] = mp_.clamp_min_log_ - mp_.unknown_flag_;
++  md_.occupancy_buffer_inflate_[address] = 0;
++  md_.occupancy_buffer_inflate_cnt_[address] = 0;
++  md_.count_hit_[address] = 0;
++  md_.count_hit_and_miss_[address] = 0;
++  md_.flag_rayend_[address] = -1;
++  md_.flag_traverse_[address] = -1;
++}
+ 
+-  md_.local_bound_min_ = Eigen::Vector3i::Zero();
+-  md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
++void GridMap::updateSlidingMap(const Eigen::Vector3d &center)
++{
++  if (!mp_.map_sliding_en_ || !center.allFinite())
++    return;
++
++  Eigen::Vector3i new_origin;
++  posToIndex(center, new_origin);
++  const Eigen::Vector3i shift = new_origin - mp_.map_origin_idx_;
++  if (shift.cwiseAbs().maxCoeff() < mp_.map_sliding_thresh_vox_)
++    return;
++
++  if ((shift.cwiseAbs().array() >= mp_.map_voxel_num_.array()).any())
++  {
++    resetAllMapData();
++    mp_.map_origin_idx_ = new_origin;
++    updateMapBoundaryFromIndex();
++    md_.local_bound_min_ = mp_.map_bound_min_idx_;
++    md_.local_bound_max_ = mp_.map_bound_max_idx_;
++    return;
++  }
++
++  const Eigen::Vector3i old_min = mp_.map_bound_min_idx_;
++  const Eigen::Vector3i old_max = mp_.map_bound_max_idx_;
++  const Eigen::Vector3i new_min = new_origin - mp_.map_voxel_num_ / 2;
++  const Eigen::Vector3i new_max = new_min + mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
++  for (int x = old_min(0); x <= old_max(0); ++x)
++    for (int y = old_min(1); y <= old_max(1); ++y)
++      for (int z = old_min(2); z <= old_max(2); ++z)
++      {
++        if (x >= new_min(0) && x <= new_max(0) && y >= new_min(1) && y <= new_max(1) &&
++            z >= new_min(2) && z <= new_max(2))
++          continue;
++        resetCellByAddress(toAddress(Eigen::Vector3i(x, y, z)));
++      }
++
++  mp_.map_origin_idx_ = new_origin;
++  updateMapBoundaryFromIndex();
++  md_.local_bound_min_ = mp_.map_bound_min_idx_;
++  md_.local_bound_max_ = mp_.map_bound_max_idx_;
++}
++
++void GridMap::resetBuffer()
++{
++  resetAllMapData();
++  md_.local_bound_min_ = mp_.map_bound_min_idx_;
++  md_.local_bound_max_ = mp_.map_bound_max_idx_;
+ }
+ 
+ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
+@@ -370,12 +539,13 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
+   boundIndex(min_id);
+   boundIndex(max_id);
+ 
+-  /* reset occ and dist buffer */
++  /* Reset raw occupancy through the ownership-aware path so inflation counts
++   * remain consistent with the raw layer. */
+   for (int x = min_id(0); x <= max_id(0); ++x)
+     for (int y = min_id(1); y <= max_id(1); ++y)
+       for (int z = min_id(2); z <= max_id(2); ++z)
+       {
+-        md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
++        applyOccupancyUpdate(Eigen::Vector3i(x, y, z), mp_.clamp_min_log_);
+       }
+ }
+ 
+@@ -693,6 +863,78 @@ void GridMap::raycastProcess()
+   }
+ }
+ 
++void GridMap::raycastCloudProcess()
++{
++  if (!md_.use_cloud_update_ || md_.proj_points_cnt <= 0 || !md_.ray_pos_.allFinite() ||
++      !isInMap(md_.ray_pos_))
++    return;
++
++  ++md_.raycast_num_;
++  RayCaster raycaster;
++  const Eigen::Vector3d half(0.5, 0.5, 0.5);
++  Eigen::Vector3d min_point = md_.ray_pos_;
++  Eigen::Vector3d max_point = md_.ray_pos_;
++
++  for (int point_id = 0; point_id < md_.proj_points_cnt; ++point_id)
++  {
++    const Eigen::Vector3d endpoint = md_.proj_points_[point_id];
++    if (!endpoint.allFinite() || !isInMap(endpoint))
++      continue;
++
++    const int endpoint_address = setCacheOccupancy(endpoint, 1);
++    if (endpoint_address == INVALID_IDX)
++      continue;
++    if (md_.flag_rayend_[endpoint_address] == md_.raycast_num_)
++      continue;
++    md_.flag_rayend_[endpoint_address] = md_.raycast_num_;
++
++    min_point = min_point.cwiseMin(endpoint);
++    max_point = max_point.cwiseMax(endpoint);
++    raycaster.setInput(endpoint * mp_.resolution_inv_, md_.ray_pos_ * mp_.resolution_inv_);
++
++    Eigen::Vector3d ray_index;
++    while (raycaster.step(ray_index))
++    {
++      const Eigen::Vector3d traversed = (ray_index + half) * mp_.resolution_;
++      if (!isInMap(traversed))
++        break;
++      const int traversed_address = setCacheOccupancy(traversed, 0);
++      if (traversed_address == INVALID_IDX)
++        continue;
++      if (md_.flag_traverse_[traversed_address] == md_.raycast_num_)
++        break;
++      md_.flag_traverse_[traversed_address] = md_.raycast_num_;
++    }
++  }
++
++  bool applied_update = false;
++  while (!md_.cache_voxel_.empty())
++  {
++    const Eigen::Vector3i id = md_.cache_voxel_.front();
++    md_.cache_voxel_.pop();
++    const int address = toAddress(id);
++    const int hit_count = md_.count_hit_[address];
++    const int observation_count = md_.count_hit_and_miss_[address];
++    md_.count_hit_[address] = 0;
++    md_.count_hit_and_miss_[address] = 0;
++    if (observation_count <= 0)
++      continue;
++
++    const double update = hit_count >= observation_count - hit_count ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
++    applyOccupancyUpdate(id, md_.occupancy_buffer_[address] + update);
++    applied_update = true;
++  }
++
++  if (!applied_update)
++    return;
++
++  posToIndex(min_point, md_.local_bound_min_);
++  posToIndex(max_point, md_.local_bound_max_);
++  boundIndex(md_.local_bound_min_);
++  boundIndex(md_.local_bound_max_);
++  md_.local_updated_ = true;
++}
++
+ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen::Vector3d &camera_pt)
+ {
+   Eigen::Vector3d diff = pt - camera_pt;
+@@ -871,6 +1113,20 @@ void GridMap::updateOccupancyCallback()
+   }
+   md_.last_occ_update_time_ = node_->now();
+ 
++  if (md_.use_cloud_update_)
++  {
++    raycastCloudProcess();
++    if (md_.local_updated_)
++    {
++      md_.has_cloud_ = true;
++      ++md_.map_revision_;
++    }
++    md_.occ_need_update_ = false;
++    md_.local_updated_ = false;
++    md_.use_cloud_update_ = false;
++    return;
++  }
++
+   /* update occupancy */
+   // ros::Time t1, t2, t3, t4;
+   // t1 = ros::Time::now();
+@@ -991,46 +1247,81 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+     latest_cloud.swap(transformed_cloud);
+   }
+ 
+-  md_.has_cloud_ = true;
+-
+-  if (!md_.has_odom_)
++  if (!mp_.transform_cloud_to_frame_ && !img->header.frame_id.empty() &&
++      img->header.frame_id != mp_.frame_id_)
+   {
+-    std::cout << "no odom!" << std::endl;
++    RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                          "Reject pointcloud: cloud frame %s is not %s and transform_cloud_to_frame is false.",
++                          img->header.frame_id.c_str(), mp_.frame_id_.c_str());
+     return;
+   }
+ 
+-  if (latest_cloud.points.size() == 0)
++  geometry_msgs::msg::TransformStamped sensor_transform;
++  if (!lookupTransformSafe(mp_.frame_id_, mp_.sensor_frame_, rclcpp::Time(img->header.stamp),
++                           sensor_transform))
++  {
++    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                         "Reject pointcloud: no timestamped sensor pose from %s to %s.",
++                         mp_.sensor_frame_.c_str(), mp_.frame_id_.c_str());
+     return;
+-
+-  if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
++  }
++  md_.ray_pos_ = Eigen::Vector3d(sensor_transform.transform.translation.x,
++                                 sensor_transform.transform.translation.y,
++                                 sensor_transform.transform.translation.z);
++  md_.ray_r_m_ = Eigen::Quaterniond(sensor_transform.transform.rotation.w,
++                                    sensor_transform.transform.rotation.x,
++                                    sensor_transform.transform.rotation.y,
++                                    sensor_transform.transform.rotation.z)
++                     .toRotationMatrix();
++  if (!md_.ray_pos_.allFinite())
+     return;
+ 
+-  // In real-world pointcloud-only mode, the robot often operates far from the
+-  // global origin. Keep the XY map bounds centered around the robot so
+-  // "out of map" is not misread as "inside an obstacle".
+-  const double rolling_margin = mp_.rolling_map_recenter_margin_;
+-  bool recenter_xy = false;
+-  for (int axis = 0; axis < 2; ++axis)
++  updateSlidingMap(md_.ray_pos_);
++  if (!isInMap(md_.ray_pos_))
+   {
+-    if (md_.camera_pos_(axis) < mp_.map_min_boundary_(axis) + mp_.local_update_range_(axis) + rolling_margin ||
+-        md_.camera_pos_(axis) > mp_.map_max_boundary_(axis) - mp_.local_update_range_(axis) - rolling_margin)
+-    {
+-      recenter_xy = true;
+-      break;
+-    }
++    RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                          "Reject pointcloud: timestamped sensor origin is outside the active map.");
++    return;
+   }
+ 
+-  if (recenter_xy)
++  if (latest_cloud.points.size() == 0)
++    return;
++
++  md_.proj_points_cnt = 0;
++  for (const pcl::PointXYZ &point : latest_cloud.points)
+   {
+-    mp_.map_origin_(0) = md_.camera_pos_(0) - mp_.map_size_(0) / 2.0;
+-    mp_.map_origin_(1) = md_.camera_pos_(1) - mp_.map_size_(1) / 2.0;
+-    mp_.map_min_boundary_ = mp_.map_origin_;
+-    mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
+-    resetBuffer();
++    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
++      continue;
++    const Eigen::Vector3d endpoint(point.x, point.y, point.z);
++    const Eigen::Vector3d deviation = endpoint - md_.ray_pos_;
++    const double range = deviation.norm();
++    const double range_xy = deviation.head<2>().norm();
++    if (range < mp_.min_ray_length_ || range > mp_.max_ray_length_ ||
++        !isInMap(endpoint) ||
++        std::abs(deviation.x()) > mp_.local_update_range_(0) ||
++        std::abs(deviation.y()) > mp_.local_update_range_(1) ||
++        std::abs(deviation.z()) > mp_.local_update_range_(2))
++      continue;
++    if (mp_.pointcloud_body_clearance_radius_ > 0.0 &&
++        range_xy < mp_.pointcloud_body_clearance_radius_ &&
++        deviation.z() >= -mp_.pointcloud_self_filter_z_down_ &&
++        deviation.z() <= mp_.pointcloud_self_filter_z_up_)
++      continue;
++    if (md_.proj_points_cnt >= static_cast<int>(md_.proj_points_.size()))
++      md_.proj_points_.push_back(endpoint);
++    else
++      md_.proj_points_[md_.proj_points_cnt] = endpoint;
++    ++md_.proj_points_cnt;
+   }
+ 
+-  this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
+-                    md_.camera_pos_ + mp_.local_update_range_);
++  if (md_.proj_points_cnt == 0)
++    return;
++
++  md_.camera_pos_ = md_.ray_pos_;
++  md_.camera_r_m_ = md_.ray_r_m_;
++  md_.use_cloud_update_ = true;
++  md_.occ_need_update_ = true;
++  return;
+ 
+   pcl::PointXYZ pt;
+   Eigen::Vector3d p3d, p3d_inf;
+
+diff --git a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+index 3bb2d78..c0a7678 100644
+--- a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+@@ -97,6 +97,9 @@ def generate_launch_description():
+     pointcloud_self_filter_z_down = LaunchConfiguration('pointcloud_self_filter_z_down')
+     pointcloud_self_filter_z_up = LaunchConfiguration('pointcloud_self_filter_z_up')
+     rolling_map_recenter_margin = LaunchConfiguration('rolling_map_recenter_margin')
++    map_sliding_en = LaunchConfiguration('map_sliding_en')
++    map_sliding_thresh_vox = LaunchConfiguration('map_sliding_thresh_vox')
++    sensor_frame = LaunchConfiguration('sensor_frame')
+     virtual_ceil_height = LaunchConfiguration('virtual_ceil_height')
+     visualization_truncate_height = LaunchConfiguration('visualization_truncate_height')
+     pointcloud_vertical_inflation = LaunchConfiguration('pointcloud_vertical_inflation')
+@@ -196,6 +199,9 @@ def generate_launch_description():
+             {'grid_map/pointcloud_self_filter_z_down': ParameterValue(pointcloud_self_filter_z_down, value_type=float)},
+             {'grid_map/pointcloud_self_filter_z_up': ParameterValue(pointcloud_self_filter_z_up, value_type=float)},
+             {'grid_map/rolling_map_recenter_margin': ParameterValue(rolling_map_recenter_margin, value_type=float)},
++            {'grid_map/map_sliding_en': ParameterValue(map_sliding_en, value_type=bool)},
++            {'grid_map/map_sliding_thresh_vox': ParameterValue(map_sliding_thresh_vox, value_type=int)},
++            {'grid_map/sensor_frame': sensor_frame},
+             {'grid_map/project_pointcloud_to_ground': ParameterValue(project_pointcloud_to_ground, value_type=bool)},
+             {'grid_map/virtual_ceil_height': ParameterValue(virtual_ceil_height, value_type=float)},
+             {'grid_map/visualization_truncate_height': ParameterValue(visualization_truncate_height, value_type=float)},
+@@ -458,6 +464,9 @@ def generate_launch_description():
+         DeclareLaunchArgument('pointcloud_self_filter_z_down', default_value='0.25', description='Static robot self-filter extent below odometry/body height'),
+         DeclareLaunchArgument('pointcloud_self_filter_z_up', default_value='0.25', description='Static robot self-filter extent above odometry/body height'),
+         DeclareLaunchArgument('rolling_map_recenter_margin', default_value='1.0', description='Distance to the map usable boundary that deterministically recenters the rolling pointcloud map'),
++        DeclareLaunchArgument('map_sliding_en', default_value='true', description='Enable SCAN-style circular sliding occupancy map'),
++        DeclareLaunchArgument('map_sliding_thresh_vox', default_value='20', description='Circular-map shift threshold in voxels'),
++        DeclareLaunchArgument('sensor_frame', default_value=base_frame, description='Physical ray-origin frame; timestamped TF to frame_id is required for every pointcloud update'),
+         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='Extra vertical inflation applied to pointcloud obstacles; 0.10 m matches the 3d-navi stair-friendly Z inflation scale'),
+         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
+         DeclareLaunchArgument('dist0', default_value='0.8', description='Collision cost distance used by EGO optimization; 0.4 matches 3d-navi safety margin, gives turns adequate clearance without blocking 0.7 m doors'),
+

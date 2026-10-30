@@ -1,0 +1,36 @@
+<launch>
+  
+  <node pkg="lego_loam_bor" exec="mcl_feature" output="screen" respawn="false">
+    <param from="$(find-pkg-share p2p_move_base)/config/p2p_move_base_localization.yaml" />
+    <remap from="/lslidar_point_cloud" to="/livox/lidar"/>
+    <remap from="/odom" to="/utlidar/robot_odomf"/>
+  </node>
+
+  <!--- TF -->
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="sensor2baselink"  args="0.1870 0 0.0803 0 0.2268928 0 base_link livox_frame" />
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="sensor2baselink"  args="0 0 -0.15 0 0 0 base_link base_footprint" />
+
+  <node pkg="mcl_3dl" exec="mcl_3dl" output="screen" respawn="false">
+    <param from="$(find-pkg-share p2p_move_base)/config/p2p_move_base_localization.yaml" />
+    <param name="map_frame" value="map" />
+    <param name="publish_tf" value="true" />
+    <remap from="cloud" to="/livox/lidar" />
+    <remap from="odom" to="/utlidar/robot_odomf" />
+  </node>
+  
+  <!--name argument is not required, because it will overwrite all node name in the exec-->
+  <node pkg="global_planner" exec="global_planner_node" output="screen" respawn="false">
+    <param from="$(find-pkg-share p2p_move_base)/config/p2p_move_base_localization.yaml" />
+  </node>
+
+  <!--name argument is not required, because it will overwrite all node name in the exec-->
+  <node pkg="p2p_move_base" exec="p2p_move_base_node" output="screen" respawn="false">
+    <param from="$(find-pkg-share p2p_move_base)/config/p2p_move_base_localization.yaml" />
+  </node>
+  <node pkg="p2p_move_base" exec="clicked2goal.py" output="screen" respawn="false"/>
+  
+
+  <let name="rviz_config" value="$(find-pkg-share p2p_move_base)/rviz/p2p_move_base_localization.rviz"/>
+  <node name="rviz2" pkg="rviz2" exec="rviz2" args="-d $(var rviz_config)"/>
+
+</launch>

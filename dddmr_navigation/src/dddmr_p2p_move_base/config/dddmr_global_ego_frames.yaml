@@ -1,0 +1,5 @@
+perception_3d_global:
+  ros__parameters:
+    # Docker-side DDDMR global planning follows the external FAST-LIO TF chain.
+    global_frame: "map"
+    robot_base_frame: "base_link"

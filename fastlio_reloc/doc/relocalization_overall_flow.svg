@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="520" viewBox="0 0 1180 520">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3a4a"/>
+    </marker>
+    <style>
+      .title { font: 700 28px sans-serif; fill: #172033; }
+      .label { font: 600 18px sans-serif; fill: #172033; }
+      .text { font: 15px sans-serif; fill: #3b4658; }
+      .small { font: 13px sans-serif; fill: #526071; }
+      .box { fill: #ffffff; stroke: #6c7a89; stroke-width: 2; rx: 10; }
+      .blue { fill: #eaf3ff; stroke: #4d83c4; }
+      .green { fill: #edf8f1; stroke: #52a66f; }
+      .orange { fill: #fff2df; stroke: #d08a2d; }
+      .red { fill: #fff0f0; stroke: #c95c5c; }
+      .line { stroke: #2f3a4a; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #6c7a89; stroke-width: 1.8; stroke-dasharray: 7 5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1180" height="520" fill="#f7f9fc"/>
+  <text x="40" y="50" class="title">图 1 置信度感知与子图检索重定位总体流程</text>
+
+  <rect x="50" y="105" width="190" height="92" class="box blue"/>
+  <text x="78" y="137" class="label">FAST-LIO</text>
+  <text x="78" y="165" class="text">输出里程计与点云</text>
+  <text x="78" y="187" class="small">/Odometry_loc, /cloud_registered_1</text>
+
+  <rect x="300" y="105" width="210" height="92" class="box green"/>
+  <text x="328" y="137" class="label">局部 ICP 跟踪</text>
+  <text x="328" y="165" class="text">根据预测位姿裁剪子图</text>
+  <text x="328" y="187" class="small">快速修正 map->odom</text>
+
+  <rect x="570" y="105" width="210" height="92" class="box orange"/>
+  <text x="598" y="137" class="label">定位质量评价</text>
+  <text x="598" y="165" class="text">fitness / RMSE / 跳变</text>
+  <text x="598" y="187" class="small">判断是否可信</text>
+
+  <rect x="850" y="85" width="250" height="135" class="box red"/>
+  <text x="878" y="122" class="label">自动重定位</text>
+  <text x="878" y="152" class="text">FPFH/RANSAC 粗配准</text>
+  <text x="878" y="176" class="text">Top-K 候选 ICP 精配准</text>
+  <text x="878" y="200" class="small">定位失效或无初始位姿时触发</text>
+
+  <rect x="340" y="305" width="230" height="92" class="box blue"/>
+  <text x="368" y="337" class="label">全局地图子图库</text>
+  <text x="368" y="365" class="text">地图切分为重叠子图</text>
+  <text x="368" y="387" class="small">预计算法向量与 FPFH</text>
+
+  <rect x="670" y="305" width="230" height="92" class="box green"/>
+  <text x="698" y="337" class="label">结果验证</text>
+  <text x="698" y="365" class="text">候选差异与连续帧一致</text>
+  <text x="698" y="387" class="small">通过后才更新全局位姿</text>
+
+  <line x1="240" y1="151" x2="300" y2="151" class="line"/>
+  <line x1="510" y1="151" x2="570" y2="151" class="line"/>
+  <line x1="780" y1="151" x2="850" y2="151" class="line"/>
+  <line x1="975" y1="220" x2="810" y2="305" class="line"/>
+  <line x1="670" y1="351" x2="570" y2="351" class="dash"/>
+  <line x1="455" y1="305" x2="850" y2="205" class="dash"/>
+  <line x1="785" y1="305" x2="675" y2="197" class="dash"/>
+
+  <text x="54" y="470" class="text">正常情况下系统依赖 FAST-LIO 预测和局部 ICP 保持实时定位；当质量评价判定定位退化或初始位姿缺失时，进入子图特征检索重定位流程。</text>
+</svg>

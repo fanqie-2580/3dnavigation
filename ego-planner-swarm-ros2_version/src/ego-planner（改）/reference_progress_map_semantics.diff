@@ -1,0 +1,1150 @@
+
+diff --git a/planner/plan_env/include/plan_env/grid_map.h b/planner/plan_env/include/plan_env/grid_map.h
+index a10a9f6..9572506 100644
+--- a/planner/plan_env/include/plan_env/grid_map.h
++++ b/planner/plan_env/include/plan_env/grid_map.h
+@@ -94,6 +94,9 @@ struct MappingParameters
+   double pointcloud_vertical_inflation_;
+   double pointcloud_min_relative_height_;
+   double pointcloud_body_clearance_radius_;
++  double pointcloud_self_filter_z_down_;
++  double pointcloud_self_filter_z_up_;
++  double rolling_map_recenter_margin_;
+   bool project_pointcloud_to_ground_;
+ 
+   /* local map update and clear */
+@@ -132,6 +135,7 @@ struct MappingData
+   bool occ_need_update_, local_updated_;
+   bool has_first_depth_;
+   bool has_odom_, has_cloud_;
++  uint64_t map_revision_;
+ 
+   // odom_depth_timeout_
+   rclcpp::Time last_occ_update_time_;
+@@ -177,6 +181,7 @@ public:
+   {
+     FootprintStatus status{FootprintStatus::INVALID_INPUT};
+     Eigen::Vector3d sample_position{Eigen::Vector3d::Zero()};
++    Eigen::Vector3d cylinder_center{Eigen::Vector3d::Zero()};
+     int cylinder_index{-1};
+   };
+ 
+@@ -223,7 +228,8 @@ public:
+   void publishDepth();
+ 
+   bool hasDepthObservation();
+-  bool hasMapObservation() const { return md_.has_first_depth_ || md_.has_cloud_; }
++  bool hasMapObservation() const { return md_.map_revision_ > 0; }
++  uint64_t getMapRevision() const { return md_.map_revision_; }
+   bool odomValid();
+   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
+   inline double getResolution();
+
+diff --git a/planner/plan_env/src/grid_map.cpp b/planner/plan_env/src/grid_map.cpp
+index 1f37daa..683c97b 100644
+--- a/planner/plan_env/src/grid_map.cpp
++++ b/planner/plan_env/src/grid_map.cpp
+@@ -48,6 +48,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->declare_parameter("grid_map/pointcloud_vertical_inflation", 0.1);
+   node_->declare_parameter("grid_map/pointcloud_min_relative_height", -1000.0);
+   node_->declare_parameter("grid_map/pointcloud_body_clearance_radius", 0.0);
++  node_->declare_parameter("grid_map/pointcloud_self_filter_z_down", 0.0);
++  node_->declare_parameter("grid_map/pointcloud_self_filter_z_up", 0.0);
++  node_->declare_parameter("grid_map/rolling_map_recenter_margin", 1.0);
+   node_->declare_parameter("grid_map/project_pointcloud_to_ground", false);
+   node_->declare_parameter("grid_map/visualization_truncate_height", -0.1);
+   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
+@@ -98,6 +101,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->get_parameter("grid_map/pointcloud_vertical_inflation", mp_.pointcloud_vertical_inflation_);
+   node_->get_parameter("grid_map/pointcloud_min_relative_height", mp_.pointcloud_min_relative_height_);
+   node_->get_parameter("grid_map/pointcloud_body_clearance_radius", mp_.pointcloud_body_clearance_radius_);
++  node_->get_parameter("grid_map/pointcloud_self_filter_z_down", mp_.pointcloud_self_filter_z_down_);
++  node_->get_parameter("grid_map/pointcloud_self_filter_z_up", mp_.pointcloud_self_filter_z_up_);
++  node_->get_parameter("grid_map/rolling_map_recenter_margin", mp_.rolling_map_recenter_margin_);
+   node_->get_parameter("grid_map/project_pointcloud_to_ground", mp_.project_pointcloud_to_ground_);
+   node_->get_parameter("grid_map/visualization_truncate_height", mp_.visualization_truncate_height_);
+   node_->get_parameter("grid_map/virtual_ceil_height", mp_.virtual_ceil_height_);
+@@ -119,7 +125,11 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+       !std::isfinite(mp_.footprint_radius_) || mp_.footprint_radius_ <= 0.0 ||
+       !std::isfinite(mp_.footprint_offset_) || mp_.footprint_offset_ < 0.0 ||
+       !std::isfinite(mp_.footprint_z_down_) || mp_.footprint_z_down_ < 0.0 ||
+-      !std::isfinite(mp_.footprint_z_up_) || mp_.footprint_z_up_ <= 0.0)
++      !std::isfinite(mp_.footprint_z_up_) || mp_.footprint_z_up_ <= 0.0 ||
++      !std::isfinite(mp_.pointcloud_body_clearance_radius_) || mp_.pointcloud_body_clearance_radius_ < 0.0 ||
++      !std::isfinite(mp_.pointcloud_self_filter_z_down_) || mp_.pointcloud_self_filter_z_down_ < 0.0 ||
++      !std::isfinite(mp_.pointcloud_self_filter_z_up_) || mp_.pointcloud_self_filter_z_up_ < 0.0 ||
++      !std::isfinite(mp_.rolling_map_recenter_margin_) || mp_.rolling_map_recenter_margin_ < 0.0)
+   {
+     throw std::runtime_error(
+         "grid_map footprint parameters must be finite and explicitly positive "
+@@ -245,6 +255,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   md_.has_first_depth_ = false;
+   md_.has_odom_ = false;
+   md_.has_cloud_ = false;
++  md_.map_revision_ = 0;
+   md_.image_cnt_ = 0;
+   md_.last_occ_update_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+ 
+@@ -288,6 +299,7 @@ GridMap::FootprintCollisionResult GridMap::checkFootprint(
+       {
+         result.status = FootprintStatus::OUT_OF_MAP;
+         result.sample_position = sample;
++        result.cylinder_center = centers[cylinder];
+         result.cylinder_index = cylinder;
+         return result;
+       }
+@@ -298,6 +310,7 @@ GridMap::FootprintCollisionResult GridMap::checkFootprint(
+       {
+         result.status = FootprintStatus::OCCUPIED;
+         result.sample_position = sample;
++        result.cylinder_center = centers[cylinder];
+         result.cylinder_index = cylinder;
+         return result;
+       }
+@@ -867,9 +880,13 @@ void GridMap::updateOccupancyCallback()
+   raycastProcess();
+   // t3 = ros::Time::now();
+ 
+-  if (md_.local_updated_)
++  const bool fused_local_map = md_.local_updated_;
++  if (fused_local_map)
+     clearAndInflateLocalMap();
+ 
++  if (fused_local_map && md_.has_first_depth_)
++    ++md_.map_revision_;
++
+   // t4 = ros::Time::now();
+ 
+   // cout << setprecision(7);
+@@ -991,7 +1008,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+   // In real-world pointcloud-only mode, the robot often operates far from the
+   // global origin. Keep the XY map bounds centered around the robot so
+   // "out of map" is not misread as "inside an obstacle".
+-  const double rolling_margin = 1.0;
++  const double rolling_margin = mp_.rolling_map_recenter_margin_;
+   bool recenter_xy = false;
+   for (int axis = 0; axis < 2; ++axis)
+   {
+@@ -1049,18 +1066,14 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+       continue;
+ 
+     if (mp_.pointcloud_body_clearance_radius_ > 0.0 &&
+-        point_dist_xy < mp_.pointcloud_body_clearance_radius_)
++        point_dist_xy < mp_.pointcloud_body_clearance_radius_ &&
++        relative_z >= -mp_.pointcloud_self_filter_z_down_ &&
++        relative_z <= mp_.pointcloud_self_filter_z_up_)
+       continue;
+ 
+     if (mp_.max_ray_length_ > 0.0 && point_dist > mp_.max_ray_length_)
+       continue;
+ 
+-    // In DDDMR pointcloud-only mode, suppress very low returns relative to the
+-    // robot so flat support surfaces in /cloud_registered are less likely to
+-    // inflate into the local trajectory tail.
+-    if (relative_z < mp_.pointcloud_min_relative_height_)
+-      continue;
+-
+     if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
+         fabs(devi(2)) < mp_.local_update_range_(2))
+     {
+@@ -1127,6 +1140,8 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
+       }
+   }
++
++  ++md_.map_revision_;
+ }
+ 
+ bool GridMap::lookupTransformSafe(const std::string &target_frame, const std::string &source_frame,
+
+diff --git a/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h b/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
+index 1d146b9..572a981 100644
+--- a/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
++++ b/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
+@@ -131,6 +131,8 @@ namespace ego_planner
+     double estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
+     double estimateControlPointYaw(const Eigen::MatrixXd &points, int index) const;
+     bool footprintOccupied(const Eigen::Vector3d &position, double yaw) const;
++    bool footprintCollision(const Eigen::Vector3d &position, double yaw,
++                            GridMap::FootprintCollisionResult &result) const;
+     fast_planner::ObjPredictor::Ptr moving_objs_;
+     SwarmTrajData *swarm_trajs_{NULL}; // Can not use shared_ptr and no need to free
+     int drone_id_;
+
+diff --git a/planner/bspline_opt/src/bspline_optimizer.cpp b/planner/bspline_opt/src/bspline_optimizer.cpp
+index d208e65..91cd9c5 100644
+--- a/planner/bspline_opt/src/bspline_optimizer.cpp
++++ b/planner/bspline_opt/src/bspline_optimizer.cpp
+@@ -80,6 +80,19 @@ namespace ego_planner
+       return true;
+     return !grid_map_->isFootprintFree(position, yaw);
+   }
++
++  bool BsplineOptimizer::footprintCollision(
++      const Eigen::Vector3d &position, double yaw,
++      GridMap::FootprintCollisionResult &result) const
++  {
++    if (!grid_map_)
++    {
++      result.status = GridMap::FootprintStatus::INVALID_INPUT;
++      return true;
++    }
++    result = grid_map_->checkFootprint(position, yaw);
++    return result.status != GridMap::FootprintStatus::FREE;
++  }
+ 
+   void BsplineOptimizer::setControlPoints(const Eigen::MatrixXd &points)
+   {
+@@ -769,26 +782,33 @@ namespace ego_planner
+           double length = (intersection_point - init_points.col(j)).norm();
+           if (length > 1e-5)
+           {
+-            cps_.flag_temp[j] = true;
+-            // 逐步进行采样
++            cps_.flag_temp[j] = true;
++            bool contact_found = false;
++            // 逐步进行采样
+             for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
+             {
+               // 通过线性插值计算采样点位置
+               const Eigen::Vector3d sample =
+                   (a / length) * intersection_point + (1 - a / length) * init_points.col(j);
+-              occ = footprintOccupied(sample, estimateControlPointYaw(init_points, j));
+-
+-              if (occ || a < grid_map_->getResolution())
+-              {
+-                if (occ)
+-                  a += grid_map_->getResolution();
+-                // 记录基点并计算到控制点的方向
+-                cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * init_points.col(j));
+-                cps_.direction[j].push_back((intersection_point - init_points.col(j)).normalized());
+-                // cout << "A " << j << endl;
+-                break;
+-              }
+-            }
++              GridMap::FootprintCollisionResult collision;
++              occ = footprintCollision(sample, estimateControlPointYaw(init_points, j), collision);
++
++              if (occ)
++              {
++                const Eigen::Vector3d contact_direction = collision.sample_position - init_points.col(j);
++                if (contact_direction.norm() <= 1e-6)
++                {
++                  got_intersection_id = -1;
++                  break;
++                }
++                cps_.base_point[j].push_back(collision.sample_position);
++                cps_.direction[j].push_back(contact_direction.normalized());
++                contact_found = true;
++                break;
++              }
++            }
++            if (!contact_found)
++              got_intersection_id = -1;
+           }
+           else
+           {
+@@ -1491,22 +1511,31 @@ namespace ego_planner
+             double length = (intersection_point - cps_.points.col(j)).norm();
+             if (length > 1e-5)
+             {
+-              cps_.flag_temp[j] = true;
+-              for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
++              cps_.flag_temp[j] = true;
++              bool contact_found = false;
++              for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
+               {
+                 const Eigen::Vector3d sample =
+                     (a / length) * intersection_point + (1 - a / length) * cps_.points.col(j);
+-                bool occ = footprintOccupied(sample, estimateControlPointYaw(cps_.points, j));
+-
+-                if (occ || a < grid_map_->getResolution())
+-                {
+-                  if (occ)
+-                    a += grid_map_->getResolution();
+-                  cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
+-                  cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+-                  break;
+-                }
+-              }
++                GridMap::FootprintCollisionResult collision;
++                bool occ = footprintCollision(sample, estimateControlPointYaw(cps_.points, j), collision);
++
++                if (occ)
++                {
++                  const Eigen::Vector3d contact_direction = collision.sample_position - cps_.points.col(j);
++                  if (contact_direction.norm() <= 1e-6)
++                  {
++                    got_intersection_id = -1;
++                    break;
++                  }
++                  cps_.base_point[j].push_back(collision.sample_position);
++                  cps_.direction[j].push_back(contact_direction.normalized());
++                  contact_found = true;
++                  break;
++                }
++              }
++              if (!contact_found)
++                got_intersection_id = -1;
+             }
+             else
+             {
+
+diff --git a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+index 2f6ffcb..830a7b1 100644
+--- a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
++++ b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+@@ -77,10 +77,11 @@ namespace ego_planner
+     double reference_path_z_offset_;
+     double reference_path_start_skip_dist_;
+     double reference_path_guide_z_margin_;
+-    double reference_path_update_min_interval_;
+     double reference_path_start_change_threshold_;
+     double reference_path_goal_change_threshold_;
+-    double reference_path_length_change_threshold_;
++    double reference_path_length_change_threshold_;
++    double reference_path_forward_projection_window_;
++    double reference_path_projection_max_error_;
+     std::string odom_world_frame_;
+     double odom_z_offset_;
+     double replan_exec_interval_;
+@@ -101,12 +102,20 @@ namespace ego_planner
+     bool has_last_replan_request_{false};
+     bool force_wait_replan_{false};
+     bool have_last_reference_path_signature_{false};
++    bool reference_progress_initialized_{false};
++    bool reference_progress_fault_{false};
+     std::string force_wait_replan_reason_;
+     rclcpp::Time last_replan_request_time_;
+-    rclcpp::Time last_reference_path_accept_time_;
+     Eigen::Vector3d last_reference_path_start_;
+     Eigen::Vector3d last_reference_path_goal_;
+     double last_reference_path_length_{0.0};
++    std::vector<Eigen::Vector3d> reference_path_points_;
++    std::vector<double> reference_path_arc_lengths_;
++    double reference_path_total_length_{0.0};
++    double reference_path_progress_s_{0.0};
++    uint64_t reference_path_id_{0};
++    uint64_t blocked_map_revision_{0};
++    uint64_t blocked_reference_path_id_{0};
+     bool have_execution_state_{false};
+     int64_t execution_traj_id_{-1};
+     uint8_t trajectory_execution_state_{traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY};
+@@ -167,15 +176,20 @@ namespace ego_planner
+     void resetReplanTracking(const rclcpp::Time &now);
+     bool hasReachedGoal(const Eigen::Vector3d &pos) const;
+     void finishCurrentTarget();
+-    bool shouldAcceptReferencePath(const std::vector<Eigen::Vector3d> &waypoints,
+-                                   const Eigen::Vector3d &candidate_goal,
+-                                   double candidate_length,
+-                                   const rclcpp::Time &now) const;
++    bool shouldAcceptReferencePath(const std::vector<Eigen::Vector3d> &waypoints,
++                                   const Eigen::Vector3d &candidate_goal,
++                                   double candidate_length) const;
+     void rememberAcceptedReferencePath(const std::vector<Eigen::Vector3d> &waypoints,
+                                        const Eigen::Vector3d &accepted_goal,
+-                                       double accepted_length,
+-                                       const rclcpp::Time &now);
++                                       double accepted_length);
+     bool getSynchronizedExecutionTime(double &execution_time, uint8_t *execution_state = nullptr) const;
++    bool setReferencePath(const std::vector<Eigen::Vector3d> &waypoints);
++    bool projectReferenceProgress(const Eigen::Vector3d &position, bool initialize);
++    bool sampleReferencePath(double s, Eigen::Vector3d &position,
++                             Eigen::Vector3d &tangent) const;
++    bool referenceCorridorIsFree(double start_s, double end_s,
++                                 std::string *reason = nullptr) const;
++    bool canRecoverFromMapRevision();
+ 
+     void readGivenWps();
+     void planNextWaypoint(const Eigen::Vector3d next_wp);
+
+diff --git a/planner/plan_manage/src/ego_replan_fsm.cpp b/planner/plan_manage/src/ego_replan_fsm.cpp
+index a527054..822f946 100644
+--- a/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -114,10 +114,11 @@ namespace ego_planner
+     node_->declare_parameter("fsm/reference_path_z_offset", 0.0);
+     node_->declare_parameter("fsm/reference_path_start_skip_dist", 0.2);
+     node_->declare_parameter("fsm/reference_path_guide_z_margin", 0.45);
+-    node_->declare_parameter("fsm/reference_path_update_min_interval", 0.8);
+     node_->declare_parameter("fsm/reference_path_start_change_threshold", 0.25);
+     node_->declare_parameter("fsm/reference_path_goal_change_threshold", 0.20);
+     node_->declare_parameter("fsm/reference_path_length_change_threshold", 0.50);
++    node_->declare_parameter("fsm/reference_path_forward_projection_window", 4.0);
++    node_->declare_parameter("fsm/reference_path_projection_max_error", 0.45);
+     node_->declare_parameter("fsm/odom_world_frame", std::string(""));
+     node_->declare_parameter("fsm/odom_z_offset", 0.0);
+     node_->declare_parameter("fsm/replan_exec_interval", 0.2);
+@@ -143,10 +144,11 @@ namespace ego_planner
+     node_->get_parameter("fsm/reference_path_z_offset", reference_path_z_offset_);
+     node_->get_parameter("fsm/reference_path_start_skip_dist", reference_path_start_skip_dist_);
+     node_->get_parameter("fsm/reference_path_guide_z_margin", reference_path_guide_z_margin_);
+-    node_->get_parameter("fsm/reference_path_update_min_interval", reference_path_update_min_interval_);
+     node_->get_parameter("fsm/reference_path_start_change_threshold", reference_path_start_change_threshold_);
+     node_->get_parameter("fsm/reference_path_goal_change_threshold", reference_path_goal_change_threshold_);
+     node_->get_parameter("fsm/reference_path_length_change_threshold", reference_path_length_change_threshold_);
++    node_->get_parameter("fsm/reference_path_forward_projection_window", reference_path_forward_projection_window_);
++    node_->get_parameter("fsm/reference_path_projection_max_error", reference_path_projection_max_error_);
+     node_->get_parameter("fsm/odom_world_frame", odom_world_frame_);
+     node_->get_parameter("fsm/odom_z_offset", odom_z_offset_);
+     node_->get_parameter("fsm/replan_exec_interval", replan_exec_interval_);
+@@ -170,6 +172,11 @@ namespace ego_planner
+ 
+     if (reference_path_topic_.empty())
+       throw std::runtime_error("fsm/reference_path_topic must not be empty");
++    if (!std::isfinite(reference_path_forward_projection_window_) ||
++        reference_path_forward_projection_window_ <= 0.0 ||
++        !std::isfinite(reference_path_projection_max_error_) ||
++        reference_path_projection_max_error_ <= 0.0)
++      throw std::runtime_error("reference-path projection window and error limit must be positive");
+     reference_path_start_skip_dist_ = std::max(0.0, reference_path_start_skip_dist_);
+     reference_path_guide_z_margin_ = std::max(0.0, reference_path_guide_z_margin_);
+ 
+@@ -181,10 +188,16 @@ namespace ego_planner
+     have_last_reference_path_signature_ = false;
+     force_wait_replan_reason_.clear();
+     last_replan_request_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+-    last_reference_path_accept_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+     last_reference_path_start_.setZero();
+     last_reference_path_goal_.setZero();
+     last_reference_path_length_ = 0.0;
++    reference_progress_initialized_ = false;
++    reference_progress_fault_ = false;
++    reference_path_total_length_ = 0.0;
++    reference_path_progress_s_ = 0.0;
++    reference_path_id_ = 0;
++    blocked_map_revision_ = 0;
++    blocked_reference_path_id_ = 0;
+ 
+     node_->declare_parameter("fsm/waypoint_num", -1);
+     node_->get_parameter("fsm/waypoint_num", waypoint_num_);
+@@ -464,11 +477,11 @@ namespace ego_planner
+       }
+     }
+ 
+-    if (waypoints.empty())
++    if (waypoints.size() < 2)
+     {
+       RCLCPP_WARN(
+           node_->get_logger(),
+-          "[EGO] Reference path did not produce usable waypoints after skipping %zu near-start poses.",
++          "[EGO] Reference path requires at least two non-duplicate waypoints after skipping %zu near-start poses.",
+           skipped_start_waypoints);
+       return;
+     }
+@@ -565,8 +578,7 @@ namespace ego_planner
+     }
+ 
+     const double candidate_length = polylineLength(waypoints);
+-    const rclcpp::Time now = plannerNow();
+-    if (!shouldAcceptReferencePath(waypoints, candidate_end_pt, candidate_length, now))
++    if (!shouldAcceptReferencePath(waypoints, candidate_end_pt, candidate_length))
+       return;
+ 
+     end_pt_ = candidate_end_pt;
+@@ -593,6 +605,21 @@ namespace ego_planner
+       return;
+     }
+ 
++    if (!setReferencePath(waypoints))
++    {
++      RCLCPP_ERROR(node_->get_logger(),
++                   "[EGO] Reject reference path: current odometry cannot be projected onto it within %.3f m.",
++                   reference_path_projection_max_error_);
++      reference_progress_fault_ = true;
++      if (have_target_)
++      {
++        callEmergencyStop(odom_pos_);
++        stop_sent_in_wait_replan_ = true;
++        changeFSMExecState(WAIT_REPLAN, "REF_PATH");
++      }
++      return;
++    }
++
+     constexpr double step_size_t = 0.1;
+     int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
+     vector<Eigen::Vector3d> gloabl_traj(i_end);
+@@ -606,7 +633,7 @@ namespace ego_planner
+     have_new_target_ = true;
+     replan_failure_count_ = 0;
+     stop_sent_in_wait_replan_ = false;
+-    rememberAcceptedReferencePath(waypoints, end_pt_, candidate_length, now);
++    rememberAcceptedReferencePath(waypoints, end_pt_, candidate_length);
+ 
+     if (exec_state_ == WAIT_TARGET || exec_state_ == INIT || exec_state_ == WAIT_REPLAN ||
+         exec_state_ == WAIT_TRAJ_START ||
+@@ -733,6 +760,14 @@ namespace ego_planner
+       return;
+ 
+     have_odom_ = true;
++    if (target_type_ == TARGET_TYPE::REFENCE_PATH && have_target_ &&
++        reference_progress_initialized_ && !reference_progress_fault_ &&
++        !projectReferenceProgress(odom_pos_, false))
++    {
++      reference_progress_fault_ = true;
++      RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                            "[EGO] REFERENCE_LOST: odometry left the forward reference projection window.");
++    }
+   }
+ 
+   void EGOReplanFSM::BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg)
+@@ -915,6 +950,12 @@ namespace ego_planner
+     static string state_str[9] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START", "WAIT_REPLAN", "WAIT_TRAJ_START"};
+     int pre_s = int(exec_state_);
+     exec_state_ = new_state;
++    if (new_state == WAIT_REPLAN && pre_s != WAIT_REPLAN)
++    {
++      const auto map = planner_manager_ ? planner_manager_->grid_map_ : nullptr;
++      blocked_map_revision_ = map ? map->getMapRevision() : 0;
++      blocked_reference_path_id_ = reference_path_id_;
++    }
+     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+   }
+ 
+@@ -1037,30 +1078,24 @@ namespace ego_planner
+     force_wait_replan_ = false;
+     have_last_reference_path_signature_ = false;
+     force_wait_replan_reason_.clear();
++    reference_path_points_.clear();
++    reference_path_arc_lengths_.clear();
++    reference_path_total_length_ = 0.0;
++    reference_path_progress_s_ = 0.0;
++    reference_progress_initialized_ = false;
++    reference_progress_fault_ = false;
+   }
+ 
+   bool EGOReplanFSM::shouldAcceptReferencePath(
+       const std::vector<Eigen::Vector3d> &waypoints,
+       const Eigen::Vector3d &candidate_goal,
+-      double candidate_length,
+-      const rclcpp::Time &now) const
++      double candidate_length) const
+   {
+-    if (waypoints.empty() || !have_last_reference_path_signature_ ||
+-        reference_path_update_min_interval_ <= 1e-3)
++    if (waypoints.empty() || !have_last_reference_path_signature_)
+     {
+       return true;
+     }
+ 
+-    const bool active_target =
+-        exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ ||
+-        exec_state_ == WAIT_TRAJ_START || exec_state_ == EXEC_TRAJ;
+-    if (!active_target)
+-      return true;
+-
+-    const double elapsed = (now - last_reference_path_accept_time_).seconds();
+-    if (elapsed >= reference_path_update_min_interval_)
+-      return true;
+-
+     const double start_change = (waypoints.front() - last_reference_path_start_).norm();
+     const double goal_change = (candidate_goal - last_reference_path_goal_).norm();
+     const double length_change = std::abs(candidate_length - last_reference_path_length_);
+@@ -1074,16 +1109,15 @@ namespace ego_planner
+ 
+     RCLCPP_DEBUG(
+         node_->get_logger(),
+-        "[EGO] Ignore repeated reference path update for %.2f s. start_delta=%.3f goal_delta=%.3f length_delta=%.3f",
+-        reference_path_update_min_interval_ - elapsed, start_change, goal_change, length_change);
++        "[EGO] Ignore identical reference path update; preserve monotonic progress. start_delta=%.3f goal_delta=%.3f length_delta=%.3f",
++        start_change, goal_change, length_change);
+     return false;
+   }
+ 
+   void EGOReplanFSM::rememberAcceptedReferencePath(
+       const std::vector<Eigen::Vector3d> &waypoints,
+       const Eigen::Vector3d &accepted_goal,
+-      double accepted_length,
+-      const rclcpp::Time &now)
++      double accepted_length)
+   {
+     if (waypoints.empty())
+       return;
+@@ -1091,10 +1125,193 @@ namespace ego_planner
+     last_reference_path_start_ = waypoints.front();
+     last_reference_path_goal_ = accepted_goal;
+     last_reference_path_length_ = accepted_length;
+-    last_reference_path_accept_time_ = now;
+     have_last_reference_path_signature_ = true;
+   }
+ 
++  bool EGOReplanFSM::setReferencePath(const std::vector<Eigen::Vector3d> &waypoints)
++  {
++    if (waypoints.size() < 2)
++      return false;
++
++    std::vector<double> arc_lengths(waypoints.size(), 0.0);
++    for (size_t i = 1; i < waypoints.size(); ++i)
++    {
++      const double segment_length = (waypoints[i] - waypoints[i - 1]).norm();
++      if (!std::isfinite(segment_length) || segment_length <= 1e-6)
++        return false;
++      arc_lengths[i] = arc_lengths[i - 1] + segment_length;
++    }
++
++    if (!std::isfinite(arc_lengths.back()) || arc_lengths.back() <= 1e-6)
++      return false;
++
++    reference_path_points_ = waypoints;
++    reference_path_arc_lengths_ = std::move(arc_lengths);
++    reference_path_total_length_ = reference_path_arc_lengths_.back();
++    reference_path_progress_s_ = 0.0;
++    reference_progress_initialized_ = false;
++    reference_progress_fault_ = false;
++    if (!projectReferenceProgress(odom_pos_, true))
++    {
++      reference_path_points_.clear();
++      reference_path_arc_lengths_.clear();
++      reference_path_total_length_ = 0.0;
++      reference_path_progress_s_ = 0.0;
++      return false;
++    }
++    ++reference_path_id_;
++    return true;
++  }
++
++  bool EGOReplanFSM::projectReferenceProgress(const Eigen::Vector3d &position, bool initialize)
++  {
++    if (!position.allFinite() || reference_path_points_.size() < 2 ||
++        reference_path_arc_lengths_.size() != reference_path_points_.size() ||
++        reference_path_total_length_ <= 0.0)
++      return false;
++
++    const double search_start = initialize ? 0.0 : reference_path_progress_s_;
++    const double search_end = initialize
++                                  ? reference_path_total_length_
++                                  : std::min(reference_path_total_length_,
++                                             search_start + reference_path_forward_projection_window_);
++    double best_error = std::numeric_limits<double>::infinity();
++    double best_s = -1.0;
++
++    for (size_t i = 1; i < reference_path_points_.size(); ++i)
++    {
++      const double segment_start_s = reference_path_arc_lengths_[i - 1];
++      const double segment_end_s = reference_path_arc_lengths_[i];
++      if (segment_end_s < search_start || segment_start_s > search_end)
++        continue;
++
++      const Eigen::Vector3d &a = reference_path_points_[i - 1];
++      const Eigen::Vector3d segment = reference_path_points_[i] - a;
++      const double segment_norm_sq = segment.squaredNorm();
++      if (!std::isfinite(segment_norm_sq) || segment_norm_sq <= 1e-12)
++        return false;
++
++      const double lower_t = std::clamp((search_start - segment_start_s) /
++                                            (segment_end_s - segment_start_s),
++                                        0.0, 1.0);
++      const double upper_t = std::clamp((search_end - segment_start_s) /
++                                            (segment_end_s - segment_start_s),
++                                        0.0, 1.0);
++      if (upper_t < lower_t)
++        continue;
++
++      const double unconstrained_t = (position - a).dot(segment) / segment_norm_sq;
++      const double t = std::clamp(unconstrained_t, lower_t, upper_t);
++      const Eigen::Vector3d projected = a + t * segment;
++      const double error = (position - projected).norm();
++      if (error < best_error)
++      {
++        best_error = error;
++        best_s = segment_start_s + t * (segment_end_s - segment_start_s);
++      }
++    }
++
++    if (!std::isfinite(best_error) || best_s < 0.0 ||
++        best_error > reference_path_projection_max_error_)
++      return false;
++
++    reference_path_progress_s_ = initialize ? best_s : std::max(reference_path_progress_s_, best_s);
++    reference_progress_initialized_ = true;
++    reference_progress_fault_ = false;
++    return true;
++  }
++
++  bool EGOReplanFSM::sampleReferencePath(double s, Eigen::Vector3d &position,
++                                         Eigen::Vector3d &tangent) const
++  {
++    if (!std::isfinite(s) || reference_path_points_.size() < 2 ||
++        reference_path_arc_lengths_.size() != reference_path_points_.size() ||
++        s < 0.0 || s > reference_path_total_length_ + 1e-6)
++      return false;
++
++    const double query_s = std::min(s, reference_path_total_length_);
++    for (size_t i = 1; i < reference_path_points_.size(); ++i)
++    {
++      if (query_s > reference_path_arc_lengths_[i] + 1e-6)
++        continue;
++
++      const double segment_length = reference_path_arc_lengths_[i] - reference_path_arc_lengths_[i - 1];
++      if (segment_length <= 1e-6)
++        return false;
++      tangent = (reference_path_points_[i] - reference_path_points_[i - 1]) / segment_length;
++      position = reference_path_points_[i - 1] +
++                 ((query_s - reference_path_arc_lengths_[i - 1]) / segment_length) *
++                     (reference_path_points_[i] - reference_path_points_[i - 1]);
++      return position.allFinite() && tangent.allFinite();
++    }
++    return false;
++  }
++
++  bool EGOReplanFSM::referenceCorridorIsFree(double start_s, double end_s,
++                                             std::string *reason) const
++  {
++    const auto map = planner_manager_ ? planner_manager_->grid_map_ : nullptr;
++    if (!map || !map->hasMapObservation())
++    {
++      if (reason != nullptr)
++        *reason = "no valid local map revision";
++      return false;
++    }
++    if (!std::isfinite(start_s) || !std::isfinite(end_s) || start_s < 0.0 ||
++        end_s < start_s || end_s > reference_path_total_length_ + 1e-6)
++    {
++      if (reason != nullptr)
++        *reason = "invalid reference arc-length interval";
++      return false;
++    }
++
++    const double sample_step = std::max(0.05, map->getResolution());
++    for (double s = start_s; s <= end_s + 1e-6; s += sample_step)
++    {
++      Eigen::Vector3d position, tangent;
++      const double sample_s = std::min(s, end_s);
++      if (!sampleReferencePath(sample_s, position, tangent))
++      {
++        if (reason != nullptr)
++          *reason = "failed to sample reference path";
++        return false;
++      }
++      double yaw = 0.0;
++      if (!planarYaw(Eigen::Vector3d::Zero(), tangent, yaw))
++      {
++        if (reason != nullptr)
++          *reason = "reference path has no planar heading";
++        return false;
++      }
++      const auto collision = map->checkFootprint(position, yaw);
++      if (collision.status != GridMap::FootprintStatus::FREE)
++      {
++        if (reason != nullptr)
++          *reason = "reference footprint is blocked or outside the current map";
++        return false;
++      }
++      if (sample_s >= end_s - 1e-6)
++        break;
++    }
++    return true;
++  }
++
++  bool EGOReplanFSM::canRecoverFromMapRevision()
++  {
++    if (target_type_ != TARGET_TYPE::REFENCE_PATH || reference_progress_fault_ ||
++        !reference_progress_initialized_ || reference_path_id_ != blocked_reference_path_id_)
++      return false;
++
++    const auto map = planner_manager_ ? planner_manager_->grid_map_ : nullptr;
++    if (!map || !map->hasMapObservation() || map->getMapRevision() == blocked_map_revision_)
++      return false;
++
++    blocked_map_revision_ = map->getMapRevision();
++    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> candidates;
++    getLocalTarget(&candidates);
++    return candidates.size() == 1;
++  }
++
+   void EGOReplanFSM::execFSMCallback()
+   {
+     static int fsm_num = 0;
+@@ -1242,6 +1459,14 @@ namespace ego_planner
+ 
+     case EXEC_TRAJ:
+     {
++      if (target_type_ == TARGET_TYPE::REFENCE_PATH && reference_progress_fault_)
++      {
++        force_wait_replan_ = true;
++        force_wait_replan_reason_ = "REFERENCE_LOST: odometry no longer projects onto the active path.";
++        changeFSMExecState(WAIT_REPLAN, "REFERENCE_LOST");
++        break;
++      }
++
+       /* determine if need to replan */
+       LocalTrajData *info = &planner_manager_->local_data_;
+       double t_cur = 0.0;
+@@ -1329,9 +1554,16 @@ namespace ego_planner
+         stop_sent_in_wait_replan_ = true;
+       }
+ 
++      if (canRecoverFromMapRevision())
++      {
++        stop_sent_in_wait_replan_ = false;
++        changeFSMExecState(GEN_NEW_TRAJ, "MAP_REVISION");
++        break;
++      }
++
+       RCLCPP_WARN_THROTTLE(
+           node_->get_logger(), *node_->get_clock(), 2000,
+-          "[EGO] BLOCKED_STOP: waiting for a new target or reference-path event.");
++          "[EGO] BLOCKED_STOP: waiting for a changed reference path or a newer valid map revision.");
+ 
+       break;
+     }
+@@ -1434,6 +1666,14 @@ namespace ego_planner
+     if (exec_state_ != EXEC_TRAJ)
+       return;
+ 
++    if (target_type_ == TARGET_TYPE::REFENCE_PATH && reference_progress_fault_)
++    {
++      force_wait_replan_ = true;
++      force_wait_replan_reason_ = "REFERENCE_LOST: odometry no longer projects onto the active path.";
++      changeFSMExecState(WAIT_REPLAN, "REFERENCE_LOST");
++      return;
++    }
++
+     const auto now = plannerNow();
+ 
+     /* ---------- check lost of depth ---------- */
+@@ -1703,109 +1943,98 @@ namespace ego_planner
+     force_wait_replan_ = false;
+     force_wait_replan_reason_.clear();
+ 
+-    const double max_vel = std::max(1e-3, planner_manager_->pp_.max_vel_);
+-    const double t_step = std::max(planning_horizen_ / 20.0 / max_vel, 0.01);
+-    const double duration = planner_manager_->global_data_.global_duration_;
+-
+-    if (duration <= 1e-6)
++    if (target_type_ != TARGET_TYPE::REFENCE_PATH)
+     {
+-      local_target_pt_ = end_pt_;
+-      local_target_vel_.setZero();
+-      force_wait_replan_ = true;
+-      force_wait_replan_reason_ = "Reference trajectory duration is invalid.";
+-      return;
+-    }
+-
+-    double t_proj = 0.0;
+-    double min_dist_to_start = std::numeric_limits<double>::max();
+-
+-    for (double t = 0.0; t <= duration + 1e-6; t += t_step)
+-    {
+-      const double sample_t = std::min(duration, t);
+-      const Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(sample_t);
+-      const double dist_to_start = (pos_t - start_pt_).norm();
+-      if (dist_to_start < min_dist_to_start)
++      const double duration = planner_manager_->global_data_.global_duration_;
++      const double max_vel = planner_manager_->pp_.max_vel_;
++      if (!std::isfinite(duration) || duration <= 1e-6 || !std::isfinite(max_vel) || max_vel <= 0.0)
+       {
+-        min_dist_to_start = dist_to_start;
+-        t_proj = sample_t;
++        force_wait_replan_ = true;
++        force_wait_replan_reason_ = "Global trajectory is invalid.";
++        return;
+       }
+ 
+-      if (sample_t >= duration - 1e-6)
+-        break;
+-    }
+-
+-    double total_dist = 0.0;
+-    bool target_found = false;
+-    double requested_target_time = duration;
+-    Eigen::Vector3d prev_pos = planner_manager_->global_data_.getPosition(t_proj);
+-    for (double t = t_proj + t_step; t <= duration + 1e-6; t += t_step)
+-    {
+-      const double sample_t = std::min(duration, t);
+-      const Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(sample_t);
+-      total_dist += (pos_t - prev_pos).norm();
+-
+-      if (total_dist >= planning_horizen_)
++      const double step = std::max(0.02, planning_horizen_ / (20.0 * max_vel));
++      const double search_start = std::clamp(planner_manager_->global_data_.last_progress_time_, 0.0, duration);
++      double nearest_time = search_start;
++      double nearest_distance = std::numeric_limits<double>::infinity();
++      for (double t = search_start; t <= duration + 1e-6; t += step)
+       {
+-        requested_target_time = sample_t;
+-        target_found = true;
+-        break;
++        const double sample_t = std::min(t, duration);
++        const double distance = (planner_manager_->global_data_.getPosition(sample_t) - start_pt_).norm();
++        if (distance < nearest_distance)
++        {
++          nearest_distance = distance;
++          nearest_time = sample_t;
++        }
++        if (sample_t >= duration - 1e-6)
++          break;
+       }
++      planner_manager_->global_data_.last_progress_time_ =
++          std::max(planner_manager_->global_data_.last_progress_time_, nearest_time);
+ 
+-      prev_pos = pos_t;
++      double target_time = nearest_time;
++      double accumulated_distance = 0.0;
++      Eigen::Vector3d previous = planner_manager_->global_data_.getPosition(nearest_time);
++      for (double t = nearest_time + step; t <= duration + 1e-6; t += step)
++      {
++        const double sample_t = std::min(t, duration);
++        const Eigen::Vector3d position = planner_manager_->global_data_.getPosition(sample_t);
++        accumulated_distance += (position - previous).norm();
++        target_time = sample_t;
++        if (accumulated_distance >= planning_horizen_ || sample_t >= duration - 1e-6)
++          break;
++        previous = position;
++      }
+ 
+-      if (sample_t >= duration - 1e-6)
+-        break;
++      local_target_pt_ = planner_manager_->global_data_.getPosition(target_time);
++      local_target_vel_ = target_time >= duration - 1e-6
++                              ? Eigen::Vector3d::Zero()
++                              : planner_manager_->global_data_.getVelocity(target_time);
++      candidates.emplace_back(local_target_pt_, local_target_vel_);
++      return;
+     }
+ 
+-    const Eigen::Vector3d requested_target =
+-        target_found ? planner_manager_->global_data_.getPosition(requested_target_time) : end_pt_;
++    if (!reference_progress_initialized_ || reference_progress_fault_)
++    {
++      force_wait_replan_ = true;
++      force_wait_replan_reason_ = "REFERENCE_LOST: no valid monotonic reference progress.";
++      return;
++    }
+ 
+-    const auto deterministic_map = planner_manager_->grid_map_;
+-    if (!deterministic_map)
++    if (!projectReferenceProgress(start_pt_, false))
+     {
++      reference_progress_fault_ = true;
+       force_wait_replan_ = true;
+-      force_wait_replan_reason_ = "Local grid map is unavailable.";
++      force_wait_replan_reason_ = "REFERENCE_LOST: replan start is outside the forward reference window.";
+       return;
+     }
+ 
+-    const double validation_step = std::max(0.05, std::min(0.20, t_step));
+-    for (double sample_time = t_proj;
+-         sample_time <= requested_target_time + 1e-6;
+-         sample_time += validation_step)
++    const double target_s = std::min(reference_path_total_length_,
++                                     reference_path_progress_s_ + planning_horizen_);
++    std::string corridor_reason;
++    if (!referenceCorridorIsFree(reference_path_progress_s_, target_s, &corridor_reason))
+     {
+-      const double t = std::min(requested_target_time, sample_time);
+-      const double previous_t = std::max(0.0, t - validation_step);
+-      const double next_t = std::min(duration, t + validation_step);
+-      const Eigen::Vector3d previous = planner_manager_->global_data_.getPosition(previous_t);
+-      const Eigen::Vector3d next = planner_manager_->global_data_.getPosition(next_t);
+-      const Eigen::Vector3d position = planner_manager_->global_data_.getPosition(t);
+-      double yaw = 0.0;
+-      if (!planarYaw(previous, next, yaw) ||
+-          !deterministic_map->isFootprintFree(position, yaw))
+-      {
+-        force_wait_replan_ = true;
+-        force_wait_replan_reason_ = "Reference path footprint is blocked before the local target.";
+-        planner_manager_->global_data_.last_progress_time_ = t_proj;
+-        return;
+-      }
++      force_wait_replan_ = true;
++      force_wait_replan_reason_ = "REFERENCE_BLOCKED: " + corridor_reason;
++      return;
++    }
+ 
+-      if (t >= requested_target_time - 1e-6)
+-        break;
++    Eigen::Vector3d requested_target, tangent;
++    if (!sampleReferencePath(target_s, requested_target, tangent))
++    {
++      force_wait_replan_ = true;
++      force_wait_replan_reason_ = "REFERENCE_LOST: target arc-length cannot be sampled.";
++      return;
+     }
+ 
+-    Eigen::Vector3d requested_velocity =
+-        planner_manager_->global_data_.getVelocity(requested_target_time);
+-    requested_velocity.z() = 0.0;
+-    if (requested_target_time >= duration - 1e-6)
++    Eigen::Vector3d requested_velocity = tangent * planner_manager_->pp_.max_vel_;
++    if (target_s >= reference_path_total_length_ - 1e-6)
+       requested_velocity.setZero();
+-    else if (requested_velocity.norm() > max_vel)
+-      requested_velocity = requested_velocity.normalized() * max_vel;
+ 
+     local_target_pt_ = requested_target;
+     local_target_vel_ = requested_velocity;
+     candidates.emplace_back(local_target_pt_, local_target_vel_);
+-    planner_manager_->global_data_.last_progress_time_ = requested_target_time;
+-    return;
+   }
+ 
+ } // namespace ego_planner
+
+diff --git a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+index 9e605fa..3bb2d78 100644
+--- a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+@@ -22,10 +22,11 @@ def generate_launch_description():
+     reference_path_z_offset = LaunchConfiguration('reference_path_z_offset')
+     reference_path_start_skip_dist = LaunchConfiguration('reference_path_start_skip_dist')
+     reference_path_guide_z_margin = LaunchConfiguration('reference_path_guide_z_margin')
+-    reference_path_update_min_interval = LaunchConfiguration('reference_path_update_min_interval')
+     reference_path_start_change_threshold = LaunchConfiguration('reference_path_start_change_threshold')
+-    reference_path_goal_change_threshold = LaunchConfiguration('reference_path_goal_change_threshold')
+-    reference_path_length_change_threshold = LaunchConfiguration('reference_path_length_change_threshold')
++    reference_path_goal_change_threshold = LaunchConfiguration('reference_path_goal_change_threshold')
++    reference_path_length_change_threshold = LaunchConfiguration('reference_path_length_change_threshold')
++    reference_path_forward_projection_window = LaunchConfiguration('reference_path_forward_projection_window')
++    reference_path_projection_max_error = LaunchConfiguration('reference_path_projection_max_error')
+     emergency_time = LaunchConfiguration('emergency_time')
+     continuous_replan = LaunchConfiguration('continuous_replan')
+     replan_exec_interval = LaunchConfiguration('replan_exec_interval')
+@@ -92,7 +93,10 @@ def generate_launch_description():
+     min_ray_length = LaunchConfiguration('min_ray_length')
+     max_ray_length = LaunchConfiguration('max_ray_length')
+     pointcloud_min_relative_height = LaunchConfiguration('pointcloud_min_relative_height')
+-    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
++    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
++    pointcloud_self_filter_z_down = LaunchConfiguration('pointcloud_self_filter_z_down')
++    pointcloud_self_filter_z_up = LaunchConfiguration('pointcloud_self_filter_z_up')
++    rolling_map_recenter_margin = LaunchConfiguration('rolling_map_recenter_margin')
+     virtual_ceil_height = LaunchConfiguration('virtual_ceil_height')
+     visualization_truncate_height = LaunchConfiguration('visualization_truncate_height')
+     pointcloud_vertical_inflation = LaunchConfiguration('pointcloud_vertical_inflation')
+@@ -137,10 +141,11 @@ def generate_launch_description():
+             {'fsm/reference_path_z_offset': ParameterValue(reference_path_z_offset, value_type=float)},
+             {'fsm/reference_path_start_skip_dist': ParameterValue(reference_path_start_skip_dist, value_type=float)},
+             {'fsm/reference_path_guide_z_margin': ParameterValue(reference_path_guide_z_margin, value_type=float)},
+-            {'fsm/reference_path_update_min_interval': ParameterValue(reference_path_update_min_interval, value_type=float)},
+             {'fsm/reference_path_start_change_threshold': ParameterValue(reference_path_start_change_threshold, value_type=float)},
+             {'fsm/reference_path_goal_change_threshold': ParameterValue(reference_path_goal_change_threshold, value_type=float)},
+-            {'fsm/reference_path_length_change_threshold': ParameterValue(reference_path_length_change_threshold, value_type=float)},
++            {'fsm/reference_path_length_change_threshold': ParameterValue(reference_path_length_change_threshold, value_type=float)},
++            {'fsm/reference_path_forward_projection_window': ParameterValue(reference_path_forward_projection_window, value_type=float)},
++            {'fsm/reference_path_projection_max_error': ParameterValue(reference_path_projection_max_error, value_type=float)},
+             {'fsm/odom_world_frame': frame_id},
+             {'fsm/odom_z_offset': ParameterValue(odom_z_offset, value_type=float)},
+             {'fsm/replan_exec_interval': ParameterValue(replan_exec_interval, value_type=float)},
+@@ -187,7 +192,10 @@ def generate_launch_description():
+             {'grid_map/odom_z_offset': ParameterValue(grid_map_odom_z_offset, value_type=float)},
+             {'grid_map/pointcloud_vertical_inflation': ParameterValue(pointcloud_vertical_inflation, value_type=float)},
+             {'grid_map/pointcloud_min_relative_height': ParameterValue(pointcloud_min_relative_height, value_type=float)},
+-            {'grid_map/pointcloud_body_clearance_radius': ParameterValue(pointcloud_body_clearance_radius, value_type=float)},
++            {'grid_map/pointcloud_body_clearance_radius': ParameterValue(pointcloud_body_clearance_radius, value_type=float)},
++            {'grid_map/pointcloud_self_filter_z_down': ParameterValue(pointcloud_self_filter_z_down, value_type=float)},
++            {'grid_map/pointcloud_self_filter_z_up': ParameterValue(pointcloud_self_filter_z_up, value_type=float)},
++            {'grid_map/rolling_map_recenter_margin': ParameterValue(rolling_map_recenter_margin, value_type=float)},
+             {'grid_map/project_pointcloud_to_ground': ParameterValue(project_pointcloud_to_ground, value_type=bool)},
+             {'grid_map/virtual_ceil_height': ParameterValue(virtual_ceil_height, value_type=float)},
+             {'grid_map/visualization_truncate_height': ParameterValue(visualization_truncate_height, value_type=float)},
+@@ -313,10 +321,6 @@ def generate_launch_description():
+             'reference_path_guide_z_margin',
+             default_value='0.25',
+             description='Maximum z overshoot allowed outside the input reference z envelope when fitting the EGO global guide'),
+-        DeclareLaunchArgument(
+-            'reference_path_update_min_interval',
+-            default_value='0.8',
+-            description='Minimum time before accepting another nearly identical reference path while EGO is already executing'),
+         DeclareLaunchArgument(
+             'reference_path_start_change_threshold',
+             default_value='0.25',
+@@ -325,10 +329,18 @@ def generate_launch_description():
+             'reference_path_goal_change_threshold',
+             default_value='0.20',
+             description='Goal movement required to accept a repeated reference path before the update interval expires'),
+-        DeclareLaunchArgument(
+-            'reference_path_length_change_threshold',
+-            default_value='0.50',
+-            description='Path-length change required to accept a repeated reference path before the update interval expires'),
++        DeclareLaunchArgument(
++            'reference_path_length_change_threshold',
++            default_value='0.50',
++            description='Path-length change required to accept a repeated reference path before the update interval expires'),
++        DeclareLaunchArgument(
++            'reference_path_forward_projection_window',
++            default_value='4.0',
++            description='Maximum forward arc-length window used to project odometry onto an already active reference path'),
++        DeclareLaunchArgument(
++            'reference_path_projection_max_error',
++            default_value='0.45',
++            description='Maximum 3D odometry-to-reference distance; exceeding it produces REFERENCE_LOST and a deterministic stop'),
+         DeclareLaunchArgument(
+             'emergency_time',
+             default_value='2.0',
+@@ -441,8 +453,11 @@ def generate_launch_description():
+         DeclareLaunchArgument('ground_height', default_value='-1.0', description='Ground height of the occupancy map'),
+         DeclareLaunchArgument('min_ray_length', default_value='0.02', description='Ignore pointcloud returns closer than this distance to the robot'),
+         DeclareLaunchArgument('max_ray_length', default_value='4.0', description='Ignore pointcloud returns farther than this distance from the robot'),
+-        DeclareLaunchArgument('pointcloud_min_relative_height', default_value='0.0', description='Ignore pointcloud returns lower than this height relative to odom/base; helps keep near-ground /cloud_registered surfaces from inflating into the trajectory tail'),
+-        DeclareLaunchArgument('pointcloud_body_clearance_radius', default_value='0.02', description='Ignore /cloud_registered returns inside this XY radius around the robot to reduce near-body self-occupancy'),
++        DeclareLaunchArgument('pointcloud_min_relative_height', default_value='-1000.0', description='Deprecated compatibility parameter; low points are no longer discarded by relative height'),
++        DeclareLaunchArgument('pointcloud_body_clearance_radius', default_value='0.12', description='Static XY radius of the robot self-filter volume for /cloud_registered'),
++        DeclareLaunchArgument('pointcloud_self_filter_z_down', default_value='0.25', description='Static robot self-filter extent below odometry/body height'),
++        DeclareLaunchArgument('pointcloud_self_filter_z_up', default_value='0.25', description='Static robot self-filter extent above odometry/body height'),
++        DeclareLaunchArgument('rolling_map_recenter_margin', default_value='1.0', description='Distance to the map usable boundary that deterministically recenters the rolling pointcloud map'),
+         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='Extra vertical inflation applied to pointcloud obstacles; 0.10 m matches the 3d-navi stair-friendly Z inflation scale'),
+         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
+         DeclareLaunchArgument('dist0', default_value='0.8', description='Collision cost distance used by EGO optimization; 0.4 matches 3d-navi safety margin, gives turns adequate clearance without blocking 0.7 m doors'),
+
+diff --git a/planner/plan_manage/launch/ct_lio_fastlio_reference_tracking.launch.py b/planner/plan_manage/launch/ct_lio_fastlio_reference_tracking.launch.py
+index 5b10642..51b70b8 100644
+--- a/planner/plan_manage/launch/ct_lio_fastlio_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/ct_lio_fastlio_reference_tracking.launch.py
+@@ -20,7 +20,11 @@ def generate_launch_description():
+     odom_z_offset = LaunchConfiguration('odom_z_offset')
+     grid_map_odom_z_offset = LaunchConfiguration('grid_map_odom_z_offset')
+     pointcloud_min_relative_height = LaunchConfiguration('pointcloud_min_relative_height')
+-    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
++    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
++    pointcloud_self_filter_z_down = LaunchConfiguration('pointcloud_self_filter_z_down')
++    pointcloud_self_filter_z_up = LaunchConfiguration('pointcloud_self_filter_z_up')
++    reference_path_forward_projection_window = LaunchConfiguration('reference_path_forward_projection_window')
++    reference_path_projection_max_error = LaunchConfiguration('reference_path_projection_max_error')
+     use_rviz = LaunchConfiguration('use_rviz')
+ 
+     return LaunchDescription([
+@@ -60,10 +64,26 @@ def generate_launch_description():
+             'pointcloud_min_relative_height',
+             default_value='-1.0',
+             description='Keep low nonground obstacle points when using linefit_ground_segmentation obstacle clouds.'),
+-        DeclareLaunchArgument(
+-            'pointcloud_body_clearance_radius',
+-            default_value='0.1',
+-            description='Ignore returns very close to the robot body to reduce self-occupancy.'),
++        DeclareLaunchArgument(
++            'pointcloud_body_clearance_radius',
++            default_value='0.1',
++            description='Static XY radius of the robot self-filter volume.'),
++        DeclareLaunchArgument(
++            'pointcloud_self_filter_z_down',
++            default_value='0.25',
++            description='Static robot self-filter extent below odometry/body height.'),
++        DeclareLaunchArgument(
++            'pointcloud_self_filter_z_up',
++            default_value='0.25',
++            description='Static robot self-filter extent above odometry/body height.'),
++        DeclareLaunchArgument(
++            'reference_path_forward_projection_window',
++            default_value='4.0',
++            description='Forward reference arc-length window used for monotonic odometry projection.'),
++        DeclareLaunchArgument(
++            'reference_path_projection_max_error',
++            default_value='0.45',
++            description='Maximum 3D odometry-to-reference error before deterministic REFERENCE_LOST stop.'),
+         DeclareLaunchArgument(
+             'use_rviz',
+             default_value='false',
+@@ -80,7 +100,11 @@ def generate_launch_description():
+                 'odom_z_offset': odom_z_offset,
+                 'grid_map_odom_z_offset': grid_map_odom_z_offset,
+                 'pointcloud_min_relative_height': pointcloud_min_relative_height,
+-                'pointcloud_body_clearance_radius': pointcloud_body_clearance_radius,
++                'pointcloud_body_clearance_radius': pointcloud_body_clearance_radius,
++                'pointcloud_self_filter_z_down': pointcloud_self_filter_z_down,
++                'pointcloud_self_filter_z_up': pointcloud_self_filter_z_up,
++                'reference_path_forward_projection_window': reference_path_forward_projection_window,
++                'reference_path_projection_max_error': reference_path_projection_max_error,
+                 'use_rviz': use_rviz,
+                 'enable_depth_fusion_input': 'false',
+                 'pose_type': '2',

@@ -1,0 +1,40 @@
+mcl_ip:
+  ros__parameters:
+    # leishen16
+    laser:
+        odom_type: "laser_odometry"         #wheel_odometry/laser_odometry 
+        baselink_frame: "base_link"
+        num_vertical_scans: 16
+        num_horizontal_scans: 1000
+        vertical_angle_bottom: -15.0          # degrees
+        vertical_angle_top: 15.0            # degrees
+        scan_period: 0.1                   # seconds
+
+    imageProjection:
+        segment_valid_point_num: 5
+        segment_valid_line_num: 2
+        segment_theta: 60.0                      # decrese this value may improve accuracy
+        minimum_detection_range: 0.5
+        maximum_detection_range: 100.0            # point cloud within this range will be used to project image
+        distance_for_patch_between_rings: 1.0    # patch ground between rings within this range, i.e. ring0 and ring1 is smaller than 1 meter, patch them
+        stitcher_num: 0                          # for non-repetitive scan lidar use 2~4 (i.e. mid360)
+        trt_model_path: ""                       # provide trt engine for yolo
+        projected_image_stack_size: 1            # Stack this number of image for yolo11n to inference as time elapsed yolo (only work when TRT is loaded)
+        
+        ground_fov_bottom: -0.2617994 # -15deg
+        ground_fov_top: -0.087266 # -5deg
+        ground_positive_start: 0.0
+        ground_positive_stop: 3.1415926
+        ground_negative_start: 0.0
+        ground_negative_stop: -3.1415926
+
+
+mcl_fa:
+  ros__parameters:
+    featureAssociation:                              
+        edge_threshold: 0.1
+        surf_threshold: 0.1
+        nearest_feature_search_distance: 3.0
+    mapping:
+        to_map_optimization: false
+

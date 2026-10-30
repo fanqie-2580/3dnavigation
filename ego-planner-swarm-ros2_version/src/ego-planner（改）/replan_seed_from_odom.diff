@@ -1,0 +1,442 @@
+diff --git a/planner/traj_utils/include/traj_utils/plan_container.hpp b/planner/traj_utils/include/traj_utils/plan_container.hpp
+--- a/planner/traj_utils/include/traj_utils/plan_container.hpp
++++ b/planner/traj_utils/include/traj_utils/plan_container.hpp
+@@ -195,7 +195,6 @@ namespace ego_planner
+     double ctrl_pt_dist;                  // distance between adjacient B-spline control points
+     double feasibility_tolerance_;        // permitted ratio of vel/acc exceeding limits
+     double planning_horizen_;
+-    double replan_start_tolerance_;
+     double z_reference_tolerance_;
+     bool use_distinctive_trajs;
+     int drone_id; // single drone: drone_id <= -1, swarm: drone_id >= 0
+diff --git a/planner/plan_manage/include/ego_planner/planner_manager.h b/planner/plan_manage/include/ego_planner/planner_manager.h
+--- a/planner/plan_manage/include/ego_planner/planner_manager.h
++++ b/planner/plan_manage/include/ego_planner/planner_manager.h
+@@ -30,7 +30,7 @@ namespace ego_planner
+ 
+     /* main planning interface */
+     bool reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel, Eigen::Vector3d start_acc,
+-                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit);
++                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel);
+     bool EmergencyStop(Eigen::Vector3d stop_pos);
+     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
+                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
+@@ -67,7 +67,6 @@ namespace ego_planner
+ 
+     int continous_failures_count_{0};
+     bool verbose_replan_log_{false};
+-    bool have_planned_once_{false};
+ 
+     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
+ 
+diff --git a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+--- a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
++++ b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+@@ -156,7 +156,7 @@ namespace ego_planner
+     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+ 
+     /* helper functions */
+-    bool callReboundReplan(bool use_polynomial_initialization); // deterministic front-end and back-end method
++    bool callReboundReplan(); // deterministic front-end and back-end method
+     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
+     bool planFromGlobalTraj(const int trial_times = 1);
+     bool planFromCurrentTraj(const int trial_times = 1);
+@@ -187,6 +187,7 @@ namespace ego_planner
+     bool projectReferenceProgress(const Eigen::Vector3d &position, bool initialize);
+     bool sampleReferencePath(double s, Eigen::Vector3d &position,
+                              Eigen::Vector3d &tangent) const;
++    bool buildRemainingReferenceWaypoints(std::vector<Eigen::Vector3d> &waypoints);
+     bool referenceCorridorIsFree(double start_s, double end_s,
+                                  std::string *reason = nullptr) const;
+     bool canRecoverFromMapRevision();
+diff --git a/planner/plan_manage/src/planner_manager.cpp b/planner/plan_manage/src/planner_manager.cpp
+--- a/planner/plan_manage/src/planner_manager.cpp
++++ b/planner/plan_manage/src/planner_manager.cpp
+@@ -67,7 +67,6 @@ namespace ego_planner
+     node->declare_parameter("manager/feasibility_tolerance", 0.0);
+     node->declare_parameter("manager/control_points_distance", -1.0);
+     node->declare_parameter("manager/planning_horizon", 5.0);
+-    node->declare_parameter("manager/replan_start_tolerance", -1.0);
+     node->declare_parameter("manager/z_reference_tolerance", -1.0);
+     node->declare_parameter("manager/use_distinctive_trajs", false);
+     node->declare_parameter("manager/drone_id", -1);
+@@ -79,14 +78,11 @@ namespace ego_planner
+     node->get_parameter("manager/feasibility_tolerance", pp_.feasibility_tolerance_);
+     node->get_parameter("manager/control_points_distance", pp_.ctrl_pt_dist);
+     node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
+-    node->get_parameter("manager/replan_start_tolerance", pp_.replan_start_tolerance_);
+     node->get_parameter("manager/z_reference_tolerance", pp_.z_reference_tolerance_);
+     node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
+     node->get_parameter("manager/drone_id", pp_.drone_id);
+     node->get_parameter("manager/verbose_replan_log", verbose_replan_log_);
+ 
+-    if (!std::isfinite(pp_.replan_start_tolerance_) || pp_.replan_start_tolerance_ <= 0.0)
+-      throw std::runtime_error("manager/replan_start_tolerance must be explicitly positive");
+     if (!std::isfinite(pp_.z_reference_tolerance_) || pp_.z_reference_tolerance_ <= 0.0)
+       throw std::runtime_error("manager/z_reference_tolerance must be explicitly positive");
+     if (pp_.use_distinctive_trajs)
+@@ -110,7 +106,7 @@ namespace ego_planner
+ 
+   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
+                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
+-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit)
++                                        Eigen::Vector3d local_target_vel)
+   {
+     static int count = 0;
+     if (verbose_replan_log_)
+@@ -167,38 +163,11 @@ namespace ego_planner
+     // terminal control points are less likely to start inside inflated voxels.
+     double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
+     vector<Eigen::Vector3d> point_set, start_end_derivatives;
+-    if (have_planned_once_ && !flag_polyInit)
+-    {
+-      const bool have_active_local_traj =
+-          local_data_.start_time_.seconds() > 1e-5 && local_data_.duration_ > 1e-3;
+-
+-      if (!have_active_local_traj)
+-      {
+-        RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
+-                     "[EGO] Deterministic trajectory reuse requested without an active trajectory.");
+-        return false;
+-      }
+-
+-      const double seed_t_cur =
+-          std::clamp((rclcpp::Clock().now() - local_data_.start_time_).seconds(), 0.0, local_data_.duration_);
+-      const Eigen::Vector3d seed_pt = local_data_.position_traj_.evaluateDeBoorT(seed_t_cur);
+-      const double seed_start_deviation = (seed_pt - start_pt).norm();
+-      if (seed_start_deviation > pp_.replan_start_tolerance_ ||
+-          !grid_map_->isFootprintFree(seed_pt, start_yaw))
+-      {
+-        RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
+-                     "[EGO] Reject deterministic replan seed. seed=%s | requested=%s | deviation=%.3f limit=%.3f",
+-                     formatPointState(grid_map_, seed_pt, start_yaw).c_str(),
+-                     formatPointState(grid_map_, start_pt, start_yaw).c_str(),
+-                     seed_start_deviation, pp_.replan_start_tolerance_);
+-        return false;
+-      }
+-    }
+-
+     point_set.clear();
+     start_end_derivatives.clear();
+ 
+-    if (!have_planned_once_ || flag_polyInit) // Initial path generated from a min-snap traj by order.
++    // Always construct the initial polynomial from the requested physical state.
++    // A previous local trajectory is never used as a replan seed.
+     {
+         // 用于存储生成的轨迹
+         PolynomialTraj gl_traj;
+@@ -236,105 +205,6 @@ namespace ego_planner
+         start_end_derivatives.push_back(gl_traj.evaluateAcc(0));
+         start_end_derivatives.push_back(gl_traj.evaluateAcc(t));
+     }
+-    else // Initial path generated from previous trajectory.
+-    {
+-
+-        double t;
+-        double t_cur = (rclcpp::Clock().now() - local_data_.start_time_).seconds();
+-
+-        vector<double> pseudo_arc_length;
+-        vector<Eigen::Vector3d> segment_point;
+-        pseudo_arc_length.push_back(0.0);
+-        for (t = t_cur; t < local_data_.duration_ + 1e-3; t += ts)
+-        {
+-          segment_point.push_back(local_data_.position_traj_.evaluateDeBoorT(t));
+-          if (t > t_cur)
+-          {
+-            pseudo_arc_length.push_back((segment_point.back() - segment_point[segment_point.size() - 2]).norm() + pseudo_arc_length.back());
+-          }
+-        }
+-
+-        if (segment_point.size() < 2 || pseudo_arc_length.size() < 2 || pseudo_arc_length.back() <= 1e-6)
+-        {
+-          RCLCPP_ERROR(
+-              rclcpp::get_logger("planner_manager"),
+-              "[EGO] Previous trajectory tail is too short for deterministic reuse. start=%s | target=%s | sampled_pts=%zu",
+-              formatPointState(grid_map_, start_pt, route_yaw).c_str(),
+-              formatPointState(grid_map_, local_target_pt, route_yaw).c_str(),
+-              segment_point.size());
+-          return false;
+-        }
+-
+-        t -= ts;
+-
+-        double poly_time = (local_data_.position_traj_.evaluateDeBoorT(t) - local_target_pt).norm() / pp_.max_vel_ * 2;
+-        if (poly_time > ts)
+-        {
+-          PolynomialTraj gl_traj = PolynomialTraj::one_segment_traj_gen(local_data_.position_traj_.evaluateDeBoorT(t),
+-                                                                        local_data_.velocity_traj_.evaluateDeBoorT(t),
+-                                                                        local_data_.acceleration_traj_.evaluateDeBoorT(t),
+-                                                                        local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), poly_time);
+-
+-          for (t = ts; t < poly_time; t += ts)
+-          {
+-            if (!pseudo_arc_length.empty())
+-            {
+-              segment_point.push_back(gl_traj.evaluate(t));
+-              pseudo_arc_length.push_back((segment_point.back() - segment_point[segment_point.size() - 2]).norm() + pseudo_arc_length.back());
+-            }
+-            else
+-            {
+-              RCLCPP_ERROR(rclcpp::get_logger("ego_planner"), "pseudo_arc_length is empty, return!");
+-              continous_failures_count_++;
+-              return false;
+-            }
+-          }
+-        }
+-
+-        double sample_length = 0;
+-        double cps_dist = pp_.ctrl_pt_dist * 1.5; // cps_dist will be divided by 1.5 in the next
+-        size_t id = 0;
+-        do
+-        {
+-          cps_dist /= 1.5;
+-          point_set.clear();
+-          point_set.push_back(start_pt);
+-          sample_length = 0;
+-          id = 0;
+-          while ((id + 1) < pseudo_arc_length.size() && sample_length <= pseudo_arc_length.back())
+-          {
+-            if (sample_length >= pseudo_arc_length[id] && sample_length < pseudo_arc_length[id + 1])
+-            {
+-              const double span = pseudo_arc_length[id + 1] - pseudo_arc_length[id];
+-              if (span <= 1e-6)
+-              {
+-                id++;
+-                continue;
+-              }
+-
+-              point_set.push_back((sample_length - pseudo_arc_length[id]) / span * segment_point[id + 1] +
+-                                  (pseudo_arc_length[id + 1] - sample_length) / span * segment_point[id]);
+-              sample_length += cps_dist;
+-            }
+-            else
+-              id++;
+-          }
+-          point_set.push_back(local_target_pt);
+-        } while (point_set.size() < 7); // If the start point is very close to end point, this will help
+-
+-        start_end_derivatives.push_back(local_data_.velocity_traj_.evaluateDeBoorT(t_cur));
+-        start_end_derivatives.push_back(local_target_vel);
+-        start_end_derivatives.push_back(local_data_.acceleration_traj_.evaluateDeBoorT(t_cur));
+-        start_end_derivatives.push_back(Eigen::Vector3d::Zero());
+-
+-        if (point_set.size() > pp_.planning_horizen_ / pp_.ctrl_pt_dist * 3) // The initial path is unnormally too long!
+-        {
+-          RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
+-                       "[EGO] Deterministic trajectory reuse generated an excessive control-point set.");
+-          return false;
+-        }
+-    }
+-
+     // 将轨迹变为B样条轨迹
+     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
+     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+@@ -540,7 +410,6 @@ namespace ego_planner
+ 
+     // save planned results
+     updateTrajInfo(pos, rclcpp::Clock().now());
+-    have_planned_once_ = true;
+ 
+     static double sum_time = 0;
+     static int count_success = 0;
+diff --git a/planner/plan_manage/src/ego_replan_fsm.cpp b/planner/plan_manage/src/ego_replan_fsm.cpp
+--- a/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -1247,6 +1247,36 @@ namespace ego_planner
+     return false;
+   }
+ 
++  bool EGOReplanFSM::buildRemainingReferenceWaypoints(
++      std::vector<Eigen::Vector3d> &waypoints)
++  {
++    waypoints.clear();
++    if (!projectReferenceProgress(odom_pos_, false) ||
++        reference_path_progress_s_ >= reference_path_total_length_ - 1e-6)
++      return false;
++
++    Eigen::Vector3d projected_position;
++    Eigen::Vector3d tangent;
++    if (!sampleReferencePath(reference_path_progress_s_, projected_position, tangent))
++      return false;
++    (void)tangent;
++
++    constexpr double kWaypointEpsilon = 1e-6;
++    if ((projected_position - odom_pos_).norm() > kWaypointEpsilon)
++      waypoints.push_back(projected_position);
++
++    for (size_t i = 1; i < reference_path_points_.size(); ++i)
++    {
++      if (reference_path_arc_lengths_[i] <= reference_path_progress_s_ + kWaypointEpsilon)
++        continue;
++      if (waypoints.empty() ||
++          (reference_path_points_[i] - waypoints.back()).norm() > kWaypointEpsilon)
++        waypoints.push_back(reference_path_points_[i]);
++    }
++
++    return !waypoints.empty();
++  }
++
+   bool EGOReplanFSM::referenceCorridorIsFree(double start_s, double end_s,
+                                              std::string *reason) const
+   {
+@@ -1594,7 +1624,7 @@ namespace ego_planner
+     start_pt_ = odom_pos_;
+     start_vel_ = odom_vel_;
+     start_acc_.setZero();
+-    return callReboundReplan(true);
++    return callReboundReplan();
+   }
+ 
+   bool EGOReplanFSM::planFromCurrentTraj(const int trial_times /*=1*/)
+@@ -1602,7 +1632,6 @@ namespace ego_planner
+     (void)trial_times;
+ 
+     LocalTrajData *info = &planner_manager_->local_data_;
+-    auto map = planner_manager_->grid_map_;
+     double t_cur = 0.0;
+     uint8_t controller_state = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
+     if (!getSynchronizedExecutionTime(t_cur, &controller_state) ||
+@@ -1613,48 +1642,56 @@ namespace ego_planner
+       return false;
+     }
+ 
+-    const Eigen::Vector3d traj_start_pt = info->position_traj_.evaluateDeBoorT(t_cur);
+     const Eigen::Vector3d traj_start_vel = info->velocity_traj_.evaluateDeBoorT(t_cur);
+     const Eigen::Vector3d traj_start_acc = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+-    const double start_deviation = (traj_start_pt - odom_pos_).norm();
+-    const double heading_sample_time = std::min(info->duration_, t_cur + 0.10);
+-    const Eigen::Vector3d heading_sample = info->position_traj_.evaluateDeBoorT(heading_sample_time);
+-    double start_yaw = 0.0;
+-    bool have_start_yaw = planarYaw(traj_start_pt, heading_sample, start_yaw);
+-    if (!have_start_yaw)
+-    {
+-      const double previous_time = std::max(0.0, t_cur - 0.10);
+-      const Eigen::Vector3d previous_position = info->position_traj_.evaluateDeBoorT(previous_time);
+-      have_start_yaw = planarYaw(previous_position, traj_start_pt, start_yaw);
+-    }
+-    if (!map || !have_start_yaw ||
+-        start_deviation > planner_manager_->pp_.replan_start_tolerance_ ||
+-        !map->isFootprintFree(traj_start_pt, start_yaw) ||
+-        !map->isFootprintFree(odom_pos_, quaternionYaw(odom_orient_)))
+-    {
+-      RCLCPP_ERROR(
+-          node_->get_logger(),
+-          "[EGO] Deterministic replan start rejected: deviation=%.3f limit=%.3f map=%d.",
+-          start_deviation, planner_manager_->pp_.replan_start_tolerance_, map != nullptr);
+-      return false;
+-    }
+-
+-    start_pt_ = traj_start_pt;
++    start_pt_ = odom_pos_;
+     start_vel_ = traj_start_vel;
+     start_acc_ = traj_start_acc;
+ 
+-    if (visualization_ != nullptr)
++    bool global_guide_ready = false;
++    if (target_type_ == TARGET_TYPE::REFENCE_PATH)
+     {
+-      visualization_->displayGoalPoint(odom_pos_, Eigen::Vector4d(0.0, 1.0, 1.0, 1.0), 0.18, 9000);
+-      visualization_->displayGoalPoint(traj_start_pt, Eigen::Vector4d(1.0, 1.0, 0.0, 1.0), 0.18, 9001);
++      std::vector<Eigen::Vector3d> remaining_waypoints;
++      if (!buildRemainingReferenceWaypoints(remaining_waypoints))
++      {
++        RCLCPP_ERROR(node_->get_logger(),
++                     "[EGO] Cannot rebuild the reference global guide from the current progress.");
++        return false;
++      }
++
++      double reference_min_z = start_pt_.z();
++      double reference_max_z = start_pt_.z();
++      for (const Eigen::Vector3d &waypoint : remaining_waypoints)
++      {
++        reference_min_z = std::min(reference_min_z, waypoint.z());
++        reference_max_z = std::max(reference_max_z, waypoint.z());
++      }
++      global_guide_ready = planner_manager_->planGlobalTrajWaypoints(
++          start_pt_, start_vel_, start_acc_, remaining_waypoints,
++          Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
++          reference_min_z - reference_path_guide_z_margin_,
++          reference_max_z + reference_path_guide_z_margin_);
++    }
++    else
++    {
++      global_guide_ready = planner_manager_->planGlobalTraj(
++          start_pt_, start_vel_, start_acc_, end_pt_, end_vel_, Eigen::Vector3d::Zero());
++    }
++
++    if (!global_guide_ready)
++    {
++      RCLCPP_ERROR(node_->get_logger(),
++                   "[EGO] Cannot rebuild the global guide from the current odometry state.");
++      return false;
+     }
+ 
+     if (visualization_ != nullptr)
+     {
++      visualization_->displayGoalPoint(odom_pos_, Eigen::Vector4d(0.0, 1.0, 1.0, 1.0), 0.18, 9000);
+       visualization_->displayGoalPoint(start_pt_, Eigen::Vector4d(1.0, 0.5, 0.0, 1.0), 0.18, 9002);
+     }
+ 
+-    return callReboundReplan(false);
++    return callReboundReplan();
+   }
+ 
+   void EGOReplanFSM::checkCollisionCallback()
+@@ -1774,7 +1811,7 @@ namespace ego_planner
+     }
+   }
+ 
+-  bool EGOReplanFSM::callReboundReplan(bool use_polynomial_initialization)
++  bool EGOReplanFSM::callReboundReplan()
+   {
+     force_wait_replan_ = false;
+     force_wait_replan_reason_.clear();
+@@ -1798,9 +1835,8 @@ namespace ego_planner
+ 
+     local_target_pt_ = target_candidates.front().first;
+     local_target_vel_ = target_candidates.front().second;
+-    const bool use_poly_init = have_new_target_ || use_polynomial_initialization;
+     const bool plan_and_refine_success = planner_manager_->reboundReplan(
+-        start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, use_poly_init);
++        start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_);
+ 
+     have_new_target_ = false;
+ 
+diff --git a/planner/plan_manage/launch/advanced_param.launch.py b/planner/plan_manage/launch/advanced_param.launch.py
+--- a/planner/plan_manage/launch/advanced_param.launch.py
++++ b/planner/plan_manage/launch/advanced_param.launch.py
+@@ -186,7 +186,6 @@ def generate_launch_description():
+             {'manager/control_points_distance': 0.4},
+             {'manager/feasibility_tolerance': 0.05},
+             {'manager/planning_horizon': planning_horizon},
+-            {'manager/replan_start_tolerance': 0.25},
+             {'manager/z_reference_tolerance': 0.25},
+             {'manager/use_distinctive_trajs': use_distinctive_trajs},
+             {'manager/drone_id': drone_id},
+diff --git a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+--- a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+@@ -86,7 +86,6 @@ def generate_launch_description():
+     footprint_offset = LaunchConfiguration('footprint_offset')
+     footprint_z_down = LaunchConfiguration('footprint_z_down')
+     footprint_z_up = LaunchConfiguration('footprint_z_up')
+-    replan_start_tolerance = LaunchConfiguration('replan_start_tolerance')
+     z_reference_tolerance = LaunchConfiguration('z_reference_tolerance')
+     local_map_margin = LaunchConfiguration('local_map_margin')
+     ground_height = LaunchConfiguration('ground_height')
+@@ -217,7 +216,6 @@ def generate_launch_description():
+             {'manager/control_points_distance': 0.2},
+             {'manager/feasibility_tolerance': 0.05},
+             {'manager/planning_horizon': ParameterValue(planning_horizon, value_type=float)},
+-            {'manager/replan_start_tolerance': ParameterValue(replan_start_tolerance, value_type=float)},
+             {'manager/z_reference_tolerance': ParameterValue(z_reference_tolerance, value_type=float)},
+             {'manager/use_distinctive_trajs': ParameterValue(use_distinctive_trajs, value_type=bool)},
+             {'manager/drone_id': ParameterValue(drone_id, value_type=int)},
+@@ -455,7 +453,6 @@ def generate_launch_description():
+         DeclareLaunchArgument('footprint_offset', default_value='0.18', description='Forward and rearward offset of the two Go2 footprint cylinders'),
+         DeclareLaunchArgument('footprint_z_down', default_value='0.18', description='Collision volume below the body-frame trajectory height; excludes the leg support region'),
+         DeclareLaunchArgument('footprint_z_up', default_value='0.22', description='Collision volume above the body-frame trajectory height'),
+-        DeclareLaunchArgument('replan_start_tolerance', default_value='0.25', description='Maximum allowed odom-to-executing-trajectory deviation for deterministic replanning'),
+         DeclareLaunchArgument('z_reference_tolerance', default_value='0.25', description='Maximum local-trajectory Z deviation from the external/global reference'),
+         DeclareLaunchArgument('local_map_margin', default_value='10', description='Voxel margin used when clearing the rolling local map'),
+         DeclareLaunchArgument('ground_height', default_value='-1.0', description='Ground height of the occupancy map'),

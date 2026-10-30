@@ -1,0 +1,50 @@
+global_localization_node:
+  ros__parameters:
+    # x, y, z, roll, pitch, yaw (degrees)
+    initialpose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    kf_baselink2map:
+      x: [0.001, 0.002]
+      y: [0.001, 0.005]
+      z: [0.00001, 0.04]
+
+    enable_auto_relocalization: true
+    enable_manual_relocalization: true
+    relocalization_on_start_without_initialpose: true
+    relocalization_require_success_on_start: true
+    relocalization_submap_size: [20.0, 20.0, 3.0]
+    relocalization_submap_stride: [10.0, 10.0, 1.5]
+    relocalization_min_submap_points: 500
+    relocalization_voxel_size: 0.4
+    relocalization_scan_min_points: 300
+    relocalization_top_k: 12
+    relocalization_nearby_radius: 30.0
+    relocalization_enable_global_search: true
+    relocalization_ransac_min_fitness: 0.08
+    relocalization_ransac_max_rmse: 2.0
+    relocalization_ransac_distance_multiplier: 2.0
+    relocalization_enable_diagnostics: true
+    relocalization_diagnostics_top_n: 8
+    relocalization_scan_window_sec: 4.0
+    relocalization_scan_min_frames: 3
+    relocalization_descriptor_ring_count: 20
+    relocalization_descriptor_sector_count: 60
+    relocalization_descriptor_max_radius: 25.0
+    relocalization_descriptor_top_k: 12
+    relocalization_descriptor_max_distance: 0.35
+    relocalization_candidate_max_z_diff: 1.8
+    relocalization_bev_resolution: 0.5
+    relocalization_bev_search_xy_range: 4.0
+    relocalization_bev_search_xy_step: 0.5
+    relocalization_bev_search_yaw_range_deg: 12.0
+    relocalization_bev_search_yaw_step_deg: 3.0
+    relocalization_bev_min_score: 0.20
+    relocalization_bev_min_matched_points: 120
+    relocalization_icp_crop_padding: 1.0
+    relocalization_icp_min_source_points: 300
+    relocalization_icp_min_keep_ratio: 0.15
+    relocalization_icp_min_fitness: 0.50
+    relocalization_icp_max_rmse: 0.8
+    relocalization_max_pose_jump: 2.5
+    localization_fail_trigger_count: 3
+    relocalization_cooldown_sec: 5.0

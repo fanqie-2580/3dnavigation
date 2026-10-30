@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>DDDMR Web Nav</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./vendor/roslib.min.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="side-panel" aria-label="navigation controls">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">3D导航</p>
+            <h1>Web Nav</h1>
+          </div>
+          <span id="connection-badge" class="badge offline">离线</span>
+        </header>
+
+        <div class="control-row">
+          <button id="connect-btn" type="button">连接</button>
+          <button id="target-mode-btn" type="button" class="secondary">目标点</button>
+        </div>
+
+        <div class="control-row">
+          <button id="clear-path-btn" type="button" class="secondary">清除路径</button>
+          <button id="estop-btn" type="button" class="danger">急停</button>
+        </div>
+
+        <section class="status-section" aria-label="navigation status">
+          <div class="status-line">
+            <span>地面地图</span>
+            <strong id="map-status">等待</strong>
+          </div>
+          <div class="status-line">
+            <span>局部障碍物</span>
+            <strong id="obstacle-status">等待</strong>
+          </div>
+          <div class="status-line">
+            <span>机器人定位</span>
+            <strong id="odom-status">等待</strong>
+          </div>
+          <div class="status-line">
+            <span>全局路径</span>
+            <strong id="path-status">等待</strong>
+          </div>
+          <div class="status-line">
+            <span>路径点数</span>
+            <strong id="path-size">0</strong>
+          </div>
+          <div class="status-line">
+            <span>最新目标</span>
+            <strong id="goal-status">未发送</strong>
+          </div>
+        </section>
+
+        <details class="settings">
+          <summary>话题设置</summary>
+          <label>
+            <span>ROSBridge</span>
+            <input id="rosbridge-url" type="text" autocomplete="off" />
+          </label>
+          <label>
+            <span>可通行地面</span>
+            <input id="map-topic" type="text" value="/web/mapground" autocomplete="off" />
+          </label>
+          <label>
+            <span>EGO障碍物</span>
+            <input id="obstacle-topic" type="text" value="/web/ego_obstacles" autocomplete="off" />
+          </label>
+          <label>
+            <span>里程计</span>
+            <input id="odom-topic" type="text" value="/baselink2map" autocomplete="off" />
+          </label>
+          <label>
+            <span>全局路径</span>
+            <input id="path-topic" type="text" value="/global_path" autocomplete="off" />
+          </label>
+          <label>
+            <span>目标点</span>
+            <input id="clicked-topic" type="text" value="/clicked_point" autocomplete="off" />
+          </label>
+          <label>
+            <span>目标坐标系</span>
+            <input id="target-frame" type="text" value="map" autocomplete="off" />
+          </label>
+          <label>
+            <span>Web 急停</span>
+            <input id="estop-topic" type="text" value="/web_estop" autocomplete="off" />
+          </label>
+        </details>
+      </section>
+
+      <section class="viewer" aria-label="3d navigation viewer">
+        <canvas id="scene"></canvas>
+        <div id="toast" class="toast" hidden></div>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js?v=ego-obstacles-20260527"></script>
+  </body>
+</html>
