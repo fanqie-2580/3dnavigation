@@ -207,6 +207,9 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_scan_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_scan2map_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_submap_;
+    /// Cached static map cloud for late RViz subscribers (TransientLocal + periodic republish).
+    sensor_msgs::msg::PointCloud2 pc2_map_vis_;
+    rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_localization_3d_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_localization_3d_confidence_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_localization_3d_delay_ms_;
@@ -398,7 +401,11 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     pub_odom2map_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom2map", 100000);
     pub_odom2map_kalman_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom2map_kalman", 100000);
 
-    pub_map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map", 1);
+    // TransientLocal so RViz / late subscribers still receive the one-shot static map.
+    rclcpp::QoS map_qos(rclcpp::KeepLast(1));
+    map_qos.reliable();
+    map_qos.transient_local();
+    pub_map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/map", map_qos);
     pub_submap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/submap", 1);
     pub_scan2map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/scan2map", 1);
     pub_scan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/scan", 1);
@@ -452,12 +459,14 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     std::string path_map = "";
     this->declare_parameter<std::string>("path_map", "");
     this->get_parameter("path_map", path_map);
+    RCLCPP_INFO(this->get_logger(), "Loading localization map from: %s", path_map.c_str());
     open3d::io::ReadPointCloud(path_map, *pcd_map_ori_);
     if (pcd_map_ori_ == nullptr || pcd_map_ori_->IsEmpty())
     {
         RCLCPP_ERROR(this->get_logger(), "read map from path: %s failed", path_map.c_str());
         rclcpp::shutdown();
     }
+    RCLCPP_INFO(this->get_logger(), "Loaded map points: %zu", pcd_map_ori_->points_.size());
 
     if (!pcd_map_ori_->HasColors())
     {
@@ -469,11 +478,22 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     pcd_map_coarse_->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxelsize_coarse_ * 2, 30));
 
     /// publish map, 用粗地图可视化，减少资源占用
-    sensor_msgs::msg::PointCloud2 pc2_map;
-    open3d_conversions::open3dToRos(*pcd_map_coarse_, pc2_map);
-    pc2_map.header.frame_id = map_frame_;
-    pc2_map.header.stamp = this->now();
-    pub_map_->publish(pc2_map);
+    open3d_conversions::open3dToRos(*pcd_map_coarse_, pc2_map_vis_);
+    pc2_map_vis_.header.frame_id = map_frame_;
+    pc2_map_vis_.header.stamp = this->now();
+    pub_map_->publish(pc2_map_vis_);
+    RCLCPP_INFO(this->get_logger(), "Published /map visualization cloud: %u points",
+                pc2_map_vis_.width * pc2_map_vis_.height);
+    // Republish periodically so Volatile RViz configs still see the static map.
+    map_pub_timer_ = this->create_wall_timer(
+        std::chrono::seconds(2),
+        [this]() {
+          if (pc2_map_vis_.data.empty()) {
+            return;
+          }
+          pc2_map_vis_.header.stamp = this->now();
+          pub_map_->publish(pc2_map_vis_);
+        });
 
     pcd_map_fine_ = pcd_map_ori_->VoxelDownSample(voxelsize_fine_);
     pcd_map_fine_->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxelsize_fine_ * 2, 30));
