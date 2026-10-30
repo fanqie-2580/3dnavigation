@@ -10,3 +10,7 @@ Robot 3D navigation / planning / localization workspace (source only).
 - `Elevator-LIO-main`, `SCAN-Planner-main`, `go2_cmd_vel_handler`, `fastlio_reloc` — related packages
 
 Build artifacts, bags, maps, and model weights are intentionally excluded.
+
+## Mapping & Navigation Bringup
+
+See [`bringup/README.md`](bringup/README.md) for Go2 + FAST-LIO + DDDMR + EGO mapping/navigation scripts.
