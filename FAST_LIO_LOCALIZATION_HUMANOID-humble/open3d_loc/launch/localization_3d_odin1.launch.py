@@ -38,8 +38,12 @@ def generate_launch_description():
                 'pcd_queue_maxsize': 10,
                 'voxelsize_coarse': 0.05,
                 'voxelsize_fine': 0.2,
-                'threshold_fitness': 0.35,
-                'threshold_fitness_init': 0.35,
+                # Odin map was built in the same continuous odom frame as live
+                # cloud_slam. Identity already overlaps well; ICP often slides
+                # ~1m/20deg in corridors and makes reloc look wrong. Keep map≡odom
+                # after init by requiring near-perfect fitness to update.
+                'threshold_fitness': 0.995,
+                'threshold_fitness_init': 0.85,
                 'loc_frequence': 2.0,
                 'save_scan': False,
                 'maxpoints_source': 80000,

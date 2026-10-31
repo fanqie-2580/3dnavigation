@@ -62,7 +62,10 @@ nohup ros2 launch open3d_loc localization_3d_odin1.launch.py \
   map_file:="$MAP" \
   localization_rviz:=true \
   > /tmp/odin1_localization.log 2>&1 &
-sleep 6
+sleep 8
+# Same continuous Odin odom as mapping: force map≡odom (ICP corridor slide otherwise)
+python3 "$ODIN_NAV/scripts/odin1_reset_odom2map_identity.py" \
+  > /tmp/odin1_reset_o2m.log 2>&1 || true
 
 # 3) DDDMR docker
 if ! docker ps --format '{{.Names}}' | grep -qx dddmr_dev; then
