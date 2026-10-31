@@ -1,0 +1,73 @@
+/**:
+  ros__parameters:
+    common:
+        lid_topic:  "/velodyne_points"
+        # imu_topic:  "/imu/data"
+        imu_topic:  "/imu"
+        # imu_topic:  "/rslidar_imu_data"
+        time_sync_en: false  #false         # ONLY turn on when external time synchronization is really not possible
+
+    preprocess:
+        lidar_type: 2                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR,
+        scan_line: 24     #16
+        scan_rate: 10                # only need to be set for velodyne, unit: Hz,
+        blind: 1.5             #1.4          #1.0
+        point_filter_num: 1
+        min_range: 0.3
+        max_range: 25.0   #100.0      #25.0
+
+    mapping:
+        down_sample_size: 0.4   #0.4  0.2
+        max_iteration: 4
+        voxel_size: 0.5     #0.25
+        max_layer: 2 #2                # 4 layer, 0, 1, 2, 3
+        layer_point_size: [ 5.0, 5.0, 5.0, 5.0, 5.0 ]
+        plannar_threshold: 0.02         #0.01
+        max_points_size: 1000
+        max_cov_points_size: 1000
+
+        fov_degree:    360
+        det_range:     100.0
+        extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic,
+        #lidar->imu
+        # extrinsic_T:  [0.0, 0.0, 0.0739]
+        # extrinsic_R: [ 1.0, 0.0, 0.0,
+        #                0.0, 1.0, 0.0,
+        #                0.0, 0.0, 1.0 ]
+        #框架机1 33度安装
+        # extrinsic_T:  [0.0389256, -0.104998, 0.0347228]
+        # extrinsic_R: [ 0.8387,  0.0,   0.5446,
+        #                 0.0,     1.0,   0.0,
+        #                 -0.5446,  0.0,   0.8387]  # 绕 y 轴向下倾斜 33°
+        #框架机2 8度安装 自装imu
+        extrinsic_T:  [0.0389256, -0.104998, 0.0347228]
+        extrinsic_R: [ 0.9914,  0.0,   0.1305,
+                        0.0,     1.0,   0.0,
+                        -0.1305,  0.0,   0.9914]  # 绕 y 轴向下倾斜 8°
+        #框架机2 8度安装 雷达内置imu
+        # extrinsic_T:  [0.0, 0.0, -0.015625]
+        # extrinsic_R: [ 1.0,  0.0,   0.0,
+        #                 0.0,  1.0,   0.0,
+        #                 0.0,  0.0,   1.0]
+    noise_model:
+        ranging_cov: 0.04
+        angle_cov: 0.1
+        acc_cov: 0.2
+        gyr_cov: 0.05
+        b_acc_cov: 0.0043
+        b_gyr_cov: 0.000266
+
+
+    publish:
+        pub_voxel_map: false
+        publish_max_voxel_layer: 1         # only publish 0,1,2 layer's plane
+        path_en:  true
+        scan_publish_en:  true       # false: close all the point cloud output
+        dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+        scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+    pcd_save:
+        pcd_save_en: false
+        interval: -1                 # how many LiDAR frames saved in each pcd file;
+        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+        save_path: "./map_output"    # map output directory; change without rebuilding

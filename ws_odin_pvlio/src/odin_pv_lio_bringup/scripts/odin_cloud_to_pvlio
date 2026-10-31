@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Convert Odin1 /odin1/cloud_raw to Velodyne-like PointCloud2 for PV-LIO."""
+from typing import Optional
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs_py import point_cloud2 as pc2
+
+
+class OdinCloudToPvLio(Node):
+    def __init__(self):
+        super().__init__('odin_cloud_to_pvlio')
+        self.declare_parameter('input_topic', '/odin1/cloud_raw')
+        self.declare_parameter('output_topic', '/odin1/points_pvlio')
+        self.declare_parameter('min_confidence', 30)
+        self.declare_parameter('blind', 0.2)
+        inp = self.get_parameter('input_topic').value
+        out = self.get_parameter('output_topic').value
+        self.min_conf = int(self.get_parameter('min_confidence').value)
+        self.blind = float(self.get_parameter('blind').value)
+        self.pub = self.create_publisher(PointCloud2, out, 10)
+        self.sub = self.create_subscription(PointCloud2, inp, self.cb, 10)
+        self.get_logger().info(
+            f'odin_cloud_to_pvlio: {inp} -> {out} conf>={self.min_conf} blind={self.blind}')
+
+    def cb(self, msg: PointCloud2):
+        names = [f.name for f in msg.fields]
+        has_ot = 'offset_time' in names
+        has_conf = 'confidence' in names
+        field_names = ['x', 'y', 'z', 'intensity']
+        if has_conf:
+            field_names.append('confidence')
+        if has_ot:
+            field_names.append('offset_time')
+        try:
+            pts = list(pc2.read_points(msg, field_names=field_names, skip_nans=True))
+        except Exception as e:
+            self.get_logger().error(f'read_points failed: {e}')
+            return
+        out_pts = []
+        for p in pts:
+            x = float(p[0]); y = float(p[1]); z = float(p[2])
+            intensity = float(p[3])
+            idx = 4
+            conf = 255
+            if has_conf:
+                conf = int(p[idx]); idx += 1
+            ot = 0.0
+            if has_ot:
+                ot = float(p[idx])
+            if conf < self.min_conf:
+                continue
+            if (x*x + y*y + z*z) < self.blind * self.blind:
+                continue
+            out_pts.append((x, y, z, intensity, 0, ot * 1.0e6))
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='ring', offset=16, datatype=PointField.UINT16, count=1),
+            PointField(name='time', offset=18, datatype=PointField.FLOAT32, count=1),
+        ]
+        self.pub.publish(pc2.create_cloud(msg.header, fields, out_pts))
+
+
+def main(args: Optional[list] = None):
+    rclpy.init(args=args)
+    node = OdinCloudToPvLio()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

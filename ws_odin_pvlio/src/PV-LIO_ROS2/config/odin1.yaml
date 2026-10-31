@@ -1,0 +1,52 @@
+/**:
+  ros__parameters:
+    common:
+      lid_topic: "/odin1/points_pvlio"
+      imu_topic: "/odin1/imu"
+      time_sync_en: false
+
+    preprocess:
+      lidar_type: 2
+      scan_line: 16
+      scan_rate: 10
+      blind: 0.2
+      point_filter_num: 2
+
+    mapping:
+      down_sample_size: 0.2
+      max_iteration: 4
+      voxel_size: 0.5
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.01
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 30.0
+      # Odin1 integrated IMU+LiDAR: start near identity; online refine
+      extrinsic_est_en: true
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      acc_cov: 0.2
+      gyr_cov: 0.05
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+
+    publish:
+      pub_voxel_map: false
+      publish_max_voxel_layer: 1
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: true
+      save_path: "/home/ll/ws_odin_pvlio/maps"
+      interval: -1
