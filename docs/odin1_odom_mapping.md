@@ -41,6 +41,33 @@ ros2 service call /save_map std_srvs/srv/Trigger
 默认文件：`/home/ll/ws_odin_pvlio/maps/odin1_odom_map.pcd`  
 `06_save_map.sh` 会额外复制一份带时间戳的副本。
 
+## 分割（给 dddmr）
+
+存图后把全局 PCD 拆成地面/障碍两份（`FIELDS x y z`，可被 dddmr `pcl_publisher` 直接加载）：
+
+```bash
+bash /home/ll/ws_odin_pvlio/scripts/07_segment_map.sh
+# 或指定输入
+bash /home/ll/ws_odin_pvlio/scripts/07_segment_map.sh /home/ll/ws_odin_pvlio/maps/odin1_odom_map.pcd
+```
+
+输出：
+
+- `/home/ll/ws_odin_pvlio/maps/segmentation_ground_map.pcd` → dddmr `mapground`
+- `/home/ll/ws_odin_pvlio/maps/segmentation_obstacle_map.pcd` → dddmr `mapcloud`
+
+拷到导航数据目录：
+
+```bash
+cp /home/ll/ws_odin_pvlio/maps/segmentation_ground_map.pcd \
+   /home/ll/ws_odin_pvlio/maps/segmentation_obstacle_map.pcd \
+   /home/ll/dddmr_navigation/src/dddmr_global_planner/data/
+```
+
+可调环境变量：`VOXEL` `DISTANCE` `MAX_ANGLE` `MAX_HEIGHT` `MIN_OBSTACLE_HEIGHT`。
+
+> 分割只处理静态全局图。以后用 Odin 导航时，还需要把 dddmr 实时 `lidar_topic` / `sensor_frame` 改成 Odin 点云（另做联调）。
+
 ## 停止
 
 ```bash
