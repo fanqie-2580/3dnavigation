@@ -71,6 +71,9 @@ namespace zjloc
     bool level_map_enable = true;
     bool level_map_on_save = true;
     bool level_map_on_publish = true;
+    // When false, lock ground leveling once and never refresh (safer for Odin).
+    // Mid-360 keeps default true.
+    bool level_map_refresh_enable = true;
     int level_map_min_points = 3000;
     int level_map_lock_frame = 40;
     double level_map_low_z_quantile = 0.35;

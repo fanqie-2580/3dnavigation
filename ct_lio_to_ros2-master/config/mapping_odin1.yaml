@@ -70,14 +70,15 @@
     publish_full_map_every_n_frames: 10
     save_map_path: "/home/ll/ws_odin_pvlio/maps/odin1_ct_lio_map.pcd"
 
-    # Odin: rely on IMU gravity leveling only. Auto ground-plane leveling on
-    # publish was unstable (tilt oscillated several degrees) and re-tilted the map.
-    # Do NOT copy these into Mid-360 mapping.yaml.
+    # Odin: no auto ground-plane leveling — plane fit misfires on indoor clutter
+    # (~10° bad lock). Keep map as gravity_level=off lidar frame (~1° floor).
+    # Mid-360 mapping.yaml untouched.
     level_map_enable: false
     level_map_on_save: false
     level_map_on_publish: false
+    level_map_refresh_enable: false
     level_map_min_points: 3000
-    level_map_lock_frame: 20
+    level_map_lock_frame: 40
     level_map_low_z_quantile: 0.35
     level_map_min_tilt_deg: 0.5
 

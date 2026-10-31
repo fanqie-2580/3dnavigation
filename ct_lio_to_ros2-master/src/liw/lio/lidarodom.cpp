@@ -172,6 +172,8 @@ namespace zjloc
     nh->get_parameter("level_map_on_save", options_.level_map_on_save);
     nh->declare_parameter<bool>("level_map_on_publish", true);
     nh->get_parameter("level_map_on_publish", options_.level_map_on_publish);
+    nh->declare_parameter<bool>("level_map_refresh_enable", true);
+    nh->get_parameter("level_map_refresh_enable", options_.level_map_refresh_enable);
     nh->declare_parameter<int>("level_map_min_points", 3000);
     nh->get_parameter("level_map_min_points", options_.level_map_min_points);
     nh->declare_parameter<int>("level_map_lock_frame", 40);
@@ -1382,7 +1384,11 @@ namespace zjloc
     {
       return;
     }
-    // Re-estimate periodically so early lock cannot freeze a bad residual.
+    // Optionally re-estimate periodically (Mid-360). Odin prefers one-shot lock.
+    if (level_map_locked_ && !options_.level_map_refresh_enable)
+    {
+      return;
+    }
     const int refresh_every = std::max(options_.level_map_lock_frame, 20);
     if (level_map_locked_ && (index_frame % refresh_every) != 0)
     {
