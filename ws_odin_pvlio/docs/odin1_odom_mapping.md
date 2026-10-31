@@ -72,6 +72,21 @@ cp /home/ll/ws_odin_pvlio/maps/segmentation_ground_map.pcd \
 
 > 分割只处理静态全局图。以后用 Odin 导航时，还需要把 dddmr 实时 `lidar_topic` / `sensor_frame` 改成 Odin 点云（另做联调）。
 
+
+## 推荐：在拓展坞本机建图（避免 TCP 断连）
+
+断连原因通常是 Jetson↔坞 的 TCP 桥在传稠密 `cloud_slam` 时超时。建图请在坞上跑：
+
+```bash
+bash /home/ll/ws_odin_pvlio/scripts/08_start_dock_mapping.sh
+# 走完存图并拉回本机分割
+bash /home/ll/ws_odin_pvlio/scripts/09_pull_dock_map.sh
+# 停止
+bash /home/ll/ws_odin_pvlio/scripts/10_stop_dock_mapping.sh
+```
+
+坞上地图：`/home/unitree/odin_bridge/maps/odin1_4floor_map.pcd`
+
 ## 停止
 
 ```bash
