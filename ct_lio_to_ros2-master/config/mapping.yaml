@@ -1,0 +1,97 @@
+/**:
+  ros__parameters:
+    # preprocess parameters
+    point_filter_num: 1 # 接收数据时降采样，设置为1则保留所有点
+    lidar_type: 1 # 1-AVIA 2-velodyne 3-ouster  4-robosense 5-pandar
+    blind: 0.1 # 盲区 单位：米
+
+    # common parameters
+    imu_topic: "livox/imu" # /imu_raw   /gps/gtimu
+    lid_topic: "livox/lidar" # /points_raw  /rslidar_points /velodyne_points
+
+    # mapping parameters
+    # Mid-360 built-in IMU↔LiDAR only (FAST-LIO / Livox manual). Do NOT put the
+    # Go2 stalk +13° pitch here: after gravity leveling works, Ry(-13°) in R
+    # re-tilts /cloud_registered and /Laser_map by ~13° vs the RViz Grid.
+    # Stalk pitch belongs in base_to_lidar_* TF (and Livox pitch stays 0).
+    extrinsic_est_en: false
+    extrinsic_T: [-0.011, -0.02329, 0.04412]
+    extrinsic_R: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+
+    # TF only: Unitree official Go2 Mid-360 stalk (+13° about Y).
+    map_frame: "map"
+    base_frame: "base_link"
+    imu_frame: "mid360_imu"
+    lidar_frame: "mid360_lidar"
+    publish_static_sensor_tf: true
+    base_to_lidar_translation: [0.1870, 0.0, 0.0803]
+    base_to_lidar_rpy_deg: [0.0, 13.0, 0.0]
+
+    delay_time: 0.15 # 设置IMU超前量，用于IMU与Lidar之间的时间同步
+
+    # odometry parameters
+    surf_res: 0.2 # 控制特征点的密度，值越小，保留的点越多
+    log_print: true
+    max_num_iteration: 10 # CT_ICP迭代次数
+
+    # ct_icp parameters
+    icpmodel: "CT_POINT_TO_PLANE" # Options: [CT_POINT_TO_PLANE, POINT_TO_PLANE]
+    size_voxel_map: 0.2 # 体素大小，等于surf_res * sampling_rate
+    min_distance_points: 0.05 # 插入新点与周围点的距离不能小于此值的平方，使点云稀疏化
+    max_num_points_in_voxel: 20 # 体素内的最大点数
+    max_distance: 500.0 # 单位：米  大于此距离的体素会从体素地图中删除
+    weight_alpha: 0.9 # 平面性的权重
+    weight_neighborhood: 0.1 # 邻近性的权重
+    max_dist_to_plane_icp: 0.6 # 点到面的最大界距离，参与邻近性的计算，并且每个点计算残差项时，只计算点面距离此范围内的点，最好大于0.5
+    init_num_frames: 20 # 需要初始化的帧数
+    voxel_neighborhood: 1 # 查找邻近点时，查找的范围
+    max_number_neighbors: 20 # 查找的邻近点数
+    threshold_voxel_occupancy: 1 # 查找邻近点时，体素内至少要包含的点
+    estimate_normal_from_neighborhood: true
+    min_number_neighbors: 5 # 最小邻近点个数，邻域点小于该个数的点则不参与计算，并且参与邻近性的计算
+    power_planarity: 2.0 # a2D的幂，a2D = (sigma_2 - sigma_3) / sigma_1，用于计算平面性
+    num_closest_neighbors: 1 # 每个点计算一次残差项
+
+    sampling_rate: 1.0 # 点云采样率
+    ratio_of_nonground: 2.
+    max_num_residuals: 2000 # 残差项应满足的个数，大于此值才会停止添加残差项
+    min_num_residuals: 300 # 残差项的最小个数，算出残差项个数小于此值，则会打印警告
+    motion_compensation: "CONTINUOUS" # NONE, CONSTANT_VELOCITY, ITERATIVE, CONTINUOUS
+    beta_location_consistency: 1.0
+    beta_orientation_consistency: 1.0
+    beta_constant_velocity: 0.0
+    beta_small_velocity: 0.0
+
+    # 迭代阈值，若迭代后的位置与开始位置的差值小于此阈值，则认为已经收敛
+    thres_translation_norm: 0.01 # m
+    thres_orientation_norm: 0.1 # deg
+
+    # map publishing and saving
+    publish_full_map: true
+    publish_full_map_every_n_frames: 10
+    save_map_path: "ct_lio_map.pcd"
+
+    # Auto ground-plane leveling in map frame. Compensates residual tilt after
+    # gravity init + Ry(-13°) extrinsic so saved / published maps stay level
+    # for linefit and dddmr (target floor tilt << 2°).
+    level_map_enable: true
+    level_map_on_save: true
+    level_map_on_publish: true
+    level_map_min_points: 3000
+    level_map_lock_frame: 40
+    level_map_low_z_quantile: 0.35
+    level_map_min_tilt_deg: 0.5
+
+    # Rear-body map filter in local lidar frame. This only blocks points from
+    # entering the voxel map; it does not change CT-LIO pose optimization.
+    # For the current Mid-360 setup, negative x is behind the lidar.
+    map_rear_filter_enabled: true
+    map_rear_filter_x_min: -2.0
+    map_rear_filter_x_max: -0.4
+    # Width 0.6 m centered on the robot rear.
+    map_rear_filter_y_min: -0.3
+    map_rear_filter_y_max: 0.3
+    map_rear_filter_z_min: -0.2
+    map_rear_filter_z_max: 1.7

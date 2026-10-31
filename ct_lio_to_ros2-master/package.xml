@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ct_lio</name>
+  <version>0.0.0</version>
+
+  <description>
+    This work is created based on some optimization on ALOAM by HKUST and LOAM by CMU
+  </description>
+
+  <maintainer email="960732491@qq.com">chengwei</maintainer>
+
+  <license>BSD</license>
+  <url>https:*</url>
+  <author email="960732491@qq.com">chengwei</author>
+  
+  <!-- 构建工具改为 ament_cmake -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>rosbag2_cpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>eigen_conversions</depend>
+  <depend>message_runtime</depend>
+  <depend>message_generation</depend>
+  <depend>livox_ros_driver2</depend>
+
+  <!-- 导出构建类型 -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
