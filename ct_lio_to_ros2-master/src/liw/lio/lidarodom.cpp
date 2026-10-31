@@ -266,6 +266,12 @@ namespace zjloc
   {
     StaticIMUInit::Options imu_init_options;
     imu_init_options.use_speed_for_static_checking_ = false; // 本节数据不需要轮速计
+    nh->declare_parameter<double>("max_static_acce_var", imu_init_options.max_static_acce_var);
+    nh->declare_parameter<double>("max_static_gyro_var", imu_init_options.max_static_gyro_var);
+    nh->declare_parameter<double>("imu_init_time_seconds", imu_init_options.init_time_seconds_);
+    nh->get_parameter("max_static_acce_var", imu_init_options.max_static_acce_var);
+    nh->get_parameter("max_static_gyro_var", imu_init_options.max_static_gyro_var);
+    nh->get_parameter("imu_init_time_seconds", imu_init_options.init_time_seconds_);
     imu_init_ = StaticIMUInit(imu_init_options);
 
     // 从ROS 2参数服务器读取delay_time参数

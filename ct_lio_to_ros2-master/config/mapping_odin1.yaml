@@ -25,6 +25,11 @@
 
     delay_time: 0.15
 
+    # Odin IMU is noisier on the dock/Go2; relax static-init gates.
+    max_static_acce_var: 8.0
+    max_static_gyro_var: 2.0
+    imu_init_time_seconds: 1.5
+
     surf_res: 0.2
     log_print: true
     max_num_iteration: 10
