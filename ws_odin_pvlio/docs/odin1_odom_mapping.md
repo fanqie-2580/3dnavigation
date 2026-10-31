@@ -25,9 +25,11 @@ bash /home/ll/ws_odin_pvlio/scripts/02_run_mapping.sh
 
 ## 话题
 
-- 输入：`/odin1/odometry`、`/odin1/cloud_raw`
+- 输入：`/odin1/odometry`、`/odin1/cloud_slam`（已在 `odom` 系，**不再二次变换**）
 - 输出：`/cloud_registered`、`/Laser_map`、`/Odometry`、`/path`
 - TF：`map`→`odom`(static)→`base_link`
+
+> 糊图常见原因：对已在 `odom` 系的 `cloud_slam` 再乘里程计。mode=1 时桥接默认转发 `cloud_slam`。
 
 ## 存图
 

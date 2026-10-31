@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Accumulate Odin cloud_raw into a map using Odin's own /odin1/odometry (not PV/CT-LIO)."""
+"""Accumulate Odin clouds into a map.
+
+For custom_map_mode=1 prefer /odin1/cloud_slam (already in odom frame) —
+do NOT re-apply odometry (that caused heavy smearing).
+"""
 import math
 import threading
 from pathlib import Path as FsPath
@@ -42,14 +46,16 @@ def se3_from_pose(pose):
 class OdinOdomMapper(Node):
     def __init__(self):
         super().__init__("odin_odom_mapper")
-        self.declare_parameter("cloud_topic", "/odin1/cloud_raw")
+        self.declare_parameter("cloud_topic", "/odin1/cloud_slam")
         self.declare_parameter("odom_topic", "/odin1/odometry")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("save_map_path", "/home/ll/ws_odin_pvlio/maps/odin1_odom_map.pcd")
         self.declare_parameter("voxel_size", 0.05)
         self.declare_parameter("min_confidence", 30)
         self.declare_parameter("blind", 0.2)
-        # imu -> lidar from live Odin TF (nearly identity)
+        # True when cloud is already in odom/map (cloud_slam). False for cloud_raw.
+        self.declare_parameter("cloud_in_odom_frame", True)
+        # imu -> lidar only used when cloud_in_odom_frame=False
         self.declare_parameter("imu_to_lidar_xyz", [-0.004, 0.013, 0.026])
         self.declare_parameter("imu_to_lidar_rpy_deg", [0.66, -0.11, -0.29])
 
@@ -58,6 +64,7 @@ class OdinOdomMapper(Node):
         self.voxel = float(self.get_parameter("voxel_size").value)
         self.min_conf = int(self.get_parameter("min_confidence").value)
         self.blind2 = float(self.get_parameter("blind").value) ** 2
+        self.cloud_in_odom = bool(self.get_parameter("cloud_in_odom_frame").value)
 
         xyz = list(self.get_parameter("imu_to_lidar_xyz").value)
         rpy = [math.radians(v) for v in self.get_parameter("imu_to_lidar_rpy_deg").value]
@@ -73,7 +80,6 @@ class OdinOdomMapper(Node):
 
         self._lock = threading.Lock()
         self._latest_odom = None
-        self._map_pts = []  # list of Nx3 arrays, voxel-merged periodically
         self._voxel_dict = {}
         self._path = Path()
         self._path.header.frame_id = self.map_frame
@@ -90,7 +96,7 @@ class OdinOdomMapper(Node):
         self.tf_br = TransformBroadcaster(self)
         self.static_br = StaticTransformBroadcaster(self)
 
-        # map == odom in Odin mode 0
+        # map coincidences with odom for Odin SLAM world cloud
         static_tf = TransformStamped()
         static_tf.header.stamp = self.get_clock().now().to_msg()
         static_tf.header.frame_id = self.map_frame
@@ -98,16 +104,16 @@ class OdinOdomMapper(Node):
         static_tf.transform.rotation.w = 1.0
         self.static_br.sendTransform(static_tf)
 
+        cloud_topic = self.get_parameter("cloud_topic").value
         self.create_subscription(
             Odometry, self.get_parameter("odom_topic").value, self.on_odom, 50
         )
-        self.create_subscription(
-            PointCloud2, self.get_parameter("cloud_topic").value, self.on_cloud, qos
-        )
+        self.create_subscription(PointCloud2, cloud_topic, self.on_cloud, qos)
         self.create_service(Trigger, "/save_map", self.on_save)
         self.create_timer(1.0, self.publish_map)
         self.get_logger().info(
-            f"Odin-odom mapper ready. save -> {self.save_path} voxel={self.voxel}"
+            f"Odin mapper ready. cloud={cloud_topic} in_odom={self.cloud_in_odom} "
+            f"save -> {self.save_path} voxel={self.voxel}"
         )
 
     def on_odom(self, msg: Odometry):
@@ -145,8 +151,6 @@ class OdinOdomMapper(Node):
     def on_cloud(self, msg: PointCloud2):
         with self._lock:
             odom = self._latest_odom
-        if odom is None:
-            return
 
         names = [f.name for f in msg.fields]
         fields = ["x", "y", "z"]
@@ -161,33 +165,36 @@ class OdinOdomMapper(Node):
         if not pts:
             return
 
-        arr = np.zeros((len(pts), 3), dtype=np.float64)
         keep = []
-        for i, p in enumerate(pts):
+        for p in pts:
             x, y, z = float(p[0]), float(p[1]), float(p[2])
             conf = int(p[3]) if has_conf else 255
             if conf < self.min_conf:
                 continue
-            if x * x + y * y + z * z < self.blind2:
+            # blind only meaningful in sensor frame
+            if (not self.cloud_in_odom) and (x * x + y * y + z * z < self.blind2):
                 continue
             keep.append((x, y, z))
         if not keep:
             return
         arr = np.asarray(keep, dtype=np.float64)
 
-        T_odom_imu = se3_from_pose(odom.pose.pose)
-        T_odom_lidar = T_odom_imu @ self.T_imu_lidar
-        R = T_odom_lidar[:3, :3]
-        t = T_odom_lidar[:3, 3]
-        world = (arr @ R.T) + t
+        if self.cloud_in_odom:
+            # cloud_slam: already registered in odom
+            world = arr
+        else:
+            if odom is None:
+                return
+            T_odom_imu = se3_from_pose(odom.pose.pose)
+            T_odom_lidar = T_odom_imu @ self.T_imu_lidar
+            R = T_odom_lidar[:3, :3]
+            t = T_odom_lidar[:3, 3]
+            world = (arr @ R.T) + t
 
-        # publish current scan
         header = msg.header
         header.frame_id = self.map_frame
-        scan_msg = pc2.create_cloud_xyz32(header, world.astype(np.float32))
-        self.pub_scan.publish(scan_msg)
+        self.pub_scan.publish(pc2.create_cloud_xyz32(header, world.astype(np.float32)))
 
-        # insert into voxel map
         inv = 1.0 / max(self.voxel, 1e-3)
         keys = np.floor(world * inv).astype(np.int32)
         with self._lock:

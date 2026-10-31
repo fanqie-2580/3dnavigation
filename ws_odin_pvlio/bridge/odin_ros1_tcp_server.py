@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""ROS1 (dock) -> TCP bridge for Odin /imu, /cloud_raw, /odometry."""
+"""ROS1 (dock) -> TCP bridge for Odin /imu, /cloud_slam (or raw), /odometry.
+
+In custom_map_mode=1, prefer /odin1/cloud_slam (already in odom frame).
+"""
 from __future__ import print_function
 import queue
 import socket
@@ -165,7 +168,8 @@ def main():
     rospy.init_node("odin_ros1_tcp_server", anonymous=False)
     port = int(rospy.get_param("~port", DEFAULT_PORT))
     imu_topic = rospy.get_param("~imu_topic", "/odin1/imu")
-    cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_raw")
+    # SLAM cloud is already in odom frame; raw lidar frame needs host-side transform
+    cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_slam")
     odom_topic = rospy.get_param("~odom_topic", "/odin1/odometry")
 
     hub = ClientHub()
