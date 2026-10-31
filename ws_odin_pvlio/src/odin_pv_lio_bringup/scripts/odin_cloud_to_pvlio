@@ -52,7 +52,14 @@ class OdinCloudToPvLio(Node):
                 continue
             if (x*x + y*y + z*z) < self.blind * self.blind:
                 continue
-            out_pts.append((x, y, z, intensity, 0, ot * 1.0e6))
+            # PV-LIO velodyne_handler expects per-point time in seconds within
+            # ~(1/scan_rate/1800, 1.1/scan_rate). Odin offset_time is already seconds.
+            if ot <= 0.0:
+                ot = 1.0e-4
+            if ot > 0.1:
+                # tolerate accidental microsecond payloads
+                ot *= 1.0e-6
+            out_pts.append((x, y, z, intensity, 0, float(ot)))
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
