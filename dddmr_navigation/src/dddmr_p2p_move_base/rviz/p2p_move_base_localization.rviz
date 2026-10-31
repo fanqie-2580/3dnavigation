@@ -68,8 +68,8 @@ Visualization Manager:
         Filter size: 1
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /sub_mapcloud
-      Use Fixed Frame: true
+        Value: /mapcloud
+      Use Fixed Frame: false
       Use rainbow: true
       Value: true
     - Alpha: 1
@@ -84,7 +84,7 @@ Visualization Manager:
       Color: 170; 255; 127
       Color Transformer: FlatColor
       Decay Time: 0
-      Enabled: false
+      Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -103,9 +103,9 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /mapground
-      Use Fixed Frame: true
+      Use Fixed Frame: false
       Use rainbow: true
-      Value: false
+      Value: true
     - Alpha: 0.5
       Autocompute Intensity Bounds: false
       Autocompute Value Bounds:
@@ -238,8 +238,8 @@ Visualization Manager:
         Filter size: 1
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /sub_mapcloud
-      Use Fixed Frame: true
+        Value: /mapcloud
+      Use Fixed Frame: false
       Use rainbow: true
       Value: false
     - Class: rviz_default_plugins/Axes

@@ -82,7 +82,7 @@ Visualization Manager:
             Value: /cloud_registered_1
           Use Fixed Frame: true
           Use rainbow: false
-          Value: false
+          Value: true
         - Angle Tolerance: 0.10000000149011612
           Class: rviz_default_plugins/Odometry
           Covariance:
@@ -122,7 +122,7 @@ Visualization Manager:
             Reliability Policy: Best Effort
             Value: /baselink2map
           Value: true
-      Enabled: false
+      Enabled: true
       Name: Robot and Sensor
     - Class: rviz_common/Group
       Displays:

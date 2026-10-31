@@ -234,7 +234,9 @@ def generate_launch_description():
         ]
     )
 
-    rviz_config_path = os.path.join(ego_share, 'launch', 'default.rviz')
+    # Go2 real-robot layout: Fixed Frame=map, /baselink2map, /cloud_registered_1,
+    # /drone_0_grid/...  (default.rviz is for sim and uses Fixed Frame=world).
+    rviz_config_path = os.path.join(ego_share, 'launch', 'go2_navigation.rviz')
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',

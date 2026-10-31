@@ -1486,6 +1486,8 @@ void GridMap::publishMap()
   sensor_msgs::msg::PointCloud2 cloud_msg;
 
   pcl::toROSMsg(cloud, cloud_msg);
+  // Non-zero stamp so RViz MessageFilter can display against Fixed Frame=map.
+  cloud_msg.header.stamp = node_->now();
   map_pub_->publish(cloud_msg);
 }
 
@@ -1527,6 +1529,7 @@ void GridMap::publishMapInflate(bool all_info)
   sensor_msgs::msg::PointCloud2 cloud_msg;
 
   pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.stamp = node_->now();
   map_inf_pub_->publish(cloud_msg);
 
   // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
