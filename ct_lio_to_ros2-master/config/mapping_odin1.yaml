@@ -29,6 +29,8 @@
     max_static_acce_var: 8.0
     max_static_gyro_var: 2.0
     imu_init_time_seconds: 1.5
+    # Lidar floor is already ~level; IMU gravity leveling (~4°) was tilting the map.
+    imu_gravity_level_enable: false
 
     surf_res: 0.2
     log_print: true
@@ -68,11 +70,14 @@
     publish_full_map_every_n_frames: 10
     save_map_path: "/home/ll/ws_odin_pvlio/maps/odin1_ct_lio_map.pcd"
 
-    level_map_enable: true
-    level_map_on_save: true
-    level_map_on_publish: true
+    # Odin: rely on IMU gravity leveling only. Auto ground-plane leveling on
+    # publish was unstable (tilt oscillated several degrees) and re-tilted the map.
+    # Do NOT copy these into Mid-360 mapping.yaml.
+    level_map_enable: false
+    level_map_on_save: false
+    level_map_on_publish: false
     level_map_min_points: 3000
-    level_map_lock_frame: 40
+    level_map_lock_frame: 20
     level_map_low_z_quantile: 0.35
     level_map_min_tilt_deg: 0.5
 

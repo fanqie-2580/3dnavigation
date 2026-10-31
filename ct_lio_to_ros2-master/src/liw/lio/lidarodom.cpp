@@ -269,9 +269,11 @@ namespace zjloc
     nh->declare_parameter<double>("max_static_acce_var", imu_init_options.max_static_acce_var);
     nh->declare_parameter<double>("max_static_gyro_var", imu_init_options.max_static_gyro_var);
     nh->declare_parameter<double>("imu_init_time_seconds", imu_init_options.init_time_seconds_);
+    nh->declare_parameter<bool>("imu_gravity_level_enable", true);
     nh->get_parameter("max_static_acce_var", imu_init_options.max_static_acce_var);
     nh->get_parameter("max_static_gyro_var", imu_init_options.max_static_gyro_var);
     nh->get_parameter("imu_init_time_seconds", imu_init_options.init_time_seconds_);
+    nh->get_parameter("imu_gravity_level_enable", imu_gravity_level_enable_);
     imu_init_ = StaticIMUInit(imu_init_options);
 
     // 从ROS 2参数服务器读取delay_time参数
@@ -1776,7 +1778,10 @@ namespace zjloc
       const double gravity_norm = imu_init_.GetGravity().norm();
       const Vec3d gravity_world(0.0, 0.0, -gravity_norm);
       // Align body +mean_acce (specific force / "up") to world +Z so map XY is horizontal.
-      const SO3 init_rotation = BuildInitialOrientationFromMeanAcce(mean_acce);
+      // Optional: skip for sensors whose lidar frame is already level (e.g. Odin1).
+      const SO3 init_rotation = imu_gravity_level_enable_
+                                    ? BuildInitialOrientationFromMeanAcce(mean_acce)
+                                    : SO3();
       const Vec3d init_rpy_deg = RotationMatrixToRpyDeg(init_rotation.matrix());
       const double init_timestamp =
           measures_.imu_.empty() ? -1.0 : measures_.imu_.back()->timestamp_;
@@ -1794,12 +1799,14 @@ namespace zjloc
       }
       LOG(INFO) << "ESKF init leveling, mean acce(body) = " << mean_acce.transpose()
                 << ", gravity(world) = " << gravity_world.transpose()
+                << ", gravity_level_en = " << imu_gravity_level_enable_
                 << ", init rpy deg = " << init_rpy_deg.transpose()
                 << ", init ba = " << imu_init_.GetInitBa().transpose()
                 << ", init time = " << init_timestamp;
       imu_need_init_ = false;
 
-      std::cout << ANSI_COLOR_GREEN_BOLD << "IMU初始化成功 (gravity leveled, rpy deg "
+      std::cout << ANSI_COLOR_GREEN_BOLD << "IMU初始化成功 (gravity_level="
+                << (imu_gravity_level_enable_ ? "on" : "off") << ", rpy deg "
                 << init_rpy_deg.transpose() << ")" << ANSI_COLOR_RESET << std::endl;
     }
   }

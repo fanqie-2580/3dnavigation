@@ -183,6 +183,9 @@ namespace zjloc
     SE3 TIL_;                   //   lidar 转换到 imu
     MeasureGroup measures_;     // sync IMU and lidar scan
     bool imu_need_init_ = true; // 是否需要估计IMU初始零偏
+    // When true (default, Mid-360), align body +mean_acce to world +Z at init.
+    // Odin lidar is already near-level while IMU can be a few degrees off; disable there.
+    bool imu_gravity_level_enable_ = true;
     int index_frame = 1;
     liwOptions options_;
 

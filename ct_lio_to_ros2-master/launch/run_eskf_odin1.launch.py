@@ -15,7 +15,8 @@ def generate_launch_description():
     source_config = os.path.abspath(
         os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "config", "mapping_odin1.yaml")
     )
-    config_path = share_config if os.path.isfile(share_config) else source_config
+    # Prefer source-tree yaml so edits take effect even when install/ is a stale copy.
+    config_path = source_config if os.path.isfile(source_config) else share_config
 
     use_sim_time = LaunchConfiguration("use_sim_time")
     namespace = LaunchConfiguration("namespace")
