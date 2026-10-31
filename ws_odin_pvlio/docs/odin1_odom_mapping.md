@@ -1,6 +1,8 @@
 # Odin1 建图（使用 Odin 自带里程计）
 
-默认建图不再用 PV-LIO / CT-LIO 的里程计，而是用 Odin `custom_map_mode=0` 输出的 `/odin1/odometry`，把 `/odin1/cloud_raw` 叠成地图。
+默认建图不再用 PV-LIO / CT-LIO 的里程计，而是用 Odin **`custom_map_mode=1`（SLAM，带回环）** 输出的 `/odin1/odometry`，把 `/odin1/cloud_raw` 叠成地图。
+
+> mode `0` 仅外部 LIO 用，位姿易卡住导致重影；室内用 Odin 自带位姿建图请保持 `1`。
 
 ## 拓扑
 
