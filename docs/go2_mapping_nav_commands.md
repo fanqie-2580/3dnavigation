@@ -22,11 +22,14 @@ ROS：**Humble**。当前联调默认 **RMW = CycloneDDS**（宿主机与 `dddmr
 /home/ll/unitree_ros2
 ```
 
-默认定位地图：
+当前联调定位地图（已验证）：
 
 ```text
-/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/ct_lio_map.pcd
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/odin1_odom_map.pcd
 ```
+
+> **定位 → 导航最短命令清单**见同目录  
+> [`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md)（已按 2026-11-02 在跑进程核对）。
 
 Go2 MID360 `body→base` 外参（当前联调）：
 
@@ -176,10 +179,11 @@ nohup ros2 launch livox_ros_driver2 msg_MID360_launch.py \
 source /home/ll/ws_livox/install/setup.bash
 source /home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/install/setup.bash
 
-MAP=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/ct_lio_map.pcd
+MAP=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/odin1_odom_map.pcd
 
 ros2 launch open3d_loc localization_3d_go2.launch.py \
   map_file:=$MAP \
+  fastlio_config_file:=mid360.yaml \
   body_to_base_qy:=-0.1132032138 \
   body_to_base_qw:=0.9935718557 \
   localization_rviz:=true \
@@ -191,6 +195,7 @@ ros2 launch open3d_loc localization_3d_go2.launch.py \
 ```bash
 nohup ros2 launch open3d_loc localization_3d_go2.launch.py \
   map_file:=$MAP \
+  fastlio_config_file:=mid360.yaml \
   body_to_base_qy:=-0.1132032138 \
   body_to_base_qw:=0.9935718557 \
   localization_rviz:=true \
@@ -216,9 +221,12 @@ source /root/dddmr_ws/install/setup.bash
 cd /root/dddmr_ws
 
 ros2 launch p2p_move_base dddmr_global_ego_docker.launch.py \
+  config_file:=/root/dddmr_ws/src/dddmr_p2p_move_base/config/p2p_move_base_localization_static_map.yaml \
+  map_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd \
+  ground_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_ground_map.pcd \
   odom_topic:=/baselink2map \
   lidar_topic:=/livox/lidar_pointcloud2 \
-  use_rviz:=true \
+  use_rviz:=false \
   publish_sensor_tf:=true \
   publish_base_footprint_tf:=true
 ```
@@ -235,6 +243,9 @@ docker exec -d dddmr_dev bash -lc '
   source /root/dddmr_ws/install/setup.bash
   cd /root/dddmr_ws
   nohup ros2 launch p2p_move_base dddmr_global_ego_docker.launch.py \
+    config_file:=/root/dddmr_ws/src/dddmr_p2p_move_base/config/p2p_move_base_localization_static_map.yaml \
+    map_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd \
+    ground_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_ground_map.pcd \
     odom_topic:=/baselink2map \
     lidar_topic:=/livox/lidar_pointcloud2 \
     use_rviz:=false \
@@ -499,5 +510,4 @@ docker exec -it dddmr_dev bash -lc '
 # 然后在 DDDMR RViz → Publish Point
 ```
 
-详细命令见第 3 节；关闭见第 5–6 节。
-```
+详细命令见第 3 节与 [`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md)；关闭见第 5–6 节。
