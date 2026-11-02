@@ -1462,20 +1462,12 @@ namespace ego_planner
         }
         else
         {
+          // Match SCAN: drop this collision segment and keep optimizing with whatever
+          // rebound guides remain instead of hard-aborting the whole plan.
           RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "a star error");
           segment_ids.erase(segment_ids.begin() + i);
           i--;
         }
-      }
-
-      // Without any valid A* repair path, continuing L-BFGS only fits a soft cost and
-      // readily accepts wall-crossing trajectories. Abort like a hard planning failure.
-      if (segment_ids.empty() || a_star_pathes.size() != segment_ids.size())
-      {
-        RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"),
-                     "No valid A* rebound guides left after collision segment search; abort.");
-        force_stop_type_ = STOP_FOR_ERROR;
-        return false;
       }
 
       for (size_t i = 1; i < segment_ids.size(); i++) // Avoid overlap
@@ -1491,6 +1483,14 @@ namespace ego_planner
       /*** Assign parameters to each segment ***/
       for (size_t i = 0; i < segment_ids.size(); ++i)
       {
+        // Match SCAN: skip desynced / empty A* paths instead of aborting.
+        if (i >= a_star_pathes.size() || a_star_pathes[i].size() < 2)
+        {
+          RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"),
+                      "Skip invalid A-star path while assigning rebound directions.");
+          continue;
+        }
+
         // step 1
         for (int j = segment_ids[i].first; j <= segment_ids[i].second; ++j)
           cps_.flag_temp[j] = false;
@@ -1701,8 +1701,7 @@ namespace ego_planner
           success = false;
           restart_nums++;
           initControlPoints(cps_.points, false);
-          if (init_control_points_failed_)
-            return false;
+          // Match SCAN: keep optimizing even if A* rebound guides are incomplete.
           new_lambda2_ *= 2; // 提高规避权重
 
           if (verbose_rebound_log_)
@@ -1720,14 +1719,13 @@ namespace ego_planner
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
         // 计算时间步长
-        // Ground-robot safety: reject if ANY sample along the full local trajectory hits
-        // inflate. The classic EGO 2/3 check leaves the tail free to cut corners through walls.
+        // Match SCAN: only check the closest 2/3 of the local trajectory.
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
         if (!(t_step > 0.0) || !std::isfinite(t_step))
           t_step = grid_map_->getResolution();
-        for (double t = tm; t <= tmp + 1e-9; t += t_step)
+        for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
         {
-          const Eigen::Vector3d position = traj.evaluateDeBoorT(std::min(tmp, t));
+          const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
           const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
           flag_occ = footprintOccupied(position, estimateSegmentYaw(position, next_position));
           if (flag_occ)
@@ -1805,12 +1803,7 @@ namespace ego_planner
         {
           restart_nums++;
           initControlPoints(cps_.points, false);
-          if (init_control_points_failed_)
-          {
-            RCLCPP_ERROR(rclcpp::get_logger("rebound_optimize"),
-                         "A-star failed while restarting rebound; abort optimization.");
-            return false;
-          }
+          // Match SCAN rebound_optimize restart: raise lambda and keep iterating.
           new_lambda2_ *= 2;
 
           if (verbose_rebound_log_)
@@ -1888,9 +1881,10 @@ namespace ego_planner
       double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
       if (!(t_step > 0.0) || !std::isfinite(t_step))
         t_step = grid_map_->getResolution();
-      for (double t = tm; t <= tmp + 1e-9; t += t_step)
+      // Match SCAN: only validate the closest 2/3 after refine.
+      for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
       {
-        const Eigen::Vector3d position = traj.evaluateDeBoorT(std::min(tmp, t));
+        const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
         const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
         if (footprintOccupied(position, estimateSegmentYaw(position, next_position)))
         {
