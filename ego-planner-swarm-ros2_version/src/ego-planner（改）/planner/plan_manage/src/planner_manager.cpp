@@ -501,6 +501,35 @@ namespace ego_planner
     // t_refine = ros::Time::now() - t_start;
     t_refine = rclcpp::Clock().now() - t_start;
 
+    // Final hard gate: never publish/display a trajectory that still intersects inflate.
+    {
+      double tm = 0.0, tmp = 0.0;
+      pos.getTimeSpan(tm, tmp);
+      const Eigen::Vector3d start_pos = pos.evaluateDeBoorT(tm);
+      const Eigen::Vector3d end_pos = pos.evaluateDeBoorT(tmp);
+      const double path_len = (end_pos - start_pos).norm();
+      double t_step = path_len > 1e-3 ? (tmp - tm) / (path_len / grid_map_->getResolution())
+                                      : grid_map_->getResolution();
+      if (!(t_step > 0.0) || !std::isfinite(t_step))
+        t_step = grid_map_->getResolution();
+      for (double t = tm; t <= tmp + 1e-9; t += t_step)
+      {
+        const Eigen::Vector3d p = pos.evaluateDeBoorT(std::min(tmp, t));
+        const Eigen::Vector3d p_next = pos.evaluateDeBoorT(std::min(tmp, t + t_step));
+        double yaw = 0.0;
+        if (!planarYaw(p, p_next, yaw))
+          yaw = 0.0;
+        if (!grid_map_->isFootprintFree(p, yaw))
+        {
+          RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
+                       "[EGO] Rejecting trajectory that still collides with inflate at t=%.3f pos=(%.2f,%.2f,%.2f)",
+                       t, p.x(), p.y(), p.z());
+          continous_failures_count_++;
+          return false;
+        }
+      }
+    }
+
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());
 

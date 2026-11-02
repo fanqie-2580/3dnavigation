@@ -300,31 +300,45 @@ GridMap::FootprintCollisionResult GridMap::checkFootprint(
     return result;
   }
 
+  // Twin-cylinder centers (SCAN-style) against the already-inflated map. Also sample
+  // the body-height band so wall hits that only exist mid-height still block the robot
+  // when vertical inflation has not yet projected them down to the trajectory z.
   const Eigen::Vector3d heading(std::cos(body_yaw), std::sin(body_yaw), 0.0);
   const Eigen::Vector3d centers[2] = {
       body_position + mp_.footprint_offset_ * heading,
       body_position - mp_.footprint_offset_ * heading};
+  const double z_down = std::max(0.0, mp_.footprint_z_down_);
+  const double z_up = std::max(0.0, mp_.footprint_z_up_);
+  const double z_step = std::max(mp_.resolution_, 1e-3);
   for (int cylinder = 0; cylinder < 2; ++cylinder)
   {
-    const Eigen::Vector3d &sample = centers[cylinder];
-    if (!isInMap(sample))
+    const Eigen::Vector3d &center = centers[cylinder];
+    if (!isInMap(center))
     {
       result.status = FootprintStatus::OUT_OF_MAP;
-      result.sample_position = sample;
-      result.cylinder_center = centers[cylinder];
+      result.sample_position = center;
+      result.cylinder_center = center;
       result.cylinder_index = cylinder;
       return result;
     }
 
-    Eigen::Vector3i index;
-    posToIndex(sample, index);
-    if (md_.occupancy_buffer_inflate_[toAddress(index)] != 0)
+    for (double dz = -z_down; dz <= z_up + 1e-9; dz += z_step)
     {
-      result.status = FootprintStatus::OCCUPIED;
-      result.sample_position = sample;
-      result.cylinder_center = centers[cylinder];
-      result.cylinder_index = cylinder;
-      return result;
+      Eigen::Vector3d sample = center;
+      sample(2) += dz;
+      if (!isInMap(sample))
+        continue;
+
+      Eigen::Vector3i index;
+      posToIndex(sample, index);
+      if (md_.occupancy_buffer_inflate_[toAddress(index)] != 0)
+      {
+        result.status = FootprintStatus::OCCUPIED;
+        result.sample_position = sample;
+        result.cylinder_center = center;
+        result.cylinder_index = cylinder;
+        return result;
+      }
     }
   }
 

@@ -1468,6 +1468,16 @@ namespace ego_planner
         }
       }
 
+      // Without any valid A* repair path, continuing L-BFGS only fits a soft cost and
+      // readily accepts wall-crossing trajectories. Abort like a hard planning failure.
+      if (segment_ids.empty() || a_star_pathes.size() != segment_ids.size())
+      {
+        RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"),
+                     "No valid A* rebound guides left after collision segment search; abort.");
+        force_stop_type_ = STOP_FOR_ERROR;
+        return false;
+      }
+
       for (size_t i = 1; i < segment_ids.size(); i++) // Avoid overlap
       {
         if (segment_ids[i - 1].second >= segment_ids[i].first)
@@ -1710,23 +1720,21 @@ namespace ego_planner
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
         // 计算时间步长
+        // Ground-robot safety: reject if ANY sample along the full local trajectory hits
+        // inflate. The classic EGO 2/3 check leaves the tail free to cut corners through walls.
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
+        if (!(t_step > 0.0) || !std::isfinite(t_step))
+          t_step = grid_map_->getResolution();
+        for (double t = tm; t <= tmp + 1e-9; t += t_step)
         {
-          const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
+          const Eigen::Vector3d position = traj.evaluateDeBoorT(std::min(tmp, t));
           const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
           flag_occ = footprintOccupied(position, estimateSegmentYaw(position, next_position));
           if (flag_occ)
           {
-            // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
             // 如果在前三个控制点范围内检测到了碰撞则视为不可行
             if (t <= bspline_interval_) // First 3 control points in obstacles!
             {
-              // cout << cps_.points.col(1).transpose() << "\n"
-              //      << cps_.points.col(2).transpose() << "\n"
-              //      << cps_.points.col(3).transpose() << "\n"
-              //      << cps_.points.col(4).transpose() << endl;
               RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
               return false;
             }
@@ -1878,21 +1886,14 @@ namespace ego_planner
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
       double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
-      for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
+      if (!(t_step > 0.0) || !std::isfinite(t_step))
+        t_step = grid_map_->getResolution();
+      for (double t = tm; t <= tmp + 1e-9; t += t_step)
       {
-        const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
+        const Eigen::Vector3d position = traj.evaluateDeBoorT(std::min(tmp, t));
         const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
         if (footprintOccupied(position, estimateSegmentYaw(position, next_position)))
         {
-          // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
-          // 将ref_pts存储为矩阵形式
-          Eigen::MatrixXd ref_pts(ref_pts_.size(), 3);
-          for (size_t i = 0; i < ref_pts_.size(); i++)
-          {
-            ref_pts.row(i) = ref_pts_[i].transpose();
-          }
-
           flag_safe = false;
           break;
         }
