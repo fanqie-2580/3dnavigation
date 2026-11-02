@@ -262,7 +262,8 @@ ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   use_rviz:=true \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
-  reference_path_topic:=/ego_repaired_global_path
+  reference_path_topic:=/ego_repaired_global_path \
+  reference_path_z_offset:=0.4
 ```
 
 后台：
@@ -273,6 +274,7 @@ nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
   reference_path_topic:=/ego_repaired_global_path \
+  reference_path_z_offset:=0.4 \
   > /tmp/ego_local_planner.log 2>&1 &
 ```
 

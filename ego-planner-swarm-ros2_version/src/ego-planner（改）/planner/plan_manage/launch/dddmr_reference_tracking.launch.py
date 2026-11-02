@@ -269,8 +269,8 @@ def generate_launch_description():
             description='DDDMR repaired global planner output path topic for EGO tracking'),
         DeclareLaunchArgument(
             'reference_path_z_offset',
-            default_value='0.0',
-            description='Height offset applied to align the DDDMR ground path z with the EGO odom/body planning z'),
+            default_value='0.4',
+            description='SCAN body_height equivalent: lift DDDMR ground-path z above Mid360 floor hits so inflate/collision checks run at body height'),
         DeclareLaunchArgument(
             'reference_path_start_skip_dist',
             default_value='0.2',
