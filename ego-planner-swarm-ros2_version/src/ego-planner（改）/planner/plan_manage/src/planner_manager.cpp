@@ -380,6 +380,13 @@ namespace ego_planner
 
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
+    // Match SCAN: if colliding seed cannot be repaired by A*, abort before optimizing
+    // a wall-crossing polynomial without rebound guides (and without flashing it in RViz).
+    if (bspline_optimizer_->initControlPointsFailed())
+    {
+      continous_failures_count_++;
+      return false;
+    }
     // 计算时间差并更新时间
     auto now = rclcpp::Clock().now();
     t_init = now - t_start;
@@ -446,7 +453,7 @@ namespace ego_planner
       cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
-      visualization_->displayOptimalList(ctrl_pts, 0);
+      // Match SCAN: do not publish/display a failed/colliding control-point set.
       continous_failures_count_++;
       return false;
     }

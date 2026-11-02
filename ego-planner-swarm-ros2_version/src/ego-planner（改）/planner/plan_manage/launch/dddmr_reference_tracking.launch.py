@@ -282,7 +282,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'continuous_replan',
             default_value='true',
-            description='Use SCAN-style distance-triggered continuous replanning'),
+            description='SCAN-style: after leaving the traj start by replan_distance, keep replanning'),
         DeclareLaunchArgument(
             'exec_interval_ms',
             default_value='10',
@@ -347,8 +347,8 @@ def generate_launch_description():
         DeclareLaunchArgument('local_update_range_x', default_value='5.0', description='SCAN local map update half-range along X'),
         DeclareLaunchArgument('local_update_range_y', default_value='5.0', description='SCAN local map update half-range along Y'),
         DeclareLaunchArgument('local_update_range_z', default_value='2.5', description='SCAN local map update half-range along Z'),
-        DeclareLaunchArgument('obstacles_inflation', default_value='0.30', description='XY inflation; SCAN double_cylinder_radius=0.25, +5cm for Mid360/indoor loc uncertainty'),
-        DeclareLaunchArgument('footprint_radius', default_value='0.30', description='Go2 twin-cylinder radius; kept aligned with obstacles_inflation (SCAN uses one shared radius)'),
+        DeclareLaunchArgument('obstacles_inflation', default_value='0.25', description='XY inflation; matches SCAN double_cylinder_radius'),
+        DeclareLaunchArgument('footprint_radius', default_value='0.25', description='Go2 twin-cylinder radius; matches SCAN double_cylinder_radius'),
         DeclareLaunchArgument('footprint_offset', default_value='0.18', description='Forward and rearward offset of the two Go2 footprint cylinders'),
         DeclareLaunchArgument('footprint_z_down', default_value='0.18', description='Collision volume below the body-frame trajectory height; excludes the leg support region'),
         DeclareLaunchArgument('footprint_z_up', default_value='0.22', description='Collision volume above the body-frame trajectory height'),
@@ -365,7 +365,7 @@ def generate_launch_description():
         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='SCAN obstacles_inflation_z_up=0.1'),
         DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.10', description='SCAN obstacles_inflation_z_down=0.1 (was 0.40 from older SCAN snapshot)'),
         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
-        DeclareLaunchArgument('dist0', default_value='0.25', description='Soft collision clearance; SCAN=0.2, +5cm to reduce wall-skimming'),
+        DeclareLaunchArgument('dist0', default_value='0.2', description='Soft collision clearance; matches SCAN optimization/dist0'),
         DeclareLaunchArgument('virtual_ceil_height', default_value='-1.0', description='Disable the virtual ceiling to match SCAN map behavior'),
         DeclareLaunchArgument('vis_height', default_value='0.3', description='Display occupancy up to this height above the current sensor pose; matches SCAN'),
         DeclareLaunchArgument('cx', default_value='321.04638671875', description='Camera intrinsic cx'),

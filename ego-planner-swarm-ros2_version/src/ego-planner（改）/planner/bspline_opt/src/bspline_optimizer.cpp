@@ -532,6 +532,7 @@ namespace ego_planner
   // 初始化控制点
   std::vector<std::pair<int, int>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
+    init_control_points_failed_ = false;
 
     if (flag_first_init)
     {
@@ -628,6 +629,7 @@ namespace ego_planner
         {
           RCLCPP_WARN(rclcpp::get_logger("initControlPoints"),
                       "A-star path has less than two points.");
+          init_control_points_failed_ = true;
           return {};
         }
         a_star_pathes.push_back(path);
@@ -635,6 +637,7 @@ namespace ego_planner
       else
       {
         RCLCPP_ERROR(rclcpp::get_logger("initControlPoints"), "A-star search failed.");
+        init_control_points_failed_ = true;
         return {};
       }
     }
@@ -1688,6 +1691,8 @@ namespace ego_planner
           success = false;
           restart_nums++;
           initControlPoints(cps_.points, false);
+          if (init_control_points_failed_)
+            return false;
           new_lambda2_ *= 2; // 提高规避权重
 
           if (verbose_rebound_log_)
@@ -1792,6 +1797,12 @@ namespace ego_planner
         {
           restart_nums++;
           initControlPoints(cps_.points, false);
+          if (init_control_points_failed_)
+          {
+            RCLCPP_ERROR(rclcpp::get_logger("rebound_optimize"),
+                         "A-star failed while restarting rebound; abort optimization.");
+            return false;
+          }
           new_lambda2_ *= 2;
 
           if (verbose_rebound_log_)
