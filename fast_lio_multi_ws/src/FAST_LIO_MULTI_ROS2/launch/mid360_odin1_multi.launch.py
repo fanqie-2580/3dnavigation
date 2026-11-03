@@ -106,15 +106,19 @@ def generate_launch_description():
                     name='dual_lidar_color_viz',
                     output='screen',
                     parameters=[{
+                        # Mid: LIO map cloud. Odin: sensor raw x Mid odom once
+                        # (same rule as odin_odom_mapper — never double-pose).
                         'mid_topic': '/cloud_registered',
-                        'odin_topic': '/cloud_odin_registered',
+                        'odin_raw_topic': '/odin1/cloud_raw_ds',
+                        'odom_topic': '/Odometry',
                         'map_frame': 'map',
-                        'odin_intensity_thresh': 100.0,
                         'mid_stride': 1,
                         'odin_stride': 2,
+                        'odin_blind': 0.3,
                         'voxel_size': 0.08,
                         'max_accum_points': 400000,
                         'accum_publish_period': 0.5,
+                        'accum_skip_sec': 8.0,
                     }],
                 )
             )
