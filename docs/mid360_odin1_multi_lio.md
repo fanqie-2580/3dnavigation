@@ -80,7 +80,9 @@ nohup ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
 - `lidar_type: 1`（Mid360 CustomMsg）  
 - `lidar_type2: 4`（Odin 通用 XYZ PointCloud2，已加 `XYZ_ONLY` 预处理）  
 - **`common.multi_lidar` 默认 `true`（Mid360 + Odin1）**：外参不准时 CloudMap 可能双墙/重影；可临时改 `false` 只跑 Mid360  
-- `extrinsic_T_L2_wrt_L1`：已写入一次 ICP 粗估（约 T=`[0.16,0,0.04]`、俯仰 ~14°）；仍有残差时请实测标定再改 yaml
+- `extrinsic_T/R_L2_wrt_L1`：ICP 俯仰粗估（~14°）；map 占用对齐易被 FOV 误导，以 body 系残差为准  
+- `/viz/accum_odin` 默认吃 `/cloud_odin_registered`（与 Mid 同为 LIO map 云；禁止 raw×10Hz odom，否则 30Hz 同戳扇形重影）  
+- `/odin1/cloud_raw_ds`：无 odom 时先用 now() 启动；有 odom 后 `one_cloud_per_odom` 每戳一帧
 
 重新打开双雷达：
 
@@ -134,7 +136,7 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
   2. `IMU_init` 对 Mid360 做 `FromTwoVectors` 重力对齐（`map` 相对 Grid 摆正）。  
   3. IMU 初始化完成后，把 `LiDAR2_wrt_LiDAR1.R` 左乘 `R_wi^T`，抵消 Odin 上同一套重力旋转。yaml 墙面 ICP 外参仍需再标定。  
 - **点云跟着机器人转**：RViz 对 `/cloud_registered` 开长 Decay 时，异步 Odin 帧会整帧顶掉世界系扫描，看起来像地图跟着 yaw 转。现 `lidar2_update_en=false` 时不再发布纯 Odin 帧；RViz 主看 **CloudMap**（`/Laser_map`，世界系固定），当前扫描 Decay=0。  
-- **双色融合累积**：`lidar2_update_en:false` 时强制 bundle，Mid+Odin 同一 IMU 去畸变/位姿；青←`/cloud_registered`，橙←`/cloud_odin_registered`。
+- **双色融合累积**：青 `/viz/accum_mid360`←`/cloud_registered`，橙 `/viz/accum_odin`←`/cloud_odin_registered`。Odin 用与 Mid 相同的 LIO `state_point` 进 `map`（不单独用 raw+/Odometry），避免走动后橙图旋转漂移。
 - **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
