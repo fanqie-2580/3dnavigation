@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Dual-color viz for Mid360 + Odin without making the world map spin.
+"""World-fixed dual-color accumulation for Mid360 + Odin.
 
-Mid360  -> /viz/cloud_mid360  from deskewed /cloud_registered (world-fixed LIO)
-Odin1   -> /viz/cloud_odin    from /odin1/cloud_raw_ds + /Odometry (live overlay)
+Mid360  (cyan)  : deskewed /cloud_registered -> voxel accum -> /viz/accum_mid360
+Odin1   (orange): /odin1/cloud_raw_ds + /Odometry -> voxel accum -> /viz/accum_odin
 
-When mapping.lidar2_update_en=false, Odin is not in /cloud_registered, so it must
-be published on its own topic. Keep RViz Odin Decay Time = 0 (current frame only).
+Also publishes current frames on /viz/cloud_mid360 and /viz/cloud_odin.
+
+Accumulation lives in this node (map frame), so RViz Decay can stay 0 — the map
+does not spin with the robot. Pose still comes from Mid360-only LIO when
+mapping.lidar2_update_en=false.
 """
 from __future__ import annotations
 
 import struct
+from typing import Dict, Tuple
 
 import numpy as np
 import rclpy
@@ -41,6 +45,36 @@ def make_cloud(header: Header, xyz: np.ndarray) -> PointCloud2:
     return point_cloud2.create_cloud_xyz32(header, xyz)
 
 
+class VoxelAccum:
+    def __init__(self, voxel: float, max_points: int) -> None:
+        self.voxel = float(voxel)
+        self.max_points = int(max_points)
+        self._grid: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
+
+    def add(self, pts: np.ndarray) -> int:
+        if pts.size == 0:
+            return 0
+        v = self.voxel
+        added = 0
+        for x, y, z in pts:
+            key = (int(np.floor(x / v)), int(np.floor(y / v)), int(np.floor(z / v)))
+            if key in self._grid:
+                continue
+            self._grid[key] = (float(x), float(y), float(z))
+            added += 1
+            if len(self._grid) >= self.max_points:
+                break
+        return added
+
+    def numpy(self) -> np.ndarray:
+        if not self._grid:
+            return np.zeros((0, 3), dtype=np.float64)
+        return np.asarray(list(self._grid.values()), dtype=np.float64)
+
+    def __len__(self) -> int:
+        return len(self._grid)
+
+
 class DualLidarColorViz(Node):
     def __init__(self) -> None:
         super().__init__('dual_lidar_color_viz')
@@ -50,6 +84,9 @@ class DualLidarColorViz(Node):
         self.declare_parameter('odin_intensity_thresh', 100.0)
         self.declare_parameter('mid_stride', 1)
         self.declare_parameter('odin_stride', 2)
+        self.declare_parameter('voxel_size', 0.08)
+        self.declare_parameter('max_accum_points', 400000)
+        self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter(
             'mapping.extrinsic_T_L2_wrt_L1', [0.154713, 0.022738, 0.000055]
         )
@@ -68,6 +105,9 @@ class DualLidarColorViz(Node):
         self.odin_thr = float(self.get_parameter('odin_intensity_thresh').value)
         self.mid_stride = max(1, int(self.get_parameter('mid_stride').value))
         self.odin_stride = max(1, int(self.get_parameter('odin_stride').value))
+        voxel = float(self.get_parameter('voxel_size').value)
+        max_n = int(self.get_parameter('max_accum_points').value)
+        period = float(self.get_parameter('accum_publish_period').value)
         self.t_w = np.asarray(
             self.get_parameter('mapping.extrinsic_T_L2_wrt_L1').value, dtype=np.float64
         ).reshape(3)
@@ -78,15 +118,24 @@ class DualLidarColorViz(Node):
         self._pose: Pose | None = None
         self._R_L2: np.ndarray | None = None
         self._t_L2: np.ndarray | None = None
+        self._accum_mid = VoxelAccum(voxel, max_n)
+        self._accum_odin = VoxelAccum(voxel, max_n)
+        self._dirty_mid = False
+        self._dirty_odin = False
 
         self.pub_mid = self.create_publisher(PointCloud2, '/viz/cloud_mid360', 5)
         self.pub_odin = self.create_publisher(PointCloud2, '/viz/cloud_odin', 5)
+        self.pub_accum_mid = self.create_publisher(PointCloud2, '/viz/accum_mid360', 1)
+        self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
+
         self.create_subscription(Odometry, '/Odometry', self.on_odom, 20)
         self.create_subscription(PointCloud2, self.reg_topic, self.on_registered, 5)
         self.create_subscription(PointCloud2, self.odin_topic, self.on_odin, 5)
+        self.create_timer(max(0.2, period), self.publish_accum)
+
         self.get_logger().info(
-            f'dual color viz: Mid from {self.reg_topic}, '
-            f'Odin live from {self.odin_topic} -> /viz/cloud_odin'
+            f'dual accum: Mid {self.reg_topic}->/viz/accum_mid360, '
+            f'Odin {self.odin_topic}->/viz/accum_odin voxel={voxel}m'
         )
 
     def on_odom(self, msg: Odometry) -> None:
@@ -96,6 +145,12 @@ class DualLidarColorViz(Node):
             self._R_L2 = R_wi0.T @ self.R_yaml
             self._t_L2 = R_wi0.T @ self.t_w
             self.get_logger().info('captured R_wi0; Odin L2 extrinsic converted')
+
+    def _header(self, stamp) -> Header:
+        h = Header()
+        h.stamp = stamp
+        h.frame_id = self.map_frame
+        return h
 
     def on_registered(self, msg: PointCloud2) -> None:
         offs = {f.name: f.offset for f in msg.fields}
@@ -120,10 +175,10 @@ class DualLidarColorViz(Node):
             if (mi % self.mid_stride) == 0:
                 mid.append([x, y, z])
             mi += 1
-        header = Header()
-        header.stamp = msg.header.stamp
-        header.frame_id = msg.header.frame_id or self.map_frame
-        self.pub_mid.publish(make_cloud(header, np.asarray(mid, dtype=np.float64)))
+        arr = np.asarray(mid, dtype=np.float64)
+        self.pub_mid.publish(make_cloud(self._header(msg.header.stamp), arr))
+        if self._accum_mid.add(arr):
+            self._dirty_mid = True
 
     def on_odin(self, msg: PointCloud2) -> None:
         if self._pose is None or self._R_L2 is None or self._t_L2 is None:
@@ -145,10 +200,28 @@ class DualLidarColorViz(Node):
             dtype=np.float64,
         )
         world = (R @ body.T).T + t
-        header = Header()
-        header.stamp = msg.header.stamp
-        header.frame_id = self.map_frame
-        self.pub_odin.publish(make_cloud(header, world))
+        self.pub_odin.publish(make_cloud(self._header(msg.header.stamp), world))
+        if self._accum_odin.add(world):
+            self._dirty_odin = True
+
+    def publish_accum(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+        if self._dirty_mid or len(self._accum_mid):
+            self.pub_accum_mid.publish(
+                make_cloud(self._header(stamp), self._accum_mid.numpy())
+            )
+            self._dirty_mid = False
+        if self._dirty_odin or len(self._accum_odin):
+            self.pub_accum_odin.publish(
+                make_cloud(self._header(stamp), self._accum_odin.numpy())
+            )
+            self._dirty_odin = False
+        if len(self._accum_mid) and len(self._accum_odin) and (
+            len(self._accum_mid) + len(self._accum_odin)
+        ) % 20000 < 50:
+            self.get_logger().info(
+                f'accum size mid={len(self._accum_mid)} odin={len(self._accum_odin)}'
+            )
 
 
 def main() -> None:

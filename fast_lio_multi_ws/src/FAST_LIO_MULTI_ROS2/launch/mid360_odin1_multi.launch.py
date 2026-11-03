@@ -112,6 +112,9 @@ def generate_launch_description():
                         'odin_intensity_thresh': 100.0,
                         'mid_stride': 1,
                         'odin_stride': 2,
+                        'voxel_size': 0.08,
+                        'max_accum_points': 400000,
+                        'accum_publish_period': 0.5,
                     }],
                 )
             )

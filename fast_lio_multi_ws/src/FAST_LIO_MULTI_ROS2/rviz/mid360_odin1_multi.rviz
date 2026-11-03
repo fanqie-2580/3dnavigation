@@ -223,7 +223,7 @@ Visualization Manager:
       Min Intensity: 0
       Name: CloudMap
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -238,7 +238,7 @@ Visualization Manager:
         Value: /Laser_map
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Alpha: 0.45
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -307,7 +307,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /viz/cloud_mid360
+        Value: /viz/accum_mid360
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -343,7 +343,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /viz/cloud_odin
+        Value: /viz/accum_odin
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
