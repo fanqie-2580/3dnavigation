@@ -56,13 +56,12 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Wall-focused ICP in gravity frame (2026-11-03): NN median ~0.09m on walls.
-      # Runtime still left-multiplies R by R_wi^T after IMU gravity-align.
-      # R_yaml below is residual Mid360↔Odin (not identity).
-      extrinsic_T_L2_wrt_L1: [0.162107, 0.039870, 0.015840]
-      extrinsic_R_L2_wrt_L1: [0.99496528, -0.01980455, -0.09824394,
-                              0.01557448, 0.99892598, -0.04363843,
-                              0.09900266, 0.04188863, 0.99420512]
+      # Gravity/world-frame extrinsic (wall ICP 2026-11-03, NN ~0.10m):
+      # p_w = R * p_odin + T. Runtime converts into L1 via R_wi^T after IMU init.
+      extrinsic_T_L2_wrt_L1: [0.154713, 0.022738, 0.000055]
+      extrinsic_R_L2_wrt_L1: [0.99603821, 0.00426344, -0.08882406,
+                             -0.00656408, 0.99965007, -0.02562515,
+                              0.08868373, 0.02610668, 0.99571765]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

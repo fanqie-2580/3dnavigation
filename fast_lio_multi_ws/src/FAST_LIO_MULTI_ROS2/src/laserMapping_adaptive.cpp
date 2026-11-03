@@ -1271,16 +1271,19 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            // Odin cloud is near gravity-level; Mid360 world was gravity-aligned via
-            // state.rot=R_wi. Express Odin in Mid360 lidar frame as R_wi^T * R_yaml * p
-            // so p_world = R_wi * R_wi^T * p_odin stays level.
+            // Yaml extrinsic_*_L2_wrt_L1 are in gravity/world: p_w = R_yaml*p_odin + t_w.
+            // Mid360 body still uses IMU gravity-align R_wi, so convert into L1 frame:
+            //   R_L2L1 = R_wi^T * R_yaml,  t_L2L1 = R_wi^T * t_w
+            // ⇒ p_w = R_wi*(R_L2L1*p + t_L2L1) = R_yaml*p + t_w.
             if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 M3D R_wi = state_point.rot.toRotationMatrix();
                 M3D R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
+                V3D t_w = LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3);
                 LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_wi.transpose() * R_yaml;
+                LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = R_wi.transpose() * t_w;
                 odin_gravity_ext_comp = true;
-                std::cout << "\033[32;1mOdin L2 extrinsic compensated by R_wi^T (gravity):\n"
+                std::cout << "\033[32;1mOdin L2 extrinsic from gravity yaml via R_wi^T:\n"
                           << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
             }
             if (feats_undistort->empty() || (feats_undistort == NULL))
