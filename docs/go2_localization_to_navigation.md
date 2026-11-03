@@ -32,11 +32,14 @@ Livox → 定位(open3d_loc) → DDDMR 全局(Docker) → EGO 局部 → go2_bri
 
 ```text
 定位地图: /home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/odin1_odom_map.pcd
-全局障碍: /home/ll/dddmr_navigation/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd
+全局障碍: /home/ll/dddmr_navigation/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd  # 已稀疏天花板
 全局地面: /home/ll/dddmr_navigation/src/dddmr_global_planner/data/segmentation_ground_map.pcd
 ```
 
-> launch 默认定位图是 `ct_lio_map.pcd`；当前联调实际用的是上面的 `odin1_odom_map.pcd`，请按本文件写的参数启动。
+> launch 默认定位图是 `ct_lio_map.pcd`；当前联调实际用的是上面的 `odin1_odom_map.pcd`，请按本文件写的参数启动。  
+> Odin1 建图 + Mid360 定位易对不齐、以及天花板稀疏化说明见  
+> [`odin1_mid360_map_and_fusion.md`](./odin1_mid360_map_and_fusion.md)。  
+> 可选瘦身定位图：`/home/ll/ws_odin_pvlio/maps/odin1_odom_map_thin_ceiling.pcd`。
 
 ---
 
