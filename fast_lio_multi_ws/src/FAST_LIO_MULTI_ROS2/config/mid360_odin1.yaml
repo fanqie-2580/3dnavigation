@@ -56,12 +56,13 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Gravity/world-frame extrinsic: wall ICP + floor-normal pitch align (~6°→~2.5°).
+      # Gravity/world-frame extrinsic (wall ICP only). Do NOT add floor-normal
+      # pitch patch — that introduced visible up/down skew between cyan/orange.
       # p_w = R * p_odin + T. Runtime converts into L1 via R_wi^T after IMU init.
-      extrinsic_T_L2_wrt_L1: [0.153773, 0.023014, -0.016656]
-      extrinsic_R_L2_wrt_L1: [0.99980332, 0.00516002, 0.01914934,
-                             -0.00468732, 0.99968520, -0.02464792,
-                             -0.01927049, 0.02455331, 0.99951277]
+      extrinsic_T_L2_wrt_L1: [0.154713, 0.022738, 0.000055]
+      extrinsic_R_L2_wrt_L1: [0.99603821, 0.00426344, -0.08882406,
+                             -0.00656408, 0.99965007, -0.02562515,
+                              0.08868373, 0.02610668, 0.99571765]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
