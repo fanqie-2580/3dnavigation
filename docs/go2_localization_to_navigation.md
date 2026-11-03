@@ -2,7 +2,8 @@
 
 > **推送到 GitHub**：改完代码/文档后按  
 > [`push_to_github.md`](./push_to_github.md)  
->（上传目录 `/home/ll/3dnavigation_github_upload` → HTTPS + `/tmp/gh_token.txt` PAT → `fanqie-2580/3dnavigation` `main`）。
+>（上传目录 `/home/ll/3dnavigation_github_upload` → HTTPS + `/tmp/gh_token.txt` PAT → `fanqie-2580/3dnavigation` `main`）。  
+> **Mid360 + Odin1 多雷达融合**：[`mid360_odin1_multi_lio.md`](./mid360_odin1_multi_lio.md)（`/home/ll/fast_lio_multi_ws`）。
 
 适用：**Unitree Go2 + Livox MID360**，ROS 2 Humble，`RMW=rmw_cyclonedds_cpp`。  
 验证时间：2026-11-02，对照当时宿主机 / `dddmr_dev` 实际在跑的 launch 命令行。

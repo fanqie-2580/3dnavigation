@@ -115,9 +115,10 @@ python3 /home/ll/ws_odin_pvlio/scripts/07b_thin_loc_map.py \
 - Odin 点云仅作局部障碍/语义，不进全局位姿优化  
 - 或 EKF：Mid360 位姿为主，Odin 视觉里程计当相对约束
 
-### D. 在线紧耦合 SLAM（工作量大）
+### D. 在线紧耦合 Multi-LIO（已落地）
 
-统一状态估计里同时吃两路点云 + IMU。当前仓库**没有**现成可直接跑的紧耦合节点，需要新开工程（如 FAST-LIO 多雷达 / LIO-SAM 扩展），不建议作为近期路径。
+已接入 **FAST_LIO_MULTI_ROS2**：Mid360 + Odin1 `/odin1/cloud_raw`（mode 0）融合成一路 `/Odometry`，并桥接到 `/baselink2map`、`/cloud_registered_1`。  
+详见 [`mid360_odin1_multi_lio.md`](./mid360_odin1_multi_lio.md)。
 
 ---
 
