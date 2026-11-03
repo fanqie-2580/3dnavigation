@@ -747,6 +747,26 @@ void publish_odin_from_undistorted(
     pubOdin->publish(laserCloudmsg);
 }
 
+// Snapshot path: meas.lidar2 is already in Mid L1 frame (LiDAR2_wrt_LiDAR1).
+// Prefer this for viz when Odin has no per-point time — avoids intensity-split
+// misses and undistort no-ops on curvature==0.
+void publish_odin_from_l1(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &lidar2_l1)
+{
+    if (!pubOdin || !lidar2_l1 || lidar2_l1->empty() || !scan_pub_en)
+        return;
+    const int size = static_cast<int>(lidar2_l1->points.size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+        RGBpointBodyToWorld(&(lidar2_l1->points[i]), &(laserCloudWorld->points[i]));
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
 void publish_mid_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubMid,
     const PointCloudXYZI::Ptr &undistorted)
@@ -1526,9 +1546,13 @@ private:
             /******* Publish points *******/
             if (multi_lidar && !lidar2_update_en)
             {
-                // Split undistorted fused scan: Mid -> /cloud_registered, Odin -> /cloud_odin_registered
+                // Mid from undistorted fused scan; Odin from L1-frame lidar2 × current pose
+                // (snapshot sensor — same end pose as Mid, no intensity-split dependency).
                 publish_mid_from_undistorted(pubLaserCloudFull_, feats_undistort);
-                publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                if (Measures.lidar2 && !Measures.lidar2->empty())
+                    publish_odin_from_l1(pubLaserCloudOdin_, Measures.lidar2);
+                else
+                    publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
             }
             else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);

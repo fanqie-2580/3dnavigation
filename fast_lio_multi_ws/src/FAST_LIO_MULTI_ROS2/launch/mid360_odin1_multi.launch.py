@@ -106,10 +106,10 @@ def generate_launch_description():
                     name='dual_lidar_color_viz',
                     output='screen',
                     parameters=[{
-                        # Mid + Odin both from LIO map clouds (no re-pose).
-                        # Raw×odom path fans on yaw: Odin 30Hz vs Mid odom 10Hz.
+                        # Mid: LIO map cloud. Odin: handshake raw×Mid odom
+                        # (one fresh cloud per odom — avoids yaw-lag fan).
                         'mid_topic': '/cloud_registered',
-                        'odin_mode': 'registered',
+                        'odin_mode': 'odom_sync',
                         'odin_registered_topic': '/cloud_odin_registered',
                         'odin_raw_topic': '/odin1/cloud_raw_ds',
                         'odom_topic': '/Odometry',
