@@ -331,7 +331,7 @@ Visualization Manager:
       Min Intensity: 0
       Name: Odin1
       Decay Time: 0
-      Enabled: false
+      Enabled: true
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -346,7 +346,7 @@ Visualization Manager:
         Value: /viz/cloud_odin
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0

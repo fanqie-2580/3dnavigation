@@ -105,11 +105,13 @@ def generate_launch_description():
                     executable='dual_lidar_color_viz.py',
                     name='dual_lidar_color_viz',
                     output='screen',
-                    parameters=[{
+                    parameters=[config_file, {
                         'registered_topic': '/cloud_registered',
+                        'odin_topic': '/odin1/cloud_raw_ds',
+                        'map_frame': 'map',
                         'odin_intensity_thresh': 100.0,
                         'mid_stride': 1,
-                        'odin_stride': 1,
+                        'odin_stride': 2,
                     }],
                 )
             )
