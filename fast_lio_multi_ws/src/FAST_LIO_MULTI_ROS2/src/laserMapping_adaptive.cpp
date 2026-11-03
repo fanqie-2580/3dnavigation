@@ -689,6 +689,28 @@ void map_incremental()
     return;
 }
 
+
+void publish_odin_registered_world(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin)
+{
+    // Odin-only frame: map via last Mid360 state_point. No IMU predict / IEKF.
+    if (!pubOdin || !Measures.lidar2 || Measures.lidar2->empty() || !scan_pub_en)
+        return;
+    const int size = static_cast<int>(Measures.lidar2->points.size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+    {
+        PointType body = Measures.lidar2->points[i];
+        body.intensity = 200.0f;
+        RGBpointBodyToWorld(&body, &laserCloudWorld->points[i]);
+    }
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
 void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFull, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFullTransFormed)
 {
     if(scan_pub_en)
@@ -1135,6 +1157,7 @@ public:
         // 4. Create Publishers
         //---------------------------
         pubLaserCloudFull_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
+        pubLaserCloudOdin_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered", 20);
         pubLaserCloudFullTransformed_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_tf", 20);
         pubLaserCloudFull_body_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
@@ -1279,6 +1302,22 @@ private:
         {
             // RCLCPP_INFO(this->get_logger(), "Timer tick: synced=%d, bundle=%d", synced, bundle_enabled);
             high_resolution_clock::time_point t1 = high_resolution_clock::now();
+
+            // Odin-only async frame: publish into map with last Mid pose, do NOT run
+            // IMU Process (predict would drag Mid odom / smear orange accum).
+            if (multi_lidar && !lidar2_update_en && !bundle_enabled &&
+                current_lidar_num == 2 && p_imu->IMU_inited())
+            {
+                if (!odin_gravity_ext_comp && !extrinsic_L2_gravity_frame)
+                {
+                    odin_gravity_ext_comp = true;
+                    std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed (no R_wi^T):\n"
+                              << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+                }
+                publish_odin_registered_world(pubLaserCloudOdin_);
+                return;
+            }
+
             if (bundle_enabled)
             {
                 p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
@@ -1431,9 +1470,8 @@ private:
             }
             else
             {
-                // Keep last Mid360 pose. Do NOT publish this Odin-only scan to
-                // /cloud_registered — RViz Decay would replace the world cloud with a
-                // body-locked sector and look like the map spins with the robot.
+                // Safety net if an Odin frame reached IEKF path.
+                publish_odin_registered_world(pubLaserCloudOdin_);
                 return;
             }
 
@@ -1487,6 +1525,7 @@ private:
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdin_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullTransformed_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;

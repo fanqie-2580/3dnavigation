@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """World-fixed dual-color accumulation for Mid360 + Odin.
 
-Mid360 (cyan): deskewed /cloud_registered -> /viz/accum_mid360
-Odin1  (orange): /odin1/cloud_raw_ds + body extrinsic + /Odometry -> /viz/accum_odin
+Mid360 (cyan):  /cloud_registered      -> /viz/accum_mid360
+Odin1  (orange): /cloud_odin_registered -> /viz/accum_odin
 
-Odin extrinsic is body-fixed L2_wrt_L1 (yaml). Do NOT apply R_wi0^T gravity
-conversion — that put Odin accum in the wrong frame while Mid stayed correct.
+Both topics are already in map, posed by the same FAST-LIO Mid360 state_point.
+Do not transform raw Odin with a separate /Odometry path — that drifts when moving.
 """
 from __future__ import annotations
 
@@ -14,24 +14,10 @@ from typing import Dict, Tuple
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Pose
-from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
-
-
-def quat_to_R(q) -> np.ndarray:
-    qw, qx, qy, qz = q.w, q.x, q.y, q.z
-    return np.array(
-        [
-            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
-            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
-        ],
-        dtype=np.float64,
-    )
 
 
 def make_cloud(header: Header, xyz: np.ndarray) -> PointCloud2:
@@ -75,28 +61,17 @@ class VoxelAccum:
 class DualLidarColorViz(Node):
     def __init__(self) -> None:
         super().__init__('dual_lidar_color_viz')
-        self.declare_parameter('registered_topic', '/cloud_registered')
-        self.declare_parameter('odin_topic', '/odin1/cloud_raw_ds')
+        self.declare_parameter('mid_topic', '/cloud_registered')
+        self.declare_parameter('odin_topic', '/cloud_odin_registered')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odin_intensity_thresh', 100.0)
         self.declare_parameter('mid_stride', 1)
-        self.declare_parameter('odin_stride', 2)
+        self.declare_parameter('odin_stride', 1)
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
-        self.declare_parameter(
-            'mapping.extrinsic_T_L2_wrt_L1', [0.152932, -0.032606, 0.080137]
-        )
-        self.declare_parameter(
-            'mapping.extrinsic_R_L2_wrt_L1',
-            [
-                0.96905401, -0.00098037, -0.24684685,
-                0.00160252, 0.99999603, 0.00231950,
-                0.24684359, -0.00264330, 0.96905173,
-            ],
-        )
 
-        self.reg_topic = self.get_parameter('registered_topic').value
+        self.mid_topic = self.get_parameter('mid_topic').value
         self.odin_topic = self.get_parameter('odin_topic').value
         self.map_frame = self.get_parameter('map_frame').value
         self.odin_thr = float(self.get_parameter('odin_intensity_thresh').value)
@@ -106,15 +81,6 @@ class DualLidarColorViz(Node):
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
 
-        # Body-fixed Odin -> Mid360/L1 (no gravity R_wi^T).
-        self.t_L2 = np.asarray(
-            self.get_parameter('mapping.extrinsic_T_L2_wrt_L1').value, dtype=np.float64
-        ).reshape(3)
-        self.R_L2 = np.asarray(
-            self.get_parameter('mapping.extrinsic_R_L2_wrt_L1').value, dtype=np.float64
-        ).reshape(3, 3)
-
-        self._pose: Pose | None = None
         self._accum_mid = VoxelAccum(voxel, max_n)
         self._accum_odin = VoxelAccum(voxel, max_n)
         self._dirty_mid = False
@@ -125,75 +91,61 @@ class DualLidarColorViz(Node):
         self.pub_accum_mid = self.create_publisher(PointCloud2, '/viz/accum_mid360', 1)
         self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
 
-        self.create_subscription(Odometry, '/Odometry', self.on_odom, 20)
-        self.create_subscription(PointCloud2, self.reg_topic, self.on_registered, 5)
+        self.create_subscription(PointCloud2, self.mid_topic, self.on_mid, 5)
         self.create_subscription(PointCloud2, self.odin_topic, self.on_odin, 5)
         self.create_timer(max(0.2, period), self.publish_accum)
 
         self.get_logger().info(
-            f'dual accum body-L2: Mid->{self.reg_topic} Odin->{self.odin_topic} '
-            f't={self.t_L2.tolist()} voxel={voxel}'
+            f'dual accum from LIO map clouds: Mid {self.mid_topic}, '
+            f'Odin {self.odin_topic}, voxel={voxel}'
         )
 
-    def on_odom(self, msg: Odometry) -> None:
-        self._pose = msg.pose.pose
-
-    def _header(self, stamp) -> Header:
+    def _header(self, stamp, frame_id: str | None = None) -> Header:
         h = Header()
         h.stamp = stamp
-        h.frame_id = self.map_frame
+        h.frame_id = frame_id or self.map_frame
         return h
 
-    def on_registered(self, msg: PointCloud2) -> None:
+    def _xyz_from_cloud(
+        self, msg: PointCloud2, stride: int, require_odin: bool | None
+    ) -> np.ndarray:
         offs = {f.name: f.offset for f in msg.fields}
         if not all(k in offs for k in ('x', 'y', 'z')):
-            return
+            return np.zeros((0, 3), dtype=np.float64)
         has_i = 'intensity' in offs
+        pts: list[list[float]] = []
         n = msg.width * msg.height
-        mid: list[list[float]] = []
-        step = msg.point_step
-        data = msg.data
-        mi = 0
+        k = 0
         for i in range(n):
-            b = i * step
-            x, y, z = struct.unpack_from('fff', data, b + offs['x'])
-            inten = (
-                struct.unpack_from('f', data, b + offs['intensity'])[0]
-                if has_i
-                else 10.0
-            )
-            if inten >= self.odin_thr:
-                continue
-            if (mi % self.mid_stride) == 0:
-                mid.append([x, y, z])
-            mi += 1
-        arr = np.asarray(mid, dtype=np.float64)
-        self.pub_mid.publish(make_cloud(self._header(msg.header.stamp), arr))
+            b = i * msg.point_step
+            x, y, z = struct.unpack_from('fff', msg.data, b + offs['x'])
+            if has_i and require_odin is not None:
+                inten = struct.unpack_from('f', msg.data, b + offs['intensity'])[0]
+                is_odin = inten >= self.odin_thr
+                if require_odin and not is_odin:
+                    continue
+                if (not require_odin) and is_odin:
+                    continue
+            if (k % stride) == 0:
+                pts.append([x, y, z])
+            k += 1
+        return np.asarray(pts, dtype=np.float64)
+
+    def on_mid(self, msg: PointCloud2) -> None:
+        # Mid registered may occasionally contain tagged Odin in bundle mode; filter.
+        arr = self._xyz_from_cloud(msg, self.mid_stride, require_odin=False)
+        self.pub_mid.publish(
+            make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)
+        )
         if self._accum_mid.add(arr):
             self._dirty_mid = True
 
     def on_odin(self, msg: PointCloud2) -> None:
-        if self._pose is None:
-            return
-        pts = list(
-            point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+        arr = self._xyz_from_cloud(msg, self.odin_stride, require_odin=None)
+        self.pub_odin.publish(
+            make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)
         )
-        if not pts:
-            return
-        arr = np.array(
-            [[p[0], p[1], p[2]] for p in pts[:: self.odin_stride]], dtype=np.float64
-        )
-        if arr.size == 0:
-            return
-        body = (self.R_L2 @ arr.T).T + self.t_L2
-        R = quat_to_R(self._pose.orientation)
-        t = np.array(
-            [self._pose.position.x, self._pose.position.y, self._pose.position.z],
-            dtype=np.float64,
-        )
-        world = (R @ body.T).T + t
-        self.pub_odin.publish(make_cloud(self._header(msg.header.stamp), world))
-        if self._accum_odin.add(world):
+        if self._accum_odin.add(arr):
             self._dirty_odin = True
 
     def publish_accum(self) -> None:
