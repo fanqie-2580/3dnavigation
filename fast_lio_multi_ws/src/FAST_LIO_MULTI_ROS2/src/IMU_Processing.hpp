@@ -466,6 +466,9 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
       }
     }
   }
+  // Tag source lidar in intensity so fused /cloud_registered can be colored/split.
+  for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
+  for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1
   pcl_out = pcl_1_out + pcl_2_out;
 }
 
