@@ -79,8 +79,8 @@ nohup ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
 
 - `lidar_type: 1`（Mid360 CustomMsg）  
 - `lidar_type2: 4`（Odin 通用 XYZ PointCloud2，已加 `XYZ_ONLY` 预处理）  
-- **`common.multi_lidar` 默认 `false`（仅 Mid360）**：双雷达外参未标定准时，CloudMap 会出现双墙/重影  
-- `extrinsic_T_L2_wrt_L1`：已写入一次 ICP 粗估（约 T=`[0.16,0,-0.04]`、俯仰 ~14°），NN median 仍约 0.37 m，**不够进图**；标定准后再把 `multi_lidar: true`
+- **`common.multi_lidar` 默认 `true`（Mid360 + Odin1）**：外参不准时 CloudMap 可能双墙/重影；可临时改 `false` 只跑 Mid360  
+- `extrinsic_T_L2_wrt_L1`：已写入一次 ICP 粗估（约 T=`[0.16,0,0.04]`、俯仰 ~14°）；仍有残差时请实测标定再改 yaml
 
 重新打开双雷达：
 

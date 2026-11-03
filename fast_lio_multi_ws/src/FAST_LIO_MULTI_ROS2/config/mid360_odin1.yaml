@@ -3,9 +3,8 @@
 
     common:
       async_debug: false
-      # false: Mid360-only (clean map). true needs accurate T_L2_wrt_L1;
-      # one-shot ICP still left ~0.37m NN residual → ghost walls in CloudMap.
-      multi_lidar: false
+      # true: Mid360 + Odin1. T_L2_wrt_L1 is ICP coarse estimate; refine if ghost walls.
+      multi_lidar: true
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
