@@ -82,6 +82,8 @@ bool multi_lidar = false, async_debug = false, publish_tf_results = false, bundl
 bool extrinsic_imu_to_lidars = false;
 
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
+size_t bundle_pair_index_ = 0;
+double bundle_pair_dt_ = 0.0;
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -508,11 +510,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
         /*** push a lidar scan ***/
         if(!lidar_pushed)
         {
+            // Pair Mid front with nearest Odin by stamp (do NOT merge whole buffers —
+            // that mixed scans from different poses and ghosted orange accum).
+            constexpr double kMaxBundleDt = 0.08; // 80 ms
             meas.lidar = lidar_buffer.front();
-            for (size_t i = 1; i < lidar_buffer.size(); i++) // merge all lidar scans
-            {
-                *meas.lidar += *lidar_buffer[i];
-            }
             meas.lidar_beg_time = time_buffer.front();
             if (meas.lidar->points.size() <= 1) // time too little
             {
@@ -531,13 +532,36 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
             meas.lidar_end_time = lidar_end_time;
 
-            meas.lidar2 = lidar_buffer2.front();
-            for (size_t i = 1; i < lidar_buffer2.size(); i++) // merge all lidar scans
+            size_t best_i = 0;
+            double best_dt = std::fabs(time_buffer2.front() - meas.lidar_beg_time);
+            for (size_t i = 1; i < time_buffer2.size(); i++)
             {
-                *meas.lidar2 += *lidar_buffer2[i];
+                const double dt = std::fabs(time_buffer2[i] - meas.lidar_beg_time);
+                if (dt < best_dt)
+                {
+                    best_dt = dt;
+                    best_i = i;
+                }
             }
+            if (best_dt > kMaxBundleDt)
+            {
+                // Drop the older stream head so the next tick can re-pair.
+                if (time_buffer.front() < time_buffer2.front())
+                {
+                    lidar_buffer.pop_front();
+                    time_buffer.pop_front();
+                }
+                else
+                {
+                    lidar_buffer2.pop_front();
+                    time_buffer2.pop_front();
+                }
+                return false;
+            }
+
+            meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1); //lidar2 data to lidar1 frame, not use lidar2-imu tf as state
-            meas.lidar_beg_time2 = time_buffer2.front();
+            meas.lidar_beg_time2 = time_buffer2[best_i];
             if (meas.lidar2->points.size() <= 1) // time too little
             {
                 lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
@@ -557,6 +581,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
 
             publish_lidar_time = max(lidar_end_time, lidar_end_time2);
             lidar_pushed = true;
+            bundle_pair_index_ = best_i; // remember which L2 to pop after IMU sync
+            bundle_pair_dt_ = best_dt;
         }
 
         if (last_timestamp_imu < lidar_end_time || last_timestamp_imu < lidar_end_time2)
@@ -575,13 +601,17 @@ bool sync_packages_bundle(MeasureGroup &meas)
             imu_buffer.pop_front();
         }
 
-        lidar_buffer.clear();
-        time_buffer.clear();
-        lidar_buffer2.clear();
-        time_buffer2.clear();
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        // Drop Odin frames up to and including the paired one.
+        for (size_t i = 0; i <= bundle_pair_index_ && !lidar_buffer2.empty(); i++)
+        {
+            lidar_buffer2.pop_front();
+            time_buffer2.pop_front();
+        }
 
         lidar_pushed = false;
-        cout << "\033[36;1mBundle update!\033[0m" << endl;
+        cout << "\033[36;1mBundle update! dt=" << bundle_pair_dt_ * 1000.0 << "ms\033[0m" << endl;
         return true;
     }
     else

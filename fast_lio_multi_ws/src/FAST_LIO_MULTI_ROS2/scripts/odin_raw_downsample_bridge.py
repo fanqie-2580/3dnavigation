@@ -22,15 +22,20 @@ class OdinRawDownsampleBridge(Node):
         self.declare_parameter('output_topic', '/odin1/cloud_raw_ds')
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_points', 20000)
+        # Odin TCP bridge stamps are device uptime, not ROS time (~1e4 vs Mid ~1e9).
+        # Bundle/IMU undistortion requires the same clock as Mid360 + /livox/imu.
+        self.declare_parameter('restamp_receive_time', True)
 
         self.voxel = float(self.get_parameter('voxel_size').value)
         self.max_points = int(self.get_parameter('max_points').value)
+        self.restamp = bool(self.get_parameter('restamp_receive_time').value)
         inn = self.get_parameter('input_topic').value
         out = self.get_parameter('output_topic').value
         self.pub = self.create_publisher(PointCloud2, out, 10)
         self.sub = self.create_subscription(PointCloud2, inn, self.cb, 10)
         self.get_logger().info(
-            f'downsample {inn} -> {out} voxel={self.voxel}m max_points={self.max_points}'
+            f'downsample {inn} -> {out} voxel={self.voxel}m max_points={self.max_points} '
+            f'restamp_receive_time={self.restamp}'
         )
 
     def cb(self, msg: PointCloud2) -> None:
@@ -53,7 +58,7 @@ class OdinRawDownsampleBridge(Node):
             arr = arr[::step]
 
         header = Header()
-        header.stamp = msg.header.stamp
+        header.stamp = self.get_clock().now().to_msg() if self.restamp else msg.header.stamp
         header.frame_id = msg.header.frame_id
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
