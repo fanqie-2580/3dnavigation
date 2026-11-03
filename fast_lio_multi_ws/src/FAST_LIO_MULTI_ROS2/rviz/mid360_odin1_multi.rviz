@@ -222,8 +222,8 @@ Visualization Manager:
       Name: CloudMap
       Position Transformer: XYZ
       Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.03
+      Size (Pixels): 2
+      Size (m): 0.025
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -234,8 +234,8 @@ Visualization Manager:
         Value: /Laser_map
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
-    - Alpha: 0.35
+      Value: true
+    - Alpha: 0.45
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -244,10 +244,10 @@ Visualization Manager:
       Axis: Z
       Channel Name: intensity
       Class: rviz_default_plugins/PointCloud2
-      Color: 80; 255; 120
+      Color: 180; 180; 180
       Color Transformer: FlatColor
-      Decay Time: 45
-      Enabled: false
+      Decay Time: 60
+      Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 255
@@ -268,7 +268,7 @@ Visualization Manager:
         Value: /cloud_registered
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -280,7 +280,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 80; 220; 255
       Color Transformer: FlatColor
-      Decay Time: 3
+      Decay Time: 20
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -314,7 +314,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 90; 40
       Color Transformer: FlatColor
-      Decay Time: 3
+      Decay Time: 20
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
