@@ -3,7 +3,9 @@
 
     common:
       async_debug: false
-      multi_lidar: true
+      # false: Mid360-only (clean map). true needs accurate T_L2_wrt_L1;
+      # one-shot ICP still left ~0.37m NN residual → ghost walls in CloudMap.
+      multi_lidar: false
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
@@ -55,11 +57,11 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # TODO: measure Odin lidar frame w.r.t Mid360 lidar frame and fill below
-      extrinsic_T_L2_wrt_L1: [0.0, 0.0, 0.0]
-      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
-                              0.0, 1.0, 0.0,
-                              0.0, 0.0, 1.0]
+      # Estimated 2026-11-03 via one-shot ICP (Odin lidar -> Mid360 lidar); refine on robot if needed
+      extrinsic_T_L2_wrt_L1: [0.164276, -0.002923, 0.035258]
+      extrinsic_R_L2_wrt_L1: [0.96812436, -0.00584105, -0.25040188,
+                              0.00189061, 0.99986998, -0.01601403,
+                              0.25046286, 0.01503016, 0.96800953]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

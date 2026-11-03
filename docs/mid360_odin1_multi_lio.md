@@ -79,21 +79,31 @@ nohup ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
 
 - `lidar_type: 1`（Mid360 CustomMsg）  
 - `lidar_type2: 4`（Odin 通用 XYZ PointCloud2，已加 `XYZ_ONLY` 预处理）  
-- `extrinsic_T_L2_wrt_L1`：**粗值单位阵**，上机后请按安装位标定再改  
+- **`common.multi_lidar` 默认 `false`（仅 Mid360）**：双雷达外参未标定准时，CloudMap 会出现双墙/重影  
+- `extrinsic_T_L2_wrt_L1`：已写入一次 ICP 粗估（约 T=`[0.16,0,-0.04]`、俯仰 ~14°），NN median 仍约 0.37 m，**不够进图**；标定准后再把 `multi_lidar: true`
+
+重新打开双雷达：
+
+```bash
+# 编辑 mid360_odin1.yaml → common.multi_lidar: true
+# 确认 extrinsic_T/R_L2_wrt_L1 为实测值后重启 launch
+```
 
 ## 4. 检查
 
 ```bash
 ros2 node list | rg 'laserMapping_multi|odin_raw|multi_lio_nav'
+ros2 param get /laserMapping_multi common.multi_lidar
 ros2 topic hz /Odometry
 ros2 topic hz /baselink2map
 ros2 topic hz /cloud_registered_1
 ros2 topic echo /Odometry --once
 ```
 
-正常日志应含：`Multi LiDAR on!`、`lidar_type[0]: 1, lidar_type[1]: 4`。
+- `multi_lidar=false`：只跑 Mid360，CloudMap 应无双墙  
+- `multi_lidar=true`：日志应含 `Multi LiDAR on!`、`lidar_type[0]: 1, lidar_type[1]: 4`
 
-无传感器时节点仍可起，但不会出稳定 odom；有两路点云+IMU 后才验收位姿。
+无传感器时节点仍可起，但不会出稳定 odom；有主雷达+IMU 后才验收位姿。
 
 ## 5. 接到 DDDMR / EGO
 
@@ -117,7 +127,8 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 
 ## 7. 风险与待标定
 
+- **对齐问题（已复现）**：`multi_lidar: true` + 不准外参 → RViz CloudMap 双墙。单帧 ICP 只能改善一部分，不能当正式标定  
+- 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP，再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
-- 外参 `extrinsic_T_L2_wrt_L1` / `R` 需实测，否则两路点云错位  
 - 无硬时间同步时避免急转首测  
 - 与旧 `open3d_loc` 单雷达链路并存；联调时不要同时发两套 `/baselink2map`
