@@ -128,7 +128,10 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 ## 7. 风险与待标定
 
 - **对齐问题（已复现）**：`multi_lidar: true` + 不准外参 → RViz CloudMap 双墙。单帧 ICP 只能改善一部分，不能当正式标定  
-- 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP，再写回 `extrinsic_*_L2_wrt_L1`  
+- **倾斜问题（源码）**：
+  1. `IMU_Processing.hpp` 里原版 `IMU_init` 保持 `rot=I`，只用 `grav=S2(-mean_acc)`；`map` 等于开机瞬间 IMU 坐标系。Mid360 实测 `mean_acc≈[-0.16,0,0.98]`（相对重力约 9°），相对 RViz Grid（XY 水平）整幅点云会斜。已改为 `FromTwoVectors` 重力对齐，使 `grav=(0,0,-g)`、`rot` 把机体 down 转到世界 -Z。  
+  2. `sync` 里 `pcl::transformPointCloud(..., LiDAR2_wrt_LiDAR1)` 把 Odin 变到 Mid360；错误的 ICP `extrinsic_R_L2_wrt_L1`（曾估计俯仰约 -14.5°）会把本已水平的 Odin 地面再拧斜，叠出斜墙/拖影。已改回 `R=I` + 粗平移。  
+- 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
 - 无硬时间同步时避免急转首测  
 - 与旧 `open3d_loc` 单雷达链路并存；联调时不要同时发两套 `/baselink2map`

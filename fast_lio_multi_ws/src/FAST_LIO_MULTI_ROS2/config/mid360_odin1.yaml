@@ -56,11 +56,12 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Estimated 2026-11-03 via one-shot ICP (Odin lidar -> Mid360 lidar); refine on robot if needed
-      extrinsic_T_L2_wrt_L1: [0.164276, -0.002923, 0.035258]
-      extrinsic_R_L2_wrt_L1: [0.96812436, -0.00584105, -0.25040188,
-                              0.00189061, 0.99986998, -0.01601403,
-                              0.25046286, 0.01503016, 0.96800953]
+      # Do NOT use unconstrained ICP R: FOV mismatch invented ~14° pitch and tilted Odin in map.
+      # Translation-only coarse guess; replace with measured extrinsic on robot.
+      extrinsic_T_L2_wrt_L1: [0.16, 0.0, 0.03]
+      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
+                              0.0, 1.0, 0.0,
+                              0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
