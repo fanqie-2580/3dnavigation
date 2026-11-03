@@ -499,7 +499,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   }
 
   if (multi_lidar) UndistortPclMultiLiDAR(meas, kf_state, *cur_pcl_un_);
-  else UndistortPcl(meas, kf_state, *cur_pcl_un_, lidar_num);
+  else
+  {
+    UndistortPcl(meas, kf_state, *cur_pcl_un_, lidar_num);
+    // Async single-lidar path: still tag source so publish/viz/filters can split.
+    const float tag = (lidar_num == 2) ? 200.0f : 10.0f;
+    for (auto &pt : cur_pcl_un_->points) pt.intensity = tag;
+  }
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
 }

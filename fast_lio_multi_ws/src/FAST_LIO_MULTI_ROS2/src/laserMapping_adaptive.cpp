@@ -148,6 +148,10 @@ bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
 bool odin_gravity_ext_comp = false; // apply R_wi^T to L2 once after IMU gravity-align
+// false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
+// Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
+bool lidar2_update_en = false;
+constexpr float kOdinIntensityTag = 100.0f;
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
 double lidar_mean_scantime2 = 0.0;
@@ -642,6 +646,10 @@ void map_incremental()
     PointNoNeedDownsample.reserve(feats_down_size);
     for (int i = 0; i < feats_down_size; i++)
     {
+        if (!lidar2_update_en &&
+            (feats_down_body->points[i].intensity >= kOdinIntensityTag ||
+             (!bundle_enabled && current_lidar_num == 2)))
+            continue;
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
         /* decide if need add to map */
@@ -870,6 +878,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
+        // Bundle: Odin tagged intensity>=100. Async lidar2 scan: whole frame is L2.
+        if (!lidar2_update_en &&
+            (point_body.intensity >= kOdinIntensityTag ||
+             (!bundle_enabled && current_lidar_num == 2)))
+        {
+            point_selected_surf[i] = false;
+            continue;
+        }
+
         /* transform to world frame */
         V3D p_body(point_body.x, point_body.y, point_body.z);
         V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
@@ -1014,6 +1031,7 @@ public:
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
 
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<bool>("mapping.lidar2_update_en", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_T", {});
@@ -1072,6 +1090,7 @@ public:
         this->get_parameter_or("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
         this->get_parameter_or("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
         this->get_parameter_or("mapping.extrinsic_T", extrinT, std::vector<double>());
@@ -1194,6 +1213,8 @@ public:
             }
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
+                 << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
+                 << " (false => Mid360-only IEKF/map)" << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
                  << LiDAR2_wrt_LiDAR1 << "\033[0m" << endl
@@ -1318,19 +1339,22 @@ private:
                     if (feats_down_size > 5)
                     {
                         feats_down_world->resize(feats_down_size);
+                        PointVector init_pts;
+                        init_pts.reserve(feats_down_size);
                         for (int i = 0; i < feats_down_size; i++)
                         {
+                            if (!lidar2_update_en &&
+                                feats_down_body->points[i].intensity >= kOdinIntensityTag)
+                                continue;
                             pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                            init_pts.push_back(feats_down_world->points[i]);
                         }
-                        ikdtree.Add_Points(feats_down_world->points, true);
-                        if (current_lidar_num == 1)
-                        {
+                        if (!init_pts.empty())
+                            ikdtree.Add_Points(init_pts, true);
+                        if (current_lidar_num == 1 || bundle_enabled)
                             lidar1_ikd_init = true;
-                        }
-                        else if (current_lidar_num == 2)
-                        {
+                        if (current_lidar_num == 2 || bundle_enabled || !lidar2_update_en)
                             lidar2_ikd_init = true;
-                        }
                     }
                     return;
                 }
