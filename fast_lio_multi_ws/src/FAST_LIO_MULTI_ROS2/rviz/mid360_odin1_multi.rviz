@@ -152,6 +152,8 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: CloudRegistered
+      Decay Time: 0
+      Enabled: false
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -220,6 +222,8 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: CloudMap
+      Decay Time: 0
+      Enabled: true
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -234,7 +238,7 @@ Visualization Manager:
         Value: /Laser_map
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
     - Alpha: 0.45
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -254,6 +258,8 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: CloudAccumDecay
+      Decay Time: 0
+      Enabled: false
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -288,6 +294,8 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: Mid360
+      Decay Time: 0
+      Enabled: true
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -322,6 +330,8 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: Odin1
+      Decay Time: 0
+      Enabled: false
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -336,7 +346,7 @@ Visualization Manager:
         Value: /viz/cloud_odin
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0

@@ -133,8 +133,9 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
   1. Odin `/odin1/cloud_raw` 已接近重力水平（~1°）；Mid360 IMU 相对重力 ~9°。  
   2. `IMU_init` 对 Mid360 做 `FromTwoVectors` 重力对齐（`map` 相对 Grid 摆正）。  
   3. IMU 初始化完成后，把 `LiDAR2_wrt_LiDAR1.R` 左乘 `R_wi^T`，抵消 Odin 上同一套重力旋转。yaml 墙面 ICP 外参仍需再标定。  
-- **分色累积**：`dual_lidar_color_viz` 从已去畸变的 `/cloud_registered` 按 intensity 拆成 `/viz/cloud_mid360`（青）与 `/viz/cloud_odin`（橙）。`lidar2_update_en=false` 时橙点仍可能相对青点歪，但青/地图走动应保持干净。
-- **累积地图**：原版 `if(0)` 未发布 `/Laser_map`；现每 5 帧 flatten 发布。RViz 主看 **CloudMap**，辅看 **CloudAccumDecay**。  
+- **点云跟着机器人转**：RViz 对 `/cloud_registered` 开长 Decay 时，异步 Odin 帧会整帧顶掉世界系扫描，看起来像地图跟着 yaw 转。现 `lidar2_update_en=false` 时不再发布纯 Odin 帧；RViz 主看 **CloudMap**（`/Laser_map`，世界系固定），当前扫描 Decay=0。  
+- **分色**：`dual_lidar_color_viz` 从 `/cloud_registered` 按 intensity 拆青/橙；外参未好前 Odin 显示可关。  
+- **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
 - 无硬时间同步时避免急转首测  

@@ -1424,13 +1424,10 @@ private:
             }
             else
             {
-                // Keep last Mid360 pose; still publish Odin scan for color viz.
-                state_point = kf.get_x();
-                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                geoQuat.x = state_point.rot.coeffs()[0];
-                geoQuat.y = state_point.rot.coeffs()[1];
-                geoQuat.z = state_point.rot.coeffs()[2];
-                geoQuat.w = state_point.rot.coeffs()[3];
+                // Keep last Mid360 pose. Do NOT publish this Odin-only scan to
+                // /cloud_registered — RViz Decay would replace the world cloud with a
+                // body-locked sector and look like the map spins with the robot.
+                return;
             }
 
             /******* Publish points *******/
