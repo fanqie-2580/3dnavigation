@@ -109,6 +109,7 @@ install(
   PROGRAMS
     scripts/odin_raw_downsample_bridge.py
     scripts/multi_lio_nav_bridge.py
+    scripts/dual_lidar_color_viz.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

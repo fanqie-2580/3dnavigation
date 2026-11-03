@@ -33,6 +33,11 @@ def generate_launch_description():
         default_value='0.08',
         description='Voxel size (m) for Odin raw cloud downsample bridge',
     )
+    enable_color_viz_arg = DeclareLaunchArgument(
+        'enable_color_viz',
+        default_value='true',
+        description='Publish /viz/cloud_mid360 and /viz/cloud_odin for RViz color compare',
+    )
 
     def choose_nodes(context, *args, **kwargs):
         method = context.launch_configurations['update_method']
@@ -93,6 +98,21 @@ def generate_launch_description():
                 )
             )
 
+        if context.launch_configurations.get('enable_color_viz', 'true') == 'true':
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='dual_lidar_color_viz.py',
+                    name='dual_lidar_color_viz',
+                    output='screen',
+                    parameters=[config_file, {
+                        'map_frame': 'map',
+                        'mid360_stride': 8,
+                        'odin_stride': 2,
+                    }],
+                )
+            )
+
         # body -> base_link using existing Go2 Mid360 extrinsic (qy/qw form as rpy approx 0)
         # Keep identity-ish; localization stack already has body_to_base static TF when using open3d_loc.
         nodes.append(
@@ -115,5 +135,6 @@ def generate_launch_description():
         enable_odin_ds_arg,
         enable_nav_bridge_arg,
         odin_voxel_arg,
+        enable_color_viz_arg,
         OpaqueFunction(function=choose_nodes),
     ])
