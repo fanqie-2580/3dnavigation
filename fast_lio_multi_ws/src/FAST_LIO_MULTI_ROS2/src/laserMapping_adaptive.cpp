@@ -148,6 +148,7 @@ bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
 bool odin_gravity_ext_comp = false; // apply R_wi^T to L2 once after IMU gravity-align
+bool extrinsic_L2_gravity_frame = false; // yaml L2 is body-fixed when false
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
@@ -1032,6 +1033,7 @@ public:
 
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("mapping.lidar2_update_en", false);
+        this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_T", {});
@@ -1091,6 +1093,7 @@ public:
         this->get_parameter_or("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
+        this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
         this->get_parameter_or("mapping.extrinsic_T", extrinT, std::vector<double>());
@@ -1292,11 +1295,9 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            // Yaml extrinsic_*_L2_wrt_L1 are in gravity/world: p_w = R_yaml*p_odin + t_w.
-            // Mid360 body still uses IMU gravity-align R_wi, so convert into L1 frame:
-            //   R_L2L1 = R_wi^T * R_yaml,  t_L2L1 = R_wi^T * t_w
-            // ⇒ p_w = R_wi*(R_L2L1*p + t_L2L1) = R_yaml*p + t_w.
-            if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
+            // Optional: yaml L2 given in gravity/world → convert once with R_wi^T.
+            // When extrinsic_L2_gravity_frame=false, yaml is already body-fixed L2_wrt_L1.
+            if (multi_lidar && extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 M3D R_wi = state_point.rot.toRotationMatrix();
                 M3D R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
@@ -1305,6 +1306,12 @@ private:
                 LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = R_wi.transpose() * t_w;
                 odin_gravity_ext_comp = true;
                 std::cout << "\033[32;1mOdin L2 extrinsic from gravity yaml via R_wi^T:\n"
+                          << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+            }
+            else if (multi_lidar && !extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())
+            {
+                odin_gravity_ext_comp = true;
+                std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed (no R_wi^T):\n"
                           << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
             }
             if (feats_undistort->empty() || (feats_undistort == NULL))

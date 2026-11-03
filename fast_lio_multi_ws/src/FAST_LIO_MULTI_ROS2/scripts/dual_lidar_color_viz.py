@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """World-fixed dual-color accumulation for Mid360 + Odin.
 
-Mid360  (cyan)  : deskewed /cloud_registered -> voxel accum -> /viz/accum_mid360
-Odin1   (orange): /odin1/cloud_raw_ds + /Odometry -> voxel accum -> /viz/accum_odin
+Mid360 (cyan): deskewed /cloud_registered -> /viz/accum_mid360
+Odin1  (orange): /odin1/cloud_raw_ds + body extrinsic + /Odometry -> /viz/accum_odin
 
-Also publishes current frames on /viz/cloud_mid360 and /viz/cloud_odin.
-
-Accumulation lives in this node (map frame), so RViz Decay can stay 0 — the map
-does not spin with the robot. Pose still comes from Mid360-only LIO when
-mapping.lidar2_update_en=false.
+Odin extrinsic is body-fixed L2_wrt_L1 (yaml). Do NOT apply R_wi0^T gravity
+conversion — that put Odin accum in the wrong frame while Mid stayed correct.
 """
 from __future__ import annotations
 
@@ -88,14 +85,14 @@ class DualLidarColorViz(Node):
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter(
-            'mapping.extrinsic_T_L2_wrt_L1', [0.154713, 0.022738, 0.000055]
+            'mapping.extrinsic_T_L2_wrt_L1', [0.152932, -0.032606, 0.080137]
         )
         self.declare_parameter(
             'mapping.extrinsic_R_L2_wrt_L1',
             [
-                0.99603821, 0.00426344, -0.08882406,
-                -0.00656408, 0.99965007, -0.02562515,
-                0.08868373, 0.02610668, 0.99571765,
+                0.96905401, -0.00098037, -0.24684685,
+                0.00160252, 0.99999603, 0.00231950,
+                0.24684359, -0.00264330, 0.96905173,
             ],
         )
 
@@ -108,16 +105,16 @@ class DualLidarColorViz(Node):
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
-        self.t_w = np.asarray(
+
+        # Body-fixed Odin -> Mid360/L1 (no gravity R_wi^T).
+        self.t_L2 = np.asarray(
             self.get_parameter('mapping.extrinsic_T_L2_wrt_L1').value, dtype=np.float64
         ).reshape(3)
-        self.R_yaml = np.asarray(
+        self.R_L2 = np.asarray(
             self.get_parameter('mapping.extrinsic_R_L2_wrt_L1').value, dtype=np.float64
         ).reshape(3, 3)
 
         self._pose: Pose | None = None
-        self._R_L2: np.ndarray | None = None
-        self._t_L2: np.ndarray | None = None
         self._accum_mid = VoxelAccum(voxel, max_n)
         self._accum_odin = VoxelAccum(voxel, max_n)
         self._dirty_mid = False
@@ -134,17 +131,12 @@ class DualLidarColorViz(Node):
         self.create_timer(max(0.2, period), self.publish_accum)
 
         self.get_logger().info(
-            f'dual accum: Mid {self.reg_topic}->/viz/accum_mid360, '
-            f'Odin {self.odin_topic}->/viz/accum_odin voxel={voxel}m'
+            f'dual accum body-L2: Mid->{self.reg_topic} Odin->{self.odin_topic} '
+            f't={self.t_L2.tolist()} voxel={voxel}'
         )
 
     def on_odom(self, msg: Odometry) -> None:
         self._pose = msg.pose.pose
-        if self._R_L2 is None:
-            R_wi0 = quat_to_R(msg.pose.pose.orientation)
-            self._R_L2 = R_wi0.T @ self.R_yaml
-            self._t_L2 = R_wi0.T @ self.t_w
-            self.get_logger().info('captured R_wi0; Odin L2 extrinsic converted')
 
     def _header(self, stamp) -> Header:
         h = Header()
@@ -181,7 +173,7 @@ class DualLidarColorViz(Node):
             self._dirty_mid = True
 
     def on_odin(self, msg: PointCloud2) -> None:
-        if self._pose is None or self._R_L2 is None or self._t_L2 is None:
+        if self._pose is None:
             return
         pts = list(
             point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
@@ -193,7 +185,7 @@ class DualLidarColorViz(Node):
         )
         if arr.size == 0:
             return
-        body = (self._R_L2 @ arr.T).T + self._t_L2
+        body = (self.R_L2 @ arr.T).T + self.t_L2
         R = quat_to_R(self._pose.orientation)
         t = np.array(
             [self._pose.position.x, self._pose.position.y, self._pose.position.z],
@@ -216,12 +208,6 @@ class DualLidarColorViz(Node):
                 make_cloud(self._header(stamp), self._accum_odin.numpy())
             )
             self._dirty_odin = False
-        if len(self._accum_mid) and len(self._accum_odin) and (
-            len(self._accum_mid) + len(self._accum_odin)
-        ) % 20000 < 50:
-            self.get_logger().info(
-                f'accum size mid={len(self._accum_mid)} odin={len(self._accum_odin)}'
-            )
 
 
 def main() -> None:
