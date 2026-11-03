@@ -1385,7 +1385,7 @@ private:
             // called publish_map → RViz CloudMap stayed empty; only current scan visible).
             {
                 static int map_pub_tic = 0;
-                if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 5 == 0))
+                if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 2 == 0))
                 {
                     PointVector().swap(ikdtree.PCL_Storage);
                     ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);

@@ -71,7 +71,8 @@
     publish:
       path_en: true
       scan_publish_en: true
-      dense_publish_en: false
+      # true: /cloud_registered keeps full undistorted scan (better RViz accum while moving)
+      dense_publish_en: true
       scan_bodyframe_pub_en: true
 
     pcd_save:
