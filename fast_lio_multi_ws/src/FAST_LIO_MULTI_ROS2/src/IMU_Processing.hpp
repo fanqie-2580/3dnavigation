@@ -205,7 +205,16 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   const double &pcl_end_time = lidar_num == 1 ? meas.lidar_end_time : meas.lidar_end_time2;
   
   /*** sort point clouds by offset time ***/
-  pcl_out = *(meas.lidar);
+  if (lidar_num == 2)
+  {
+    assert(meas.lidar2 != nullptr);
+    pcl_out = *(meas.lidar2);
+  }
+  else
+  {
+    assert(meas.lidar != nullptr);
+    pcl_out = *(meas.lidar);
+  }
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
   // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
   //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;

@@ -1381,46 +1381,59 @@ private:
                 return;
             }
 
-            normvec->resize(feats_down_size);
-            feats_down_world->resize(feats_down_size);
-            Nearest_Points.resize(feats_down_size);
-            /*** iterated state estimation ***/
-            double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            geoQuat.x = state_point.rot.coeffs()[0];
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
-            // RCLCPP_INFO(this->get_logger(), "KF done. Pose: %.3f %.3f %.3f",
-            //             pos_lid.x(), pos_lid.y(), pos_lid.z());
+            const bool skip_l2_update =
+                !lidar2_update_en && !bundle_enabled && current_lidar_num == 2;
 
-            /******* Publish odometry *******/
-            if (publish_tf_results)
-                publish_visionpose(pubMavrosVisionPose_);
-            // RCLCPP_INFO(this->get_logger(), "Publishing...");
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-
-            /*** add the feature points to map kdtree ***/
-            map_incremental();
-
-            // Publish accumulated ikdtree map (stock code left this under if(0) and never
-            // called publish_map → RViz CloudMap stayed empty; only current scan visible).
+            if (!skip_l2_update)
             {
-                static int map_pub_tic = 0;
-                if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 2 == 0))
+                normvec->resize(feats_down_size);
+                feats_down_world->resize(feats_down_size);
+                Nearest_Points.resize(feats_down_size);
+                /*** iterated state estimation ***/
+                double solve_H_time = 0;
+                kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                geoQuat.x = state_point.rot.coeffs()[0];
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+
+                /******* Publish odometry *******/
+                if (publish_tf_results)
+                    publish_visionpose(pubMavrosVisionPose_);
+                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+
+                /*** add the feature points to map kdtree ***/
+                map_incremental();
+
+                // Publish accumulated ikdtree map (stock code left this under if(0)).
                 {
-                    PointVector().swap(ikdtree.PCL_Storage);
-                    ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                    featsFromMap->clear();
-                    featsFromMap->points = ikdtree.PCL_Storage;
-                    publish_map(pubLaserCloudMap_);
+                    static int map_pub_tic = 0;
+                    if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 2 == 0))
+                    {
+                        PointVector().swap(ikdtree.PCL_Storage);
+                        ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                        featsFromMap->clear();
+                        featsFromMap->points = ikdtree.PCL_Storage;
+                        publish_map(pubLaserCloudMap_);
+                    }
                 }
+                if (path_en)
+                    publish_path(pubPath_);
             }
+            else
+            {
+                // Keep last Mid360 pose; still publish Odin scan for color viz.
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                geoQuat.x = state_point.rot.coeffs()[0];
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+            }
+
             /******* Publish points *******/
-            if (path_en)
-                publish_path(pubPath_);
             if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
             if (scan_pub_en && scan_body_pub_en)
