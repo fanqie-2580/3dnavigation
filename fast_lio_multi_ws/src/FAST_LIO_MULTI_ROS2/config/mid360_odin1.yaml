@@ -56,7 +56,8 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Do NOT use unconstrained ICP R: FOV mismatch invented ~14° pitch and tilted Odin in map.
+      # Odin cloud_raw is already near gravity-level (floor ~1°). Keep R=I.
+      # Unconstrained ICP / IMU gravity-align both put false pitch on Odin.
       # Translation-only coarse guess; replace with measured extrinsic on robot.
       extrinsic_T_L2_wrt_L1: [0.16, 0.0, 0.03]
       extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,

@@ -166,16 +166,11 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  // Align world +Z with gravity so map is level vs RViz Grid.
-  // Stock FAST-LIO leaves rot=I and puts grav in the initial IMU frame, so a
-  // pitched Mid360 IMU makes the whole CloudMap look tilted.
-  {
-    V3D gz_body = (-mean_acc / mean_acc.norm()); // down in IMU
-    Eigen::Quaterniond q_align =
-        Eigen::Quaterniond::FromTwoVectors(gz_body, V3D(0.0, 0.0, -1.0));
-    init_state.rot = SO3(q_align.toRotationMatrix());
-    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
-  }
+  // Stock FAST-LIO: world = first IMU attitude, grav expressed in that frame.
+  // Do NOT FromTwoVectors-align here: Mid360 IMU (~9° vs g) disagrees with both
+  // Mid360 lidar floor (~3°) and Odin cloud (~1°, already near-level). Aligning
+  // to IMU tilts Odin in /Laser_map while Mid360 stays relatively flatter.
+  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
