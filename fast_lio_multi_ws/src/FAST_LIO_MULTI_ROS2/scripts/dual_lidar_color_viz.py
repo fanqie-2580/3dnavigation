@@ -10,6 +10,7 @@ Do not transform raw Odin with a separate /Odometry path — that drifts when mo
 from __future__ import annotations
 
 import struct
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -18,6 +19,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from std_srvs.srv import Trigger
 
 
 def make_cloud(header: Header, xyz: np.ndarray) -> PointCloud2:
@@ -70,6 +72,9 @@ class DualLidarColorViz(Node):
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
+        # Skip early frames while LIO gravity/zero-start settles — otherwise
+        # permanent VoxelAccum keeps ghost walls forever.
+        self.declare_parameter('accum_skip_sec', 8.0)
 
         self.mid_topic = self.get_parameter('mid_topic').value
         self.odin_topic = self.get_parameter('odin_topic').value
@@ -80,6 +85,8 @@ class DualLidarColorViz(Node):
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
+        self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
+        self._t0 = time.time()
 
         self._accum_mid = VoxelAccum(voxel, max_n)
         self._accum_odin = VoxelAccum(voxel, max_n)
@@ -94,11 +101,24 @@ class DualLidarColorViz(Node):
         self.create_subscription(PointCloud2, self.mid_topic, self.on_mid, 5)
         self.create_subscription(PointCloud2, self.odin_topic, self.on_odin, 5)
         self.create_timer(max(0.2, period), self.publish_accum)
+        self.create_service(Trigger, '~/clear_accum', self.on_clear_accum)
 
         self.get_logger().info(
             f'dual accum from LIO map clouds: Mid {self.mid_topic}, '
-            f'Odin {self.odin_topic}, voxel={voxel}'
+            f'Odin {self.odin_topic}, voxel={voxel}, skip={self.accum_skip_sec}s'
         )
+
+    def _accum_ready(self) -> bool:
+        return (time.time() - self._t0) >= self.accum_skip_sec
+
+    def on_clear_accum(self, _req, resp):
+        self._accum_mid = VoxelAccum(self._accum_mid.voxel, self._accum_mid.max_points)
+        self._accum_odin = VoxelAccum(self._accum_odin.voxel, self._accum_odin.max_points)
+        self._dirty_mid = self._dirty_odin = True
+        self._t0 = time.time()
+        resp.success = True
+        resp.message = 'cleared Mid/Odin voxel accum'
+        return resp
 
     def _header(self, stamp, frame_id: str | None = None) -> Header:
         h = Header()
@@ -137,7 +157,7 @@ class DualLidarColorViz(Node):
         self.pub_mid.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)
         )
-        if self._accum_mid.add(arr):
+        if self._accum_ready() and self._accum_mid.add(arr):
             self._dirty_mid = True
 
     def on_odin(self, msg: PointCloud2) -> None:
@@ -145,7 +165,7 @@ class DualLidarColorViz(Node):
         self.pub_odin.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)
         )
-        if self._accum_odin.add(arr):
+        if self._accum_ready() and self._accum_odin.add(arr):
             self._dirty_odin = True
 
     def publish_accum(self) -> None:

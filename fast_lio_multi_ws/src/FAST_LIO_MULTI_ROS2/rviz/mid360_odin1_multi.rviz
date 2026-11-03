@@ -286,7 +286,8 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 80; 220; 255
       Color Transformer: FlatColor
-      Decay Time: 120
+      # Accum topic already voxel-integrates; Decay>0 stacks full-map snapshots = fake ghosts.
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -294,8 +295,6 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: Mid360
-      Decay Time: 0
-      Enabled: true
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -322,7 +321,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 90; 40
       Color Transformer: FlatColor
-      Decay Time: 120
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -330,8 +329,6 @@ Visualization Manager:
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: Odin1
-      Decay Time: 0
-      Enabled: true
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
