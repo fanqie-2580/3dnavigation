@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """World-fixed dual-color accumulation for Mid360 + Odin.
 
-Mid360 (cyan): /cloud_registered (already in map from FAST-LIO)
+Mid360 (cyan): /cloud_registered (FAST-LIO map cloud)
 
-Odin1 (orange): same pattern as ws_odin_pvlio/bridge/odin_odom_mapper.py
-  - Input is sensor-frame /odin1/cloud_raw_ds (NOT cloud_slam, NOT LIO-undistorted)
-  - Apply Mid /Odometry pose ONCE with L2_wrt_L1 + Mid IMU extrinsic
-  - Voxel-accumulate in map
-
-Standalone Odin mapping worked because cloud_slam was already in odom and
-the mapper never re-multiplied pose (re-applying odom caused "follows robot"
-smearing). Fusion must likewise apply pose exactly once to raw sensor cloud.
+Odin1 (orange): same rule as ws_odin_pvlio odin_odom_mapper —
+  sensor-frame /odin1/cloud_raw_ds × Mid pose ONCE.
+  Pose is interpolated from /Odometry at the cloud stamp so rotation
+  does not fan-smear (latest-odom lag was the orange swirl).
 """
 from __future__ import annotations
 
 import math
 import struct
 import time
-from typing import Dict, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -38,6 +35,10 @@ def make_cloud(header: Header, xyz: np.ndarray) -> PointCloud2:
     return point_cloud2.create_cloud_xyz32(header, xyz)
 
 
+def stamp_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
 def quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
     n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
     x, y, z, w = x / n, y / n, z / n, w / n
@@ -51,6 +52,35 @@ def quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
+def rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return x, y, z, w
+
+
 def se3_from_pose(pose: Pose) -> np.ndarray:
     p = pose.position
     q = pose.orientation
@@ -62,10 +92,36 @@ def se3_from_pose(pose: Pose) -> np.ndarray:
 
 def se3_from_rt(R9, t3) -> np.ndarray:
     T = np.eye(4, dtype=np.float64)
-    R = np.asarray(R9, dtype=np.float64).reshape(3, 3)
-    T[:3, :3] = R
+    T[:3, :3] = np.asarray(R9, dtype=np.float64).reshape(3, 3)
     T[:3, 3] = np.asarray(t3, dtype=np.float64).reshape(3)
     return T
+
+
+def slerp_R(R0: np.ndarray, R1: np.ndarray, a: float) -> np.ndarray:
+    """Simple relative-angle slerp via axis-angle on R0^T R1."""
+    a = float(np.clip(a, 0.0, 1.0))
+    if a <= 0.0:
+        return R0.copy()
+    if a >= 1.0:
+        return R1.copy()
+    Rrel = R0.T @ R1
+    # clamp numerical
+    c = float(np.clip((np.trace(Rrel) - 1.0) * 0.5, -1.0, 1.0))
+    ang = math.acos(c)
+    if abs(ang) < 1e-9:
+        return R0.copy()
+    # Rodriguez from skew
+    K = Rrel - Rrel.T
+    axis = np.array([K[2, 1], K[0, 2], K[1, 0]], dtype=np.float64)
+    n = np.linalg.norm(axis)
+    if n < 1e-9:
+        return R0.copy()
+    axis /= n
+    a2 = ang * a
+    x, y, z = axis
+    Kx = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
+    Rinc = np.eye(3) + math.sin(a2) * Kx + (1 - math.cos(a2)) * (Kx @ Kx)
+    return R0 @ Rinc
 
 
 class VoxelAccum:
@@ -105,7 +161,6 @@ class DualLidarColorViz(Node):
     def __init__(self) -> None:
         super().__init__('dual_lidar_color_viz')
         self.declare_parameter('mid_topic', '/cloud_registered')
-        # Sensor-frame Odin (mode0 raw). Do NOT use cloud_slam here.
         self.declare_parameter('odin_raw_topic', '/odin1/cloud_raw_ds')
         self.declare_parameter('odom_topic', '/Odometry')
         self.declare_parameter('map_frame', 'map')
@@ -116,13 +171,13 @@ class DualLidarColorViz(Node):
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter('accum_skip_sec', 8.0)
-        # Mid360 IMU -> Mid lidar (mid360_odin1.yaml)
+        self.declare_parameter('odom_buffer_sec', 2.0)
+        self.declare_parameter('max_odom_cloud_dt', 0.15)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
         self.declare_parameter(
             'extrinsic_R',
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
-        # Odin -> Mid lidar
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.152932, -0.032606, 0.080137])
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
@@ -144,6 +199,8 @@ class DualLidarColorViz(Node):
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
+        self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
+        self.max_odom_cloud_dt = float(self.get_parameter('max_odom_cloud_dt').value)
         self._t0 = time.time()
 
         T_imu_mid = se3_from_rt(
@@ -154,14 +211,13 @@ class DualLidarColorViz(Node):
             self.get_parameter('extrinsic_R_L2_wrt_L1').value,
             self.get_parameter('extrinsic_T_L2_wrt_L1').value,
         )
-        # p_imu = T_imu_mid * T_mid_odin * p_odin
         self.T_imu_odin = T_imu_mid @ T_mid_odin
 
         self._accum_mid = VoxelAccum(voxel, max_n)
         self._accum_odin = VoxelAccum(voxel, max_n)
         self._dirty_mid = False
         self._dirty_odin = False
-        self._latest_odom: Optional[Odometry] = None
+        self._odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
 
         self.pub_mid = self.create_publisher(PointCloud2, '/viz/cloud_mid360', 5)
         self.pub_odin = self.create_publisher(PointCloud2, '/viz/cloud_odin', 5)
@@ -169,15 +225,14 @@ class DualLidarColorViz(Node):
         self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
 
         self.create_subscription(PointCloud2, self.mid_topic, self.on_mid, 5)
-        self.create_subscription(Odometry, self.odom_topic, self.on_odom, 50)
+        self.create_subscription(Odometry, self.odom_topic, self.on_odom, 100)
         self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_raw, 5)
         self.create_timer(max(0.2, period), self.publish_accum)
         self.create_service(Trigger, '~/clear_accum', self.on_clear_accum)
 
         self.get_logger().info(
-            f'Mid accum from {self.mid_topic}; Odin from SENSOR {self.odin_raw_topic} '
-            f'x Mid {self.odom_topic} once (odin_odom_mapper style), voxel={voxel}, '
-            f'skip={self.accum_skip_sec}s'
+            f'Mid={self.mid_topic}; Odin={self.odin_raw_topic} x interpolated '
+            f'{self.odom_topic} (max_dt={self.max_odom_cloud_dt}s), voxel={voxel}'
         )
 
     def _accum_ready(self) -> bool:
@@ -199,7 +254,38 @@ class DualLidarColorViz(Node):
         return h
 
     def on_odom(self, msg: Odometry) -> None:
-        self._latest_odom = msg
+        t = stamp_sec(msg.header.stamp)
+        T = se3_from_pose(msg.pose.pose)
+        self._odom_buf.append((t, T))
+        cutoff = t - self.odom_buffer_sec
+        while self._odom_buf and self._odom_buf[0][0] < cutoff:
+            self._odom_buf.popleft()
+
+    def _interp_odom(self, t_cloud: float) -> Optional[np.ndarray]:
+        if len(self._odom_buf) < 1:
+            return None
+        # exact / clamp ends
+        if t_cloud <= self._odom_buf[0][0]:
+            if abs(t_cloud - self._odom_buf[0][0]) > self.max_odom_cloud_dt:
+                return None
+            return self._odom_buf[0][1].copy()
+        if t_cloud >= self._odom_buf[-1][0]:
+            if abs(t_cloud - self._odom_buf[-1][0]) > self.max_odom_cloud_dt:
+                return None
+            return self._odom_buf[-1][1].copy()
+        # find segment
+        for i in range(len(self._odom_buf) - 1):
+            t0, T0 = self._odom_buf[i]
+            t1, T1 = self._odom_buf[i + 1]
+            if t0 <= t_cloud <= t1:
+                if (t1 - t0) < 1e-6:
+                    return T0.copy()
+                a = (t_cloud - t0) / (t1 - t0)
+                T = np.eye(4)
+                T[:3, :3] = slerp_R(T0[:3, :3], T1[:3, :3], a)
+                T[:3, 3] = (1 - a) * T0[:3, 3] + a * T1[:3, 3]
+                return T
+        return None
 
     def _xyz_stride(self, msg: PointCloud2, stride: int, blind2: float = 0.0) -> np.ndarray:
         offs = {f.name: f.offset for f in msg.fields}
@@ -229,22 +315,20 @@ class DualLidarColorViz(Node):
             self._dirty_mid = True
 
     def on_odin_raw(self, msg: PointCloud2) -> None:
-        """Pose sensor-frame Odin with Mid odom exactly once → map (world-fixed)."""
-        odom = self._latest_odom
-        if odom is None:
+        t_cloud = stamp_sec(msg.header.stamp)
+        T_map_imu = self._interp_odom(t_cloud)
+        if T_map_imu is None:
             return
         arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
         if arr.size == 0:
             return
 
-        T_map_imu = se3_from_pose(odom.pose.pose)
         T_map_odin = T_map_imu @ self.T_imu_odin
         R = T_map_odin[:3, :3]
         t = T_map_odin[:3, 3]
         world = (arr @ R.T) + t
 
-        stamp = odom.header.stamp
-        self.pub_odin.publish(make_cloud(self._header(stamp), world))
+        self.pub_odin.publish(make_cloud(self._header(msg.header.stamp), world))
         if self._accum_ready() and self._accum_odin.add(world):
             self._dirty_odin = True
 
