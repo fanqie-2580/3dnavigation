@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Voxel-downsample Odin1 /odin1/cloud_raw for FAST_LIO_MULTI second lidar input."""
+"""Voxel-downsample Odin1 /odin1/cloud_raw for FAST_LIO_MULTI second lidar input.
+
+Preserves intensity (or fills 0) so PCL XYZI conversion does not warn.
+"""
 from __future__ import annotations
 
+import struct
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
-import numpy as np
+from std_msgs.msg import Header
 
 
 class OdinRawDownsampleBridge(Node):
@@ -28,19 +34,44 @@ class OdinRawDownsampleBridge(Node):
         )
 
     def cb(self, msg: PointCloud2) -> None:
-        pts = list(point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True))
+        names = [f.name for f in msg.fields]
+        want = ('x', 'y', 'z', 'intensity') if 'intensity' in names else ('x', 'y', 'z')
+        pts = list(point_cloud2.read_points(msg, field_names=want, skip_nans=True))
         if not pts:
             return
-        arr = np.asarray([[p[0], p[1], p[2]] for p in pts], dtype=np.float32)
+        if len(want) == 4:
+            arr = np.asarray([[p[0], p[1], p[2], p[3]] for p in pts], dtype=np.float32)
+        else:
+            arr = np.asarray([[p[0], p[1], p[2], 0.0] for p in pts], dtype=np.float32)
+
         if self.voxel > 0:
-            keys = np.floor(arr / self.voxel).astype(np.int32)
-            # unique voxels keep first point
+            keys = np.floor(arr[:, :3] / self.voxel).astype(np.int32)
             _, idx = np.unique(keys, axis=0, return_index=True)
             arr = arr[np.sort(idx)]
         if len(arr) > self.max_points:
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
-        out = point_cloud2.create_cloud_xyz32(msg.header, arr.tolist())
+
+        header = Header()
+        header.stamp = msg.header.stamp
+        header.frame_id = msg.header.frame_id
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        data = b''.join(struct.pack('<ffff', float(x), float(y), float(z), float(i)) for x, y, z, i in arr)
+        out = PointCloud2()
+        out.header = header
+        out.height = 1
+        out.width = len(arr)
+        out.fields = fields
+        out.is_bigendian = False
+        out.point_step = 16
+        out.row_step = 16 * len(arr)
+        out.is_dense = True
+        out.data = data
         self.pub.publish(out)
 
 

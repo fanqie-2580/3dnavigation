@@ -274,9 +274,24 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
   pl_surf.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZI> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  const int plsize = static_cast<int>(pl_orig.points.size());
+  pcl::PointCloud<pcl::PointXYZ> pl_xyz;
+  pcl::PointCloud<pcl::PointXYZI> pl_xyzi;
+  bool has_i = false;
+  for (const auto &f : msg->fields)
+  {
+    if (f.name == "intensity")
+    {
+      has_i = true;
+      break;
+    }
+  }
+  if (has_i)
+    pcl::fromROSMsg(*msg, pl_xyzi);
+  else
+    pcl::fromROSMsg(*msg, pl_xyz);
+
+  const int plsize = has_i ? static_cast<int>(pl_xyzi.points.size())
+                           : static_cast<int>(pl_xyz.points.size());
   if (plsize == 0) return;
   pl_surf.reserve(plsize / std::max(1, point_filter_num[lidar_num]) + 1);
 
@@ -285,16 +300,26 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
   for (int i = 0; i < plsize; i++)
   {
     if (point_filter_num[lidar_num] > 1 && (i % point_filter_num[lidar_num]) != 0) continue;
-    const auto &pt = pl_orig.points[i];
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-    const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+    float x, y, z, intensity = 0.f;
+    if (has_i)
+    {
+      const auto &pt = pl_xyzi.points[i];
+      x = pt.x; y = pt.y; z = pt.z; intensity = pt.intensity;
+    }
+    else
+    {
+      const auto &pt = pl_xyz.points[i];
+      x = pt.x; y = pt.y; z = pt.z;
+    }
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+    const float r2 = x * x + y * y + z * z;
     if (r2 <= blind2) continue;
 
     PointType added_pt;
-    added_pt.x = pt.x;
-    added_pt.y = pt.y;
-    added_pt.z = pt.z;
-    added_pt.intensity = pt.intensity;
+    added_pt.x = x;
+    added_pt.y = y;
+    added_pt.z = z;
+    added_pt.intensity = intensity;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
