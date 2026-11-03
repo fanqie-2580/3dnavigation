@@ -128,10 +128,10 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 ## 7. 风险与待标定
 
 - **对齐问题（已复现）**：`multi_lidar: true` + 不准外参 → RViz CloudMap 双墙。单帧 ICP 只能改善一部分，不能当正式标定  
-- **Odin 发斜（已定位）**：
-  1. Odin `/odin1/cloud_raw` 地面 PCA 已接近水平（~1°）；Mid360 雷达系地面 ~3°；Mid360 IMU 相对重力 ~9°——三者不一致。  
-  2. 曾对 IMU 做 `FromTwoVectors` 重力对齐：`map` 按 IMU 转正后，Odin（本已水平）被同一 `state.rot` 再拧约 6°→看起来「Odin 斜」。已**撤销**该对齐，恢复原版 `rot=I` + `grav=S2(-mean_acc)`。  
-  3. 无约束 ICP 的 `extrinsic_R_L2_wrt_L1`（~−14° pitch）同样会拧斜 Odin；保持 `R=I` + 粗平移。  
+- **Mid360 / Odin 同时水平**：
+  1. Odin `/odin1/cloud_raw` 已接近重力水平（~1°）；Mid360 IMU 相对重力 ~9°。  
+  2. `IMU_init` 对 Mid360 做 `FromTwoVectors` 重力对齐（`map` 相对 Grid 摆正）。  
+  3. IMU 初始化完成后，把 `LiDAR2_wrt_LiDAR1.R` 左乘 `R_wi^T`，抵消 Odin 上同一套重力旋转，避免「Mid360 正了、Odin 又斜」。yaml 里 `extrinsic_R_L2_wrt_L1` 仍写安装外参（默认 `I`）。  
 - **累积地图**：原版 `if(0)` 未发布 `/Laser_map`；现每 5 帧 flatten 发布。RViz 主看 **CloudMap**，辅看 **CloudAccumDecay**。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  

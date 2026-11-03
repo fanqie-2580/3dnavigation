@@ -147,6 +147,7 @@ BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
+bool odin_gravity_ext_comp = false; // apply R_wi^T to L2 once after IMU gravity-align
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
 double lidar_mean_scantime2 = 0.0;
@@ -1270,6 +1271,18 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            // Odin cloud is near gravity-level; Mid360 world was gravity-aligned via
+            // state.rot=R_wi. Express Odin in Mid360 lidar frame as R_wi^T * R_yaml * p
+            // so p_world = R_wi * R_wi^T * p_odin stays level.
+            if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
+            {
+                M3D R_wi = state_point.rot.toRotationMatrix();
+                M3D R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
+                LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_wi.transpose() * R_yaml;
+                odin_gravity_ext_comp = true;
+                std::cout << "\033[32;1mOdin L2 extrinsic compensated by R_wi^T (gravity):\n"
+                          << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+            }
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");

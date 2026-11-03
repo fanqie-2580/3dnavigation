@@ -39,6 +39,7 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_, const bool &multi_lidar, int lidar_num = 1);
+  bool IMU_inited() const { return !imu_need_init_; }
 
   V3D cov_acc;
   V3D cov_gyr;
@@ -166,11 +167,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  // Stock FAST-LIO: world = first IMU attitude, grav expressed in that frame.
-  // Do NOT FromTwoVectors-align here: Mid360 IMU (~9° vs g) disagrees with both
-  // Mid360 lidar floor (~3°) and Odin cloud (~1°, already near-level). Aligning
-  // to IMU tilts Odin in /Laser_map while Mid360 stays relatively flatter.
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  // Gravity-align Mid360/IMU world so CloudMap is level vs RViz Grid.
+  // Odin cloud_raw is already near gravity-level; laserMapping compensates
+  // LiDAR2_wrt_LiDAR1 by R_wi^T once after IMU_inited() so Odin is not re-tilted.
+  {
+    V3D gz_body = (-mean_acc / mean_acc.norm());
+    Eigen::Quaterniond q_align =
+        Eigen::Quaterniond::FromTwoVectors(gz_body, V3D(0.0, 0.0, -1.0));
+    init_state.rot = SO3(q_align.toRotationMatrix());
+    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  }
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
