@@ -56,13 +56,13 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Odin cloud_raw is already near gravity-level (floor ~1°). Keep R=I.
-      # Unconstrained ICP / IMU gravity-align both put false pitch on Odin.
-      # Translation-only coarse guess; replace with measured extrinsic on robot.
-      extrinsic_T_L2_wrt_L1: [0.16, 0.0, 0.03]
-      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
-                              0.0, 1.0, 0.0,
-                              0.0, 0.0, 1.0]
+      # Wall-focused ICP in gravity frame (2026-11-03): NN median ~0.09m on walls.
+      # Runtime still left-multiplies R by R_wi^T after IMU gravity-align.
+      # R_yaml below is residual Mid360↔Odin (not identity).
+      extrinsic_T_L2_wrt_L1: [0.162107, 0.039870, 0.015840]
+      extrinsic_R_L2_wrt_L1: [0.99496528, -0.01980455, -0.09824394,
+                              0.01557448, 0.99892598, -0.04363843,
+                              0.09900266, 0.04188863, 0.99420512]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
