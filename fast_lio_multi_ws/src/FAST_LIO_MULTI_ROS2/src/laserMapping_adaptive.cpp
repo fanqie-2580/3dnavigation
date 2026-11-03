@@ -1365,12 +1365,18 @@ private:
             /*** add the feature points to map kdtree ***/
             map_incremental();
 
-            if (0) // If you need to see map point, change to "if(1)"
+            // Publish accumulated ikdtree map (stock code left this under if(0) and never
+            // called publish_map → RViz CloudMap stayed empty; only current scan visible).
             {
-                PointVector().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
+                static int map_pub_tic = 0;
+                if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 5 == 0))
+                {
+                    PointVector().swap(ikdtree.PCL_Storage);
+                    ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                    featsFromMap->clear();
+                    featsFromMap->points = ikdtree.PCL_Storage;
+                    publish_map(pubLaserCloudMap_);
+                }
             }
             /******* Publish points *******/
             if (path_en)

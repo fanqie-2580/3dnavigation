@@ -129,8 +129,9 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 
 - **对齐问题（已复现）**：`multi_lidar: true` + 不准外参 → RViz CloudMap 双墙。单帧 ICP 只能改善一部分，不能当正式标定  
 - **倾斜问题（源码）**：
-  1. `IMU_Processing.hpp` 里原版 `IMU_init` 保持 `rot=I`，只用 `grav=S2(-mean_acc)`；`map` 等于开机瞬间 IMU 坐标系。Mid360 实测 `mean_acc≈[-0.16,0,0.98]`（相对重力约 9°），相对 RViz Grid（XY 水平）整幅点云会斜。已改为 `FromTwoVectors` 重力对齐，使 `grav=(0,0,-g)`、`rot` 把机体 down 转到世界 -Z。  
+  1. `IMU_Processing.hpp` 里原版 `IMU_init` 保持 `rot=I`，只用 `grav=S2(-mean_acc)`；`map` 等于开机瞬间 IMU 坐标系。Mid360 实测 `mean_acc≈[-0.16,0,0.98]`（相对重力约 9°），相对 RViz Grid（XY 水平）整幅点云会斜。已改为 `FromTwoVectors` 重力对齐，使 `grav=(0,0,-g)`、`rot` 把机体 down 转到世界 -Z。对齐后 **body TF 会稳定俯仰约 9°**（机体相对重力），`/Laser_map` 地面应对齐 Grid；不要把 body 轴倾斜误当成地图在晃。  
   2. `sync` 里 `pcl::transformPointCloud(..., LiDAR2_wrt_LiDAR1)` 把 Odin 变到 Mid360；错误的 ICP `extrinsic_R_L2_wrt_L1`（曾估计俯仰约 -14.5°）会把本已水平的 Odin 地面再拧斜，叠出斜墙/拖影。已改回 `R=I` + 粗平移。  
+- **累积地图**：原版 `laserMapping_adaptive.cpp` 把 ikdtree→`featsFromMap` 放在 `if(0)` 且未调用 `publish_map`，`/Laser_map` 为空，RViz 只能看当前 `/cloud_registered`。现已每 5 帧 flatten 并发布 `/Laser_map`；RViz 主看 **CloudMap**，辅看 **CloudAccumDecay**（Decay=45s）。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
 - 无硬时间同步时避免急转首测  
