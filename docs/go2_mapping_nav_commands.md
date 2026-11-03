@@ -1,5 +1,8 @@
 # Go2 + MID360：建图 → 导航命令手册
 
+> **推送到 GitHub**：见 [`push_to_github.md`](./push_to_github.md)  
+>（`/home/ll/3dnavigation_github_upload` + HTTPS PAT → `fanqie-2580/3dnavigation`）。
+
 适用机型：**Unitree Go2 + Livox MID360**。  
 ROS：**Humble**。当前联调默认 **RMW = CycloneDDS**（宿主机与 `dddmr_dev` 一致）。
 
