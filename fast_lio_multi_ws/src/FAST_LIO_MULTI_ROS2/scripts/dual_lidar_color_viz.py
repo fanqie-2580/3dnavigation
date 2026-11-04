@@ -140,6 +140,10 @@ class DualLidarColorViz(Node):
         self.declare_parameter('mid_stride', 1)
         self.declare_parameter('odin_stride', 1)
         self.declare_parameter('odin_blind', 0.3)
+        # Drop near-ground wedge so side-view does not look like a pitched cloud.
+        # Level forward depth cams always paint a slanted floor sheet in XZ.
+        self.declare_parameter('odin_z_min', 0.25)
+        self.declare_parameter('odin_z_max', 100.0)
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
@@ -170,6 +174,8 @@ class DualLidarColorViz(Node):
         self.mid_stride = max(1, int(self.get_parameter('mid_stride').value))
         self.odin_stride = max(1, int(self.get_parameter('odin_stride').value))
         self.odin_blind2 = float(self.get_parameter('odin_blind').value) ** 2
+        self.odin_z_min = float(self.get_parameter('odin_z_min').value)
+        self.odin_z_max = float(self.get_parameter('odin_z_max').value)
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
@@ -301,6 +307,10 @@ class DualLidarColorViz(Node):
         arr = self._xyz_stride(msg, self.odin_stride)
         if arr.size == 0:
             return
+        if self.odin_z_min > -50.0 or self.odin_z_max < 50.0:
+            arr = arr[(arr[:, 2] >= self.odin_z_min) & (arr[:, 2] <= self.odin_z_max)]
+            if arr.size == 0:
+                return
         self.pub_odin.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id or self.map_frame), arr)
         )

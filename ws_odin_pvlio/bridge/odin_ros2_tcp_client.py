@@ -113,7 +113,7 @@ class OdinBridgeClient(Node):
         self.declare_parameter("server_host", "192.168.123.18")
         self.declare_parameter("server_port", 5601)
         self.declare_parameter("imu_topic", "/odin1/imu")
-        self.declare_parameter("cloud_topic", "/odin1/cloud_slam")
+        self.declare_parameter("cloud_topic", "/odin1/cloud_raw")
         self.declare_parameter("odom_topic", "/odin1/odometry")
         self.host = self.get_parameter("server_host").value
         self.port = int(self.get_parameter("server_port").value)
