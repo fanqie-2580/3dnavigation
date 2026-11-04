@@ -46,8 +46,10 @@ class OdinRawDownsampleBridge(Node):
         self._last_pub_key: Optional[Tuple[int, int]] = None
         self._pending: Optional[PointCloud2] = None
 
-        self.pub = self.create_publisher(PointCloud2, out, 10)
-        self.sub = self.create_subscription(PointCloud2, inn, self.cb, 10)
+        # Match FAST_LIO SensorDataQoS (BEST_EFFORT) so laserMapping always receives.
+        from rclpy.qos import qos_profile_sensor_data
+        self.pub = self.create_publisher(PointCloud2, out, qos_profile_sensor_data)
+        self.sub = self.create_subscription(PointCloud2, inn, self.cb, qos_profile_sensor_data)
         if self.restamp_from_odom:
             self.create_subscription(
                 Odometry, self.get_parameter('odom_topic').value, self.on_odom, 50

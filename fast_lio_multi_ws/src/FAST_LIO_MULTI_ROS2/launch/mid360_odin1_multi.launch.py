@@ -76,8 +76,9 @@ def generate_launch_description():
                         'input_topic': '/odin1/cloud_raw',
                         'output_topic': '/odin1/cloud_raw_ds',
                         'voxel_size': float(context.launch_configurations.get('odin_voxel', '0.08')),
+                        # Match Mid ~10Hz for official FAST_LIO_MULTI bundle; restamp Odin device clock.
                         'restamp_from_odom': True,
-                        'one_cloud_per_odom': False,
+                        'one_cloud_per_odom': True,
                     }],
                 )
             )

@@ -44,7 +44,7 @@
       b_gyr_cov: 0.0001
       det_range: 100.0
       extrinsic_est_en: false
-      # false until L2 extrinsic is good: Odin must NOT enter IEKF/ikdtree or
+      # false: Mid IEKF only; Odin posed via L2 extrinsic for viz (official async).
       # motion immediately smears CloudMap. Odin still tagged in /cloud_registered.
       lidar2_update_en: false
 
@@ -60,14 +60,13 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). NOT gravity-frame.
-      # Viz and LIO use this directly; do not apply R_wi^T again.
-      # Coarse ICP (pitch ~14°). Do not pad map-frame occupancy yaw — FOV mismatch
-      # false-positives; body-frame residual with this TF is ~0.
+      # No extra RotZ(±90°): keep R = I; only lever-arm T. Frame convention
+      # must come from sensor TF / mounting, not a viz yaw hack.
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.152932, -0.032606, 0.080137]
-      extrinsic_R_L2_wrt_L1: [0.96905401, -0.00098037, -0.24684685,
-                             0.00160252, 0.99999603, 0.00231950,
-                             0.24684359, -0.00264330, 0.96905173]
+      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0,
+                             0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
