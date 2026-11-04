@@ -147,10 +147,13 @@ class DualLidarColorViz(Node):
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.152932, -0.032606, 0.080137])
-        # Match mid360_odin1.yaml: translation only — no extra relative pitch/yaw.
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            [
+                0.96905401, -0.00098037, -0.24684685,
+                0.00160252, 0.99999603, 0.00231950,
+                0.24684359, -0.00264330, 0.96905173,
+            ],
         )
         # Odin body extrinsic (same defaults as odin_odom_mapper) for odin_own mode
         self.declare_parameter('odin_imu_to_lidar_xyz', [-0.004, 0.013, 0.026])

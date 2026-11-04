@@ -294,45 +294,11 @@ Visualization Manager:
       Max Intensity: 255
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Mid360Live
+      Name: Mid360
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.03
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /viz/cloud_mid360
-      Use Fixed Frame: true
-      Use rainbow: true
-      Value: true
-    - Alpha: 0.35
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 80; 220; 255
-      Color Transformer: FlatColor
-      Decay Time: 0
-      Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 255
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: Mid360Accum
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.02
+      Size (m): 0.025
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -362,7 +328,7 @@ Visualization Manager:
       Max Intensity: 255
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Odin1Accum
+      Name: Odin1
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2

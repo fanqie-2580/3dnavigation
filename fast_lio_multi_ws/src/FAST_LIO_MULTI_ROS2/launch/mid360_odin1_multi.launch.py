@@ -110,10 +110,11 @@ def generate_launch_description():
                     name='dual_lidar_color_viz',
                     output='screen',
                     parameters=[{
-                        # Mid + Odin both from LIO map clouds (same Mid state × L2).
-                        # imu_prop re-pose drifts/yaws off; registered is the aligned path.
+                        # Mid: LIO map cloud.
+                        # Odin: soft-sync — ignore device stamp, pose by receive
+                        # time with Mid odom + Livox IMU gyro prop (clock mismatch).
                         'mid_topic': '/cloud_registered',
-                        'odin_mode': 'registered',
+                        'odin_mode': 'imu_prop',
                         'odin_registered_topic': '/cloud_odin_registered',
                         'odin_raw_topic': '/odin1/cloud_raw_ds',
                         'odom_topic': '/Odometry',

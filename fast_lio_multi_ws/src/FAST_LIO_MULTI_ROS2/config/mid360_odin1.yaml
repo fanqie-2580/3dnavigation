@@ -60,14 +60,14 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). NOT gravity-frame.
-      # Viz/LIO use T directly — do NOT apply extra yaw/pitch after this TF
-      # (no R_wi^T, no viz level-yaw). R=I: only lever-arm translation until
-      # a measured body-fixed rotation is available.
+      # Viz and LIO use this directly; do not apply R_wi^T again.
+      # Coarse ICP (pitch ~14°). Do not pad map-frame occupancy yaw — FOV mismatch
+      # false-positives; body-frame residual with this TF is ~0.
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.152932, -0.032606, 0.080137]
-      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
-                             0.0, 1.0, 0.0,
-                             0.0, 0.0, 1.0]
+      extrinsic_R_L2_wrt_L1: [0.96905401, -0.00098037, -0.24684685,
+                             0.00160252, 0.99999603, 0.00231950,
+                             0.24684359, -0.00264330, 0.96905173]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
