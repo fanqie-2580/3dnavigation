@@ -145,10 +145,11 @@ def generate_launch_description():
                     'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                     # keep in sync with config/mid360_odin1.yaml (Odin front+higher)
                     'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
+                    # keep in sync with yaml Ry tip-up ~4.5°
                     'extrinsic_R_L2_wrt_L1': [
-                        0.99965732, 0.0, -0.02617695,
+                        0.99691733, 0.0, -0.07845910,
                         0.0, 1.0, 0.0,
-                        0.02617695, 0.0, 0.99965732,
+                        0.07845910, 0.0, 0.99691733,
                     ],
                 }],
             )
