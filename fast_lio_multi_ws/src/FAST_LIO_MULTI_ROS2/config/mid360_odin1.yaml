@@ -59,15 +59,13 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). NOT gravity-frame.
-      # No extra RotZ(±90°): keep R = I; only lever-arm T.
-      # Joint live fit vs Mid: RotY(+2.75°) + T (dx/dz/gnd). No RotZ.
+      # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). Mount is level → R = I.
+      # No RotZ/RotY hacks (pitch hacks made FOV look more tilted). Only lever T.
       extrinsic_L2_gravity_frame: false
-      extrinsic_T_L2_wrt_L1: [-0.070, -0.0371, 0.340]
-      # RotY(+2.75°): c=0.9989 s=0.0480
-      extrinsic_R_L2_wrt_L1: [0.9989, 0.0, 0.0480,
-                             0.0,    1.0, 0.0,
-                            -0.0480, 0.0, 0.9989]
+      extrinsic_T_L2_wrt_L1: [-0.030, -0.0371, 0.208]
+      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0,
+                             0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
