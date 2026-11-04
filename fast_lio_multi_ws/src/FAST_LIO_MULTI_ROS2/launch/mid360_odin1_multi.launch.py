@@ -76,10 +76,6 @@ def generate_launch_description():
                         'input_topic': '/odin1/cloud_raw',
                         'output_topic': '/odin1/cloud_raw_ds',
                         'voxel_size': float(context.launch_configurations.get('odin_voxel', '0.08')),
-                        # imu_prop viz uses receive-time; do not gate ds on Mid odom
-                        # (that re-introduced clock coupling). Still restamp for LIO bundle.
-                        'restamp_from_odom': True,
-                        'one_cloud_per_odom': False,
                     }],
                 )
             )
@@ -110,15 +106,13 @@ def generate_launch_description():
                     name='dual_lidar_color_viz',
                     output='screen',
                     parameters=[{
-                        # Mid: LIO map cloud.
-                        # Odin: soft-sync — ignore device stamp, pose by receive
-                        # time with Mid odom + Livox IMU gyro prop (clock mismatch).
+                        # Mid + Odin both from LIO map clouds (no re-pose).
+                        # Raw×odom path fans on yaw: Odin 30Hz vs Mid odom 10Hz.
                         'mid_topic': '/cloud_registered',
-                        'odin_mode': 'imu_prop',
+                        'odin_mode': 'registered',
                         'odin_registered_topic': '/cloud_odin_registered',
                         'odin_raw_topic': '/odin1/cloud_raw_ds',
                         'odom_topic': '/Odometry',
-                        'imu_topic': '/livox/imu',
                         'map_frame': 'map',
                         'mid_stride': 1,
                         'odin_stride': 1,
