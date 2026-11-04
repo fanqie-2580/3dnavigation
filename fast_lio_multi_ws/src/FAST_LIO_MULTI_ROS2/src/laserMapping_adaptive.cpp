@@ -132,6 +132,8 @@ shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 Eigen::Matrix4d LiDAR2_wrt_LiDAR1 = Eigen::Matrix4d::Identity();
+// Yaml level-frame R (Odin // gravity). Mid mount pitch is cancelled per-frame, not baked.
+M3D LiDAR2_R_yaml = Eye3d;
 Eigen::Matrix4d LiDAR1_wrt_drone = Eigen::Matrix4d::Identity();
 
 /*** EKF inputs and output ***/
@@ -149,8 +151,8 @@ BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
-bool odin_gravity_ext_comp = false; // apply R_wi^T to L2 once after IMU gravity-align
-bool extrinsic_L2_gravity_frame = false; // yaml L2 R is level-aligned when true
+bool odin_gravity_ext_comp = false; // log once when gravity L2 path is active
+bool extrinsic_L2_gravity_frame = false; // yaml R = level Odin; cancel Mid pitch/roll per frame
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
@@ -176,6 +178,24 @@ void publish_odin_body_to_world(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &odin_body_mid,
     double stamp_sec);
+
+// Odin factory/mapping calib is nearly level (imu_to_lidar_rpy ~ [0.66,-0.11,-0.29] deg).
+// Mid FAST-LIO state.rot still carries ~mount pitch vs gravity. Posing level Odin with
+// full R_wi tilts walls. Cancel ONLY Mid pitch/roll each frame; keep Mid yaw via R_wi
+// in RGBpointBodyToWorld. T stays the body lever from yaml.
+Eigen::Matrix4d odin_L2_T_for_publish()
+{
+    Eigen::Matrix4d T = LiDAR2_wrt_LiDAR1;
+    if (!extrinsic_L2_gravity_frame || !p_imu || !p_imu->IMU_inited())
+        return T;
+    const M3D R_wi = state_point.rot.toRotationMatrix();
+    const vect3 e_deg = SO3ToEuler(state_point.rot); // roll,pitch,yaw in degrees
+    const M3D R_yaw =
+        Eigen::AngleAxisd(e_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    const M3D R_pitch_roll = R_yaw.transpose() * R_wi;
+    T.block<3, 3>(0, 0) = R_pitch_roll.transpose() * LiDAR2_R_yaml;
+    return T;
+}
 
 void pointBodyToWorld(PointType const * const pi, PointType * const po)
 {
@@ -293,7 +313,7 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         if (!ptr->empty())
         {
             PointCloudXYZI::Ptr body(new PointCloudXYZI());
-            pcl::transformPointCloud(*ptr, *body, LiDAR2_wrt_LiDAR1);
+            pcl::transformPointCloud(*ptr, *body, odin_L2_T_for_publish());
             for (auto &pt : body->points)
                 pt.intensity = 200.0f;
             // Stamp with last Mid scan time: state_point is Mid-pose, not Odin device clock.
@@ -1349,7 +1369,10 @@ public:
                 Lidar2_R_wrt_LiDAR1 << MAT_FROM_ARRAY(extrinR3);
                 LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = Lidar2_R_wrt_LiDAR1;
                 LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = LiDAR2_T_wrt_LiDAR1;
+                LiDAR2_R_yaml = Lidar2_R_wrt_LiDAR1;
             }
+            if (extrinsic_imu_to_lidars)
+                LiDAR2_R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
@@ -1427,22 +1450,19 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            // Restore 17:33 behavior: yaml R is level-aligned; convert once with R_wi^T
-            // after IMU init. Keep T as body-fixed lever (do not rotate T).
-            if (multi_lidar && extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())
-            {
-                M3D R_wi = state_point.rot.toRotationMatrix();
-                M3D R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
-                LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_wi.transpose() * R_yaml;
-                odin_gravity_ext_comp = true;
-                std::cout << "\033[32;1mOdin L2 R from level yaml via R_wi^T (T body-fixed):\n"
-                          << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
-            }
-            else if (multi_lidar && !extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())
+            // Odin is level (official imu_to_lidar ~0°). Do not bake R_wi^T once —
+            // Mid pitch drifts after IMU init and walls tilt again. Mid-only publish
+            // path cancels pitch/roll every frame (odin_L2_T_for_publish).
+            if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 odin_gravity_ext_comp = true;
-                std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed (no R_wi^T):\n"
-                          << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+                if (extrinsic_L2_gravity_frame)
+                    std::cout << "\033[32;1mOdin L2: level yaml R + per-frame Mid pitch/roll "
+                                 "cancel (ref: odin imu_to_lidar ~0°)\033[0m"
+                              << std::endl;
+                else
+                    std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed:\n"
+                              << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
             }
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
