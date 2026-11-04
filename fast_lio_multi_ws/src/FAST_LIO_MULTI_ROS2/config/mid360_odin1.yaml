@@ -60,15 +60,15 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # L2_wrt_L1 (Odin -> Mid360/L1).
-      # Mid mount pitch (~9° in state.rot) is cancelled per-frame (gravity_frame).
-      # Official Odin imu_to_lidar_rpy ≈ [0.66,-0.11,-0.29]° (IMU↔lidar only).
-      # Separately, cloud_raw front walls still need Ry(-8°) vs Mid-map vertical
-      # (fit under pitch/roll cancel — not Mid mount double-count). T = body lever.
+      # gravity_frame=true: pose Odin with Mid yaw+position ONLY (no Mid pitch/roll).
+      # Mid body is pitched ~9° in gravity-aligned map; that pitch must NOT rotate Odin
+      # (Odin cloud_raw is already ~level). Keep R=I; only lever-arm T. Do NOT bake
+      # Mid mount pitch into R_yaml (old Ry(-8°) made Odin walls lean while Mid stayed level).
       extrinsic_L2_gravity_frame: true
       extrinsic_T_L2_wrt_L1: [-0.030, -0.0371, 0.208]
-      extrinsic_R_L2_wrt_L1: [0.99026807, 0.0, -0.13917310,
+      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
                              0.0, 1.0, 0.0,
-                             0.13917310, 0.0, 0.99026807]
+                             0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

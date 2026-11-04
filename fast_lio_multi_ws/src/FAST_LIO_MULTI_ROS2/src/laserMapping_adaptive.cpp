@@ -115,6 +115,7 @@ deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer2;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 mutex mtx_buffer;
+mutex mtx_state; // Mid pose snapshot for Odin callback (timer vs sub threads)
 condition_variable sig_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
@@ -151,11 +152,15 @@ BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
-bool odin_gravity_ext_comp = false; // log once when gravity L2 path is active
-bool extrinsic_L2_gravity_frame = false; // yaml R = level Odin; cancel Mid pitch/roll per frame
+bool odin_gravity_ext_comp = false; // log once when level-Odin publish path is active
+bool extrinsic_L2_gravity_frame = false; // true: pose Odin with Mid yaw+pos only (level cloud)
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
+// Snapshot of Mid pose for thread-safe Odin publish (yaw-only world pose).
+M3D odin_mid_R = Eye3d;
+V3D odin_mid_t = Zero3d;
+bool odin_mid_pose_ready = false;
 constexpr float kOdinIntensityTag = 100.0f;
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
@@ -178,23 +183,20 @@ void publish_odin_body_to_world(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &odin_body_mid,
     double stamp_sec);
+void publish_odin_level_to_map(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_lidar,
+    double stamp_sec);
 
-// Odin factory/mapping calib is nearly level (imu_to_lidar_rpy ~ [0.66,-0.11,-0.29] deg).
-// Mid FAST-LIO state.rot still carries ~mount pitch vs gravity. Posing level Odin with
-// full R_wi tilts walls. Cancel ONLY Mid pitch/roll each frame; keep Mid yaw via R_wi
-// in RGBpointBodyToWorld. T stays the body lever from yaml.
-Eigen::Matrix4d odin_L2_T_for_publish()
+// Mid yaw-only rotation from a body->world matrix (stable; no Euler pitch/roll).
+static M3D mid_yaw_rotation(const M3D &R_wi)
 {
-    Eigen::Matrix4d T = LiDAR2_wrt_LiDAR1;
-    if (!extrinsic_L2_gravity_frame || !p_imu || !p_imu->IMU_inited())
-        return T;
-    const M3D R_wi = state_point.rot.toRotationMatrix();
-    const vect3 e_deg = SO3ToEuler(state_point.rot); // roll,pitch,yaw in degrees
-    const M3D R_yaw =
-        Eigen::AngleAxisd(e_deg[2] * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-    const M3D R_pitch_roll = R_yaw.transpose() * R_wi;
-    T.block<3, 3>(0, 0) = R_pitch_roll.transpose() * LiDAR2_R_yaml;
-    return T;
+    // yaw from first column projected to XY (same as atan2(R10, R00) for ZYX).
+    const double yaw = std::atan2(R_wi(1, 0), R_wi(0, 0));
+    const double c = std::cos(yaw), s = std::sin(yaw);
+    M3D R_yaw = Eye3d;
+    R_yaw << c, -s, 0, s, c, 0, 0, 0, 1;
+    return R_yaw;
 }
 
 void pointBodyToWorld(PointType const * const pi, PointType * const po)
@@ -304,23 +306,26 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    // Mid-only IEKF: pose Odin with yaml L2 extrinsic + latest Mid state, do not
-    // enqueue into async sync (avoids stamp/IMU stalls that drop /cloud_odin_registered).
+    // Mid-only IEKF: pose Odin for viz only; do not enqueue into async sync.
     if (!lidar2_update_en)
     {
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
         p_pre->process(msg, ptr, 1);
         if (!ptr->empty())
         {
-            PointCloudXYZI::Ptr body(new PointCloudXYZI());
-            pcl::transformPointCloud(*ptr, *body, odin_L2_T_for_publish());
-            for (auto &pt : body->points)
+            for (auto &pt : ptr->points)
                 pt.intensity = 200.0f;
-            // Stamp with last Mid scan time: state_point is Mid-pose, not Odin device clock.
             const double stamp = (publish_lidar_time > 0.0)
                                      ? publish_lidar_time
                                      : rclcpp::Time(msg->header.stamp).seconds();
-            publish_odin_body_to_world(g_pub_odin_registered, body, stamp);
+            if (extrinsic_L2_gravity_frame)
+                publish_odin_level_to_map(g_pub_odin_registered, ptr, stamp);
+            else
+            {
+                PointCloudXYZI::Ptr body(new PointCloudXYZI());
+                pcl::transformPointCloud(*ptr, *body, LiDAR2_wrt_LiDAR1);
+                publish_odin_body_to_world(g_pub_odin_registered, body, stamp);
+            }
         }
         return;
     }
@@ -788,6 +793,53 @@ void publish_odin_body_to_world(
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
     for (int i = 0; i < size; i++)
         RGBpointBodyToWorld(&odin_body_mid->points[i], &laserCloudWorld->points[i]);
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(stamp_sec);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
+// Level Odin cloud -> map using Mid yaw + position only (no Mid pitch/roll).
+// Avoids per-frame Euler cancel that flipped wall lean ~±same angle.
+// p_map = R_yaw * (R_yaml * p + t_L2) + t_mid
+void publish_odin_level_to_map(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_lidar,
+    double stamp_sec)
+{
+    if (!pubOdin || !odin_lidar || odin_lidar->empty() || !scan_pub_en)
+        return;
+    if (!p_imu || !p_imu->IMU_inited())
+        return;
+
+    M3D R_mid;
+    V3D t_mid;
+    {
+        std::lock_guard<std::mutex> lk(mtx_state);
+        if (!odin_mid_pose_ready)
+            return;
+        R_mid = odin_mid_R;
+        t_mid = odin_mid_t;
+    }
+
+    const M3D R_yaw = mid_yaw_rotation(R_mid);
+    const M3D R_yaml = LiDAR2_R_yaml;
+    const V3D t_L2 = LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3);
+
+    const int size = static_cast<int>(odin_lidar->size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+    {
+        const auto &pi = odin_lidar->points[i];
+        V3D p_l(pi.x, pi.y, pi.z);
+        V3D p_m = R_yaw * (R_yaml * p_l + t_L2) + t_mid;
+        auto &po = laserCloudWorld->points[i];
+        po.x = p_m(0);
+        po.y = p_m(1);
+        po.z = p_m(2);
+        po.intensity = pi.intensity;
+    }
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(stamp_sec);
@@ -1450,15 +1502,19 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            // Odin is level (official imu_to_lidar ~0°). Do not bake R_wi^T once —
-            // Mid pitch drifts after IMU init and walls tilt again. Mid-only publish
-            // path cancels pitch/roll every frame (odin_L2_T_for_publish).
+            {
+                std::lock_guard<std::mutex> lk(mtx_state);
+                odin_mid_R = state_point.rot.toRotationMatrix();
+                odin_mid_t = state_point.pos;
+                odin_mid_pose_ready = p_imu->IMU_inited();
+            }
+            // Level Odin: publish with Mid yaw+pos only (see publish_odin_level_to_map).
             if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 odin_gravity_ext_comp = true;
                 if (extrinsic_L2_gravity_frame)
-                    std::cout << "\033[32;1mOdin L2: level yaml R + per-frame Mid pitch/roll "
-                                 "cancel (ref: odin imu_to_lidar ~0°)\033[0m"
+                    std::cout << "\033[32;1mOdin L2: Mid yaw+pos only (level cloud; "
+                                 "no Mid pitch/roll, mutex snapshot)\033[0m"
                               << std::endl;
                 else
                     std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed:\n"
@@ -1551,6 +1607,12 @@ private:
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_state);
+                    odin_mid_R = state_point.rot.toRotationMatrix();
+                    odin_mid_t = state_point.pos;
+                    odin_mid_pose_ready = true;
+                }
                 geoQuat.x = state_point.rot.coeffs()[0];
                 geoQuat.y = state_point.rot.coeffs()[1];
                 geoQuat.z = state_point.rot.coeffs()[2];
