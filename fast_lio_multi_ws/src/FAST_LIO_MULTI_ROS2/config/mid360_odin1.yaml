@@ -3,8 +3,8 @@
 
     common:
       async_debug: false
-      # true: Mid360 + Odin1. T_L2_wrt_L1 is ICP coarse estimate; refine if ghost walls.
-      multi_lidar: true
+      # false: Mid360-only LIO. Odin accumulates independently (no association).
+      multi_lidar: false
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
@@ -60,15 +60,17 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # L2_wrt_L1 = Odin origin in Mid360 lidar frame (X fwd, Y left, Z up).
-      # Mount (Go2): Odin in front & higher than Mid — ~+150 mm X, ~+35 mm Z, Y≈0.
-      # gravity_frame=true: Mid yaw+pos only (no Mid pitch/roll on Odin).
-      # Odin bracket nose-down → Ry tip-up ~4.5° (=1.5°+3°) (not Mid mount pitch).
-      extrinsic_L2_gravity_frame: true
+      # Mount (Go2): Odin in front & higher — T≈[+0.150, 0, +0.035].
+      # gravity_frame=false: use the SAME full Mid body pose as Mid cloud (needed when
+      # turning). Odin is gravity-level while Mid body is pitched ~8.8°, plus Odin
+      # residual tip-up ~4.5° → bake Ry(-(8.8+4.5))=Ry(-13.3°) into R_L2 so
+      # R_wb*R_L2 ≈ R_yaw*R_tip (level walls) without a separate yaw-only path.
+      extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.035]
-      # Ry tip-up ~4.5°: [[c,0,-s],[0,1,0],[s,0,c]]
-      extrinsic_R_L2_wrt_L1: [0.99691733, 0.0, -0.07845910,
+      # Ry_std(-13.3°): [[c,0,-s],[0,1,0],[s,0,c]]
+      extrinsic_R_L2_wrt_L1: [0.97317887, 0.0, -0.23004974,
                              0.0, 1.0, 0.0,
-                             0.07845910, 0.0, 0.99691733]
+                             0.23004974, 0.0, 0.97317887]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

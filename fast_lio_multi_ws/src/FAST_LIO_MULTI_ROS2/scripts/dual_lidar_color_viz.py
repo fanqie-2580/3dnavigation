@@ -131,7 +131,8 @@ class DualLidarColorViz(Node):
     def __init__(self) -> None:
         super().__init__('dual_lidar_color_viz')
         self.declare_parameter('mid_topic', '/cloud_registered')
-        # registered = map-fixed LIO split (default). raw = sensor × Mid odom (debug).
+        # registered = map-fixed LIO split. raw = sensor × Mid odom (debug).
+        # off / mid_only = Mid accum only (Odin handled elsewhere, no association).
         self.declare_parameter('odin_mode', 'registered')
         self.declare_parameter('odin_registered_topic', '/cloud_odin_registered')
         self.declare_parameter('odin_raw_topic', '/odin1/cloud_raw_ds')
@@ -182,6 +183,7 @@ class DualLidarColorViz(Node):
         self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
         self.max_odom_cloud_dt = float(self.get_parameter('max_odom_cloud_dt').value)
         self._t0 = time.time()
+        self._odin_off = self.odin_mode in ('off', 'mid_only', 'none', 'disabled')
 
         T_imu_mid = se3_from_rt(
             self.get_parameter('extrinsic_R').value,
@@ -205,14 +207,24 @@ class DualLidarColorViz(Node):
         self.pub_odin = self.create_publisher(PointCloud2, '/viz/cloud_odin', 5)
         self.pub_fused = self.create_publisher(PointCloud2, '/cloud_fused', 5)
         self.pub_accum_mid = self.create_publisher(PointCloud2, '/viz/accum_mid360', 1)
-        self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
-        self.pub_accum_fused = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
+        # Only publish Odin/fused when this node owns Odin (not mid_only).
+        if not self._odin_off:
+            self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
+            self.pub_accum_fused = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
+        else:
+            self.pub_accum_odin = None
+            self.pub_accum_fused = None
 
         self.create_subscription(PointCloud2, self.mid_topic, self.on_mid, 5)
         self.create_timer(max(0.2, period), self.publish_accum)
         self.create_service(Trigger, '~/clear_accum', self.on_clear_accum)
 
-        if self.odin_mode == 'raw':
+        if self._odin_off:
+            self.get_logger().info(
+                f'Mid-only accum: {self.mid_topic} → /viz/accum_mid360 '
+                f'(Odin association disabled), voxel={voxel}'
+            )
+        elif self.odin_mode == 'raw':
             self.create_subscription(Odometry, self.odom_topic, self.on_odom, 100)
             self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_raw, 5)
             self.get_logger().info(
@@ -247,6 +259,8 @@ class DualLidarColorViz(Node):
         return h
 
     def _publish_fused_scan(self, stamp) -> None:
+        if self._odin_off:
+            return
         parts = []
         if self._latest_mid.size:
             parts.append(self._latest_mid)
@@ -362,12 +376,14 @@ class DualLidarColorViz(Node):
                 make_cloud(self._header(stamp), self._accum_mid.numpy())
             )
             self._dirty_mid = False
+        if self._odin_off or self.pub_accum_odin is None:
+            return
         if self._dirty_odin or len(self._accum_odin):
             self.pub_accum_odin.publish(
                 make_cloud(self._header(stamp), self._accum_odin.numpy())
             )
             self._dirty_odin = False
-        # Mid + Odin in one cloud (map frame)
+        # Mid + Odin in one cloud (map frame) — only when this node owns both
         if len(self._accum_mid) or len(self._accum_odin):
             parts = []
             if len(self._accum_mid):

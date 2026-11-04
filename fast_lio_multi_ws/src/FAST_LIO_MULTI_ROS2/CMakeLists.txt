@@ -111,6 +111,7 @@ install(
     scripts/multi_lio_nav_bridge.py
     scripts/dual_lidar_color_viz.py
     scripts/dual_lidar_frames.py
+    scripts/odin_independent_accum.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

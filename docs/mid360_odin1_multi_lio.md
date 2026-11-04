@@ -1,8 +1,16 @@
-# Mid360 + Odin1 多雷达融合（一路位姿/地图）
+# Mid360 + Odin1（当前：各自独立累积，无关联）
 
 工作区：`/home/ll/fast_lio_multi_ws`（包名 `fast_lio_multi`，基于 [FAST_LIO_MULTI_ROS2](https://github.com/Draxran/FAST_LIO_MULTI_ROS2)）
 
-把 **Livox Mid360** 与 **Odin1 dToF 激光雷达**紧耦合成一路里程计与点云，再 remap 到现有导航话题。
+**当前默认**：两路互不关联。
+
+| 传感器 | 位姿 | 累积图 |
+|--------|------|--------|
+| Mid360 | FAST-LIO `/Odometry`（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
+| Odin1 | 自带 `/odin1/odometry` | `/viz/accum_odin`（`odin_map`） |
+
+导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
+两图仅通过恒等 TF `map→odin_map` 方便同屏看，**不会对齐**。
 
 ## 时间戳不一致：开源参考 & 本仓库做法
 
@@ -102,17 +110,16 @@ nohup ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
 配置文件：[`config/mid360_odin1.yaml`](/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/config/mid360_odin1.yaml)
 
 - `lidar_type: 1`（Mid360 CustomMsg）  
-- `lidar_type2: 4`（Odin 通用 XYZ PointCloud2，已加 `XYZ_ONLY` 预处理）  
-- **`common.multi_lidar` 默认 `true`（Mid360 + Odin1）**：外参不准时 CloudMap 可能双墙/重影；可临时改 `false` 只跑 Mid360  
-- `extrinsic_T/R_L2_wrt_L1`：ICP 俯仰粗估（~14°）；map 占用对齐易被 FOV 误导，以 body 系残差为准  
-- `/viz/accum_odin` 默认吃 `/cloud_odin_registered`（与 Mid 同为 LIO map 云；禁止 raw×10Hz odom，否则 30Hz 同戳扇形重影）  
-- `/odin1/cloud_raw_ds`：无 odom 时先用 now() 启动；有 odom 后 `one_cloud_per_odom` 每戳一帧
+- **`common.multi_lidar` 默认 `false`**：Mid 单独 LIO；Odin 不进 FAST-LIO  
+- Odin 独立节点 `odin_independent_accum`：`/odin1/cloud_raw` × `/odin1/odometry` → `/viz/accum_odin`  
+- Mid 累积：`dual_lidar_color_viz`（`odin_mode:=off`）→ `/viz/accum_mid360`  
+- 需要重新开关联融合时：改 `multi_lidar: true`，并关掉 `enable_odin_accum` / 改回 `odin_mode:=registered`
 
-重新打开双雷达：
+清空各自累积：
 
 ```bash
-# 编辑 mid360_odin1.yaml → common.multi_lidar: true
-# 确认 extrinsic_T/R_L2_wrt_L1 为实测值后重启 launch
+ros2 service call /dual_lidar_color_viz/clear_accum std_srvs/srv/Trigger {}
+ros2 service call /odin_independent_accum/clear_accum std_srvs/srv/Trigger {}
 ```
 
 ## 4. 检查
@@ -158,9 +165,9 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 - **Mid360 / Odin 同时水平**：
   1. Odin `/odin1/cloud_raw` 已接近重力水平；Mid 本体在重力对齐后的 `map` 里仍有 ~9° 俯仰（安装角）。  
   2. Mid 点云用完整 `R_wi`（含 pitch）投到 `map`，所以墙是正的。  
-  3. Odin 必须走 `extrinsic_L2_gravity_frame: true`：只用 Mid 的 **yaw + 平移**；**禁止**把 Mid 安装俯仰编进 Odin。Odin 相对墙面若仍微下倾，只加很小的 `Ry` tip-up（当前 ~1.5°），不要再用 ±8°。  
-  4. RViz 坐标系：`dual_lidar_frames` 发布 `map→mid360_lidar`、`map→odin1_lidar`（TF 开 Show Names）。  
-- **Odin 累积跟着转圈转（已修）**：实测 `/cloud_odin_registered` stamp 比 `/Odometry` 落后约 **5s**，按 stamp 查位姿 = 旧 yaw × 新 body 墙 → 橙色扇形；Mid 用当前扫描 deskew 所以仍正。现改为 Odin **只缓冲最新 body 云**，在 Mid IEKF 更新后用**同一帧** `state_point` 做 yaw-only 投影再发布。  
+  3. **不必须和 Mid 雷达同一时间戳**；需要的是「点云内容对应时刻的 Mid 位姿」。Odin 缓冲最新 body 云，Mid IEKF 更新后用**当前** `state_point`（与 Mid 云同一姿态）投影。  
+  4. 转弯时用 **完整 Mid 姿态**（`gravity_frame=false`），把 Mid 安装俯仰(~8.8°)与 Odin tip-up(~4.5°) 一并打进 `R_L2=Ry(-13.3°)`，避免 yaw-only 与 Mid 全姿态不一致导致橙色跟着转。  
+  5. RViz：`dual_lidar_frames` 发 `map→mid360_lidar` / `odin1_lidar`。  
 - **点云跟着机器人转（RViz）**：对当前扫描开长 Decay 也会像地图在转；主看 `/viz/accum_*` / `/Laser_map`，Decay=0。  
 - **双色融合累积**：青 `/viz/accum_mid360`←`/cloud_registered`，橙 `/viz/accum_odin`←`/cloud_odin_registered`。Odin 用与 Mid 相同的 LIO `state_point` 进 `map`（不单独用 raw+/Odometry），避免走动后橙图旋转漂移。
 - **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
