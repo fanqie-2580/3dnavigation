@@ -55,15 +55,17 @@ Visualization Manager:
           Value: true
         camera_init:
           Value: true
-      Marker Scale: 1
+        mid360_lidar:
+          Value: true
+        odin1_lidar:
+          Value: true
+      Marker Scale: 0.5
       Name: TF
       Show Arrows: true
       Show Axes: true
-      Show Names: false
+      Show Names: true
       Tree:
-        camera_init:
-          body:
-            {}
+        {}
       Update Interval: 0
       Value: true
     - Angle Tolerance: 0.10000000149011612

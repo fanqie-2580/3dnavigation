@@ -128,6 +128,32 @@ def generate_launch_description():
                 )
             )
 
+        # RViz TF axes: map -> mid360_lidar / odin1_lidar (same extrinsics as yaml)
+        nodes.append(
+            Node(
+                package='fast_lio_multi',
+                executable='dual_lidar_frames.py',
+                name='dual_lidar_frames',
+                output='screen',
+                parameters=[{
+                    'map_frame': 'map',
+                    'odom_topic': '/Odometry',
+                    'mid_frame': 'mid360_lidar',
+                    'odin_frame': 'odin1_lidar',
+                    'gravity_frame': True,
+                    'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                    'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    'extrinsic_T_L2_wrt_L1': [-0.030, -0.0371, 0.208],
+                    # keep in sync with config/mid360_odin1.yaml R_L2 (~1.5° tip-up)
+                    'extrinsic_R_L2_wrt_L1': [
+                        0.99965732, 0.0, -0.02617695,
+                        0.0, 1.0, 0.0,
+                        0.02617695, 0.0, 0.99965732,
+                    ],
+                }],
+            )
+        )
+
         # body -> base_link using existing Go2 Mid360 extrinsic (qy/qw form as rpy approx 0)
         # Keep identity-ish; localization stack already has body_to_base static TF when using open3d_loc.
         nodes.append(
