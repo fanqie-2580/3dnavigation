@@ -4,6 +4,28 @@
 
 把 **Livox Mid360** 与 **Odin1 dToF 激光雷达**紧耦合成一路里程计与点云，再 remap 到现有导航话题。
 
+## 时间戳不一致：开源参考 & 本仓库做法
+
+Odin TCP 戳是设备 uptime，Mid/LIO 是 ROS 时间——**硬 restamp 再乘 Mid odom 会在转弯时糊成扇形**，这不是外参 yaw 问题，是跨时钟融合问题。
+
+| 项目 | 链接 | 做法 |
+|------|------|------|
+| FAST-LIO-MULTI | https://github.com/engcang/FAST_LIO_MULTI | bundle / **async** / adaptive；副雷达按自己的到达更新 |
+| MA-LIO | https://github.com/minwoo0611/MA-LIO | ApproximateTime + **连续时间 B 样条**，点级时间不确定度 |
+| M-LOAM | https://github.com/gogojjh/M-LOAM | 多雷达在线外参 + 建图 |
+| SLICT | https://github.com/brytsknguyen/slict | 连续时间、多输入 LIO |
+| LI-Init | https://github.com/hku-mars/LiDAR_IMU_Init | 标定 **time offset** + 外参 |
+| MILIOM (论文) | https://ar5iv.labs.arxiv.org/html/2104.11888 | 主雷达定拍，副雷达靠 **IMU 传播 deskew** |
+
+本仓库橙色累积默认 `odin_mode:=imu_prop`：
+
+1. **忽略** Odin header 时间戳  
+2. 用 **接收时刻**（Mid/ROS 钟）  
+3. 取最近 Mid `/Odometry`，用 `/livox/imu` 陀螺积分补到接收时刻  
+4. 再乘 L2 外参做世界系 voxel 累积  
+
+备选：`odin_own`（跟 `odin_odom_mapper` 一样用 `/odin1/odometry` 自己累，再锁一次到 Mid `map`）。
+
 ## 话题约定
 
 | 角色 | 输入 | 说明 |

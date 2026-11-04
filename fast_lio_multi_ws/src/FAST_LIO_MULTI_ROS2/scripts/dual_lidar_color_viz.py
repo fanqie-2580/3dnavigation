@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """World-fixed dual-color accumulation for Mid360 + Odin.
 
-Mid360 (cyan): /cloud_registered (already map-fixed).
+Mid360 (cyan): /cloud_registered — already map-fixed by FAST-LIO.
 
-Odin1 (orange): default odin_mode:=odom_sync —
-  keep latest /odin1/cloud_raw_ds (sensor frame); on every Mid /Odometry
-  tick, pose that cloud ONCE with this odom × L2 extrinsic and voxel-accum.
-  This matches Mid rate and avoids 30Hz scans sharing one pose (fan on yaw).
+Odin1 (orange): default odin_mode:=imu_prop
+  Soft-sync for mismatched clocks (Odin uptime vs Mid/ROS time):
+  - ignore Odin header stamp for posing
+  - use receive-time on the Mid/ROS clock
+  - take latest Mid /Odometry, then propagate with /livox/imu gyro to receive time
+  - apply L2 extrinsic once, voxel-accum
+  This is the usual soft-sync idea (MILIOM / MA-LIO style), without needing PPS.
 
-Other modes: registered (LIO /cloud_odin_registered), raw (stamp-interp debug).
+Other modes:
+  odin_own  — pose with /odin1/odometry (same as odin_odom_mapper), lock into Mid map once
+  odom_sync — handshake Mid odom × raw (old; fails when clocks disagree)
+  registered / raw — debug
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ import rclpy
 from geometry_msgs.msg import Pose
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Imu, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
@@ -70,28 +76,16 @@ def se3_from_rt(R9, t3) -> np.ndarray:
     return T
 
 
-def slerp_R(R0: np.ndarray, R1: np.ndarray, a: float) -> np.ndarray:
-    a = float(np.clip(a, 0.0, 1.0))
-    if a <= 0.0:
-        return R0.copy()
-    if a >= 1.0:
-        return R1.copy()
-    Rrel = R0.T @ R1
-    c = float(np.clip((np.trace(Rrel) - 1.0) * 0.5, -1.0, 1.0))
-    ang = math.acos(c)
-    if abs(ang) < 1e-9:
-        return R0.copy()
-    K = Rrel - Rrel.T
-    axis = np.array([K[2, 1], K[0, 2], K[1, 0]], dtype=np.float64)
-    n = np.linalg.norm(axis)
-    if n < 1e-9:
-        return R0.copy()
-    axis /= n
-    a2 = ang * a
-    x, y, z = axis
-    Kx = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
-    Rinc = np.eye(3) + math.sin(a2) * Kx + (1 - math.cos(a2)) * (Kx @ Kx)
-    return R0 @ Rinc
+def rotvec_to_R(w: np.ndarray) -> np.ndarray:
+    """Rodrigues: rotation vector (rad) -> R."""
+    th = float(np.linalg.norm(w))
+    if th < 1e-12:
+        return np.eye(3)
+    k = w / th
+    K = np.array(
+        [[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]], dtype=np.float64
+    )
+    return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * (K @ K)
 
 
 class VoxelAccum:
@@ -131,11 +125,13 @@ class DualLidarColorViz(Node):
     def __init__(self) -> None:
         super().__init__('dual_lidar_color_viz')
         self.declare_parameter('mid_topic', '/cloud_registered')
-        # odom_sync | registered | raw
-        self.declare_parameter('odin_mode', 'odom_sync')
+        # imu_prop | odin_own | odom_sync | registered | raw
+        self.declare_parameter('odin_mode', 'imu_prop')
         self.declare_parameter('odin_registered_topic', '/cloud_odin_registered')
         self.declare_parameter('odin_raw_topic', '/odin1/cloud_raw_ds')
         self.declare_parameter('odom_topic', '/Odometry')
+        self.declare_parameter('odin_odom_topic', '/odin1/odometry')
+        self.declare_parameter('imu_topic', '/livox/imu')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('mid_stride', 1)
         self.declare_parameter('odin_stride', 1)
@@ -144,8 +140,7 @@ class DualLidarColorViz(Node):
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter('accum_skip_sec', 3.0)
-        self.declare_parameter('odom_buffer_sec', 2.0)
-        self.declare_parameter('max_odom_cloud_dt', 0.15)
+        self.declare_parameter('max_imu_prop_sec', 0.25)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
         self.declare_parameter(
             'extrinsic_R',
@@ -160,12 +155,17 @@ class DualLidarColorViz(Node):
                 0.24684359, -0.00264330, 0.96905173,
             ],
         )
+        # Odin body extrinsic (same defaults as odin_odom_mapper) for odin_own mode
+        self.declare_parameter('odin_imu_to_lidar_xyz', [-0.004, 0.013, 0.026])
+        self.declare_parameter('odin_imu_to_lidar_rpy_deg', [0.66, -0.11, -0.29])
 
         self.mid_topic = self.get_parameter('mid_topic').value
         self.odin_mode = str(self.get_parameter('odin_mode').value).strip().lower()
         self.odin_registered_topic = self.get_parameter('odin_registered_topic').value
         self.odin_raw_topic = self.get_parameter('odin_raw_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
+        self.odin_odom_topic = self.get_parameter('odin_odom_topic').value
+        self.imu_topic = self.get_parameter('imu_topic').value
         self.map_frame = self.get_parameter('map_frame').value
         self.mid_stride = max(1, int(self.get_parameter('mid_stride').value))
         self.odin_stride = max(1, int(self.get_parameter('odin_stride').value))
@@ -174,8 +174,7 @@ class DualLidarColorViz(Node):
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
-        self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
-        self.max_odom_cloud_dt = float(self.get_parameter('max_odom_cloud_dt').value)
+        self.max_imu_prop_sec = float(self.get_parameter('max_imu_prop_sec').value)
         self._t0 = time.time()
 
         T_imu_mid = se3_from_rt(
@@ -188,15 +187,28 @@ class DualLidarColorViz(Node):
         )
         self.T_imu_odin = T_imu_mid @ T_mid_odin
 
+        xyz = list(self.get_parameter('odin_imu_to_lidar_xyz').value)
+        rpy = [math.radians(float(v)) for v in self.get_parameter('odin_imu_to_lidar_rpy_deg').value]
+        cr, sr = math.cos(rpy[0]), math.sin(rpy[0])
+        cp, sp = math.cos(rpy[1]), math.sin(rpy[1])
+        cy, sy = math.cos(rpy[2]), math.sin(rpy[2])
+        Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+        self.T_odin_imu_lidar = np.eye(4)
+        self.T_odin_imu_lidar[:3, :3] = Rz @ Ry @ Rx
+        self.T_odin_imu_lidar[:3, 3] = xyz
+
         self._accum_mid = VoxelAccum(voxel, max_n)
         self._accum_odin = VoxelAccum(voxel, max_n)
         self._dirty_mid = False
         self._dirty_odin = False
-        self._odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
-        self._latest_odin_msg: Optional[PointCloud2] = None
-        self._pending_odom: Optional[Odometry] = None
-        self._odin_fresh = False
         self._posed_count = 0
+
+        self._mid_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=200)
+        self._imu: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
+        self._odin_odom: Optional[np.ndarray] = None
+        self._T_align: Optional[np.ndarray] = None  # map <- odin_odom
 
         self.pub_mid = self.create_publisher(PointCloud2, '/viz/cloud_mid360', 5)
         self.pub_odin = self.create_publisher(PointCloud2, '/viz/cloud_odin', 5)
@@ -207,27 +219,32 @@ class DualLidarColorViz(Node):
         self.create_timer(max(0.2, period), self.publish_accum)
         self.create_service(Trigger, '~/clear_accum', self.on_clear_accum)
 
-        if self.odin_mode == 'registered':
+        if self.odin_mode == 'imu_prop':
+            self.create_subscription(Odometry, self.odom_topic, self.on_mid_odom, 100)
+            self.create_subscription(Imu, self.imu_topic, self.on_imu, 200)
+            self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_imu_prop, 10)
+            self.get_logger().info(
+                f'Mid={self.mid_topic}; Odin IMU_PROP raw={self.odin_raw_topic} '
+                f'+ {self.odom_topic} + {self.imu_topic} (soft-sync, ignore Odin stamp)'
+            )
+        elif self.odin_mode == 'odin_own':
+            self.create_subscription(Odometry, self.odom_topic, self.on_mid_odom, 50)
+            self.create_subscription(Odometry, self.odin_odom_topic, self.on_odin_odom, 50)
+            self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_own, 10)
+            self.get_logger().info(
+                f'Mid={self.mid_topic}; Odin OWN_ODOM raw×{self.odin_odom_topic}, '
+                f'lock into Mid map once'
+            )
+        elif self.odin_mode == 'registered':
             self.create_subscription(
                 PointCloud2, self.odin_registered_topic, self.on_odin_registered, 5
             )
-            self.get_logger().info(
-                f'Mid={self.mid_topic}; Odin REGISTERED={self.odin_registered_topic}'
-            )
-        elif self.odin_mode == 'raw':
-            self.create_subscription(Odometry, self.odom_topic, self.on_odom_raw_mode, 100)
-            self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_raw_interp, 5)
-            self.get_logger().info(
-                f'Mid={self.mid_topic}; Odin RAW interp={self.odin_raw_topic}'
-            )
+            self.get_logger().info(f'Odin REGISTERED={self.odin_registered_topic}')
         else:
-            # odom_sync (default): pose latest raw exactly once per Mid odom message
-            self.create_subscription(Odometry, self.odom_topic, self.on_odom_sync, 100)
-            self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_store, 10)
-            self.get_logger().info(
-                f'Mid={self.mid_topic}; Odin ODOM_SYNC raw={self.odin_raw_topic} '
-                f'x {self.odom_topic} (one pose per Mid odom)'
-            )
+            self.get_logger().warn(f'odin_mode={self.odin_mode} falling back to imu_prop wiring')
+            self.create_subscription(Odometry, self.odom_topic, self.on_mid_odom, 100)
+            self.create_subscription(Imu, self.imu_topic, self.on_imu, 200)
+            self.create_subscription(PointCloud2, self.odin_raw_topic, self.on_odin_imu_prop, 10)
 
     def _accum_ready(self) -> bool:
         return (time.time() - self._t0) >= self.accum_skip_sec
@@ -236,9 +253,10 @@ class DualLidarColorViz(Node):
         self._accum_mid.clear()
         self._accum_odin.clear()
         self._dirty_mid = self._dirty_odin = True
+        self._T_align = None
         self._t0 = time.time()
         resp.success = True
-        resp.message = f'cleared (posed_frames={self._posed_count})'
+        resp.message = f'cleared (posed={self._posed_count})'
         return resp
 
     def _header(self, stamp, frame_id: str | None = None) -> Header:
@@ -266,14 +284,7 @@ class DualLidarColorViz(Node):
             k += 1
         return np.asarray(pts, dtype=np.float64)
 
-    def _pose_odin_sensor(self, msg: PointCloud2, T_map_imu: np.ndarray, stamp) -> None:
-        arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
-        if arr.size == 0:
-            return
-        T_map_odin = T_map_imu @ self.T_imu_odin
-        R = T_map_odin[:3, :3]
-        t = T_map_odin[:3, 3]
-        world = (arr @ R.T) + t
+    def _publish_world(self, world: np.ndarray, stamp) -> None:
         self.pub_odin.publish(make_cloud(self._header(stamp), world))
         self._posed_count += 1
         if self._accum_ready() and self._accum_odin.add(world):
@@ -287,77 +298,97 @@ class DualLidarColorViz(Node):
         if self._accum_ready() and self._accum_mid.add(arr):
             self._dirty_mid = True
 
-    def on_odin_store(self, msg: PointCloud2) -> None:
-        self._latest_odin_msg = msg
-        self._odin_fresh = True
-        self._try_odom_sync_pose()
+    def on_mid_odom(self, msg: Odometry) -> None:
+        self._mid_odom.append((stamp_sec(msg.header.stamp), se3_from_pose(msg.pose.pose)))
 
-    def on_odom_sync(self, msg: Odometry) -> None:
-        self._pending_odom = msg
-        self._try_odom_sync_pose()
+    def on_imu(self, msg: Imu) -> None:
+        w = np.array(
+            [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
+            dtype=np.float64,
+        )
+        self._imu.append((stamp_sec(msg.header.stamp), w))
 
-    def _try_odom_sync_pose(self) -> None:
-        """Handshake: pose only when a fresh Odin cloud and a Mid odom are both ready.
+    def _prop_mid_pose(self, t_target: float) -> Optional[np.ndarray]:
+        """Latest Mid odom at/before t_target, gyro-propagate rotation to t_target."""
+        if not self._mid_odom:
+            return None
+        # pick latest odom with stamp <= target; else earliest
+        T0 = None
+        t0 = None
+        for t, T in reversed(self._mid_odom):
+            if t <= t_target + 1e-3:
+                t0, T0 = t, T
+                break
+        if T0 is None:
+            t0, T0 = self._mid_odom[0]
+        dt = t_target - t0
+        if abs(dt) > self.max_imu_prop_sec:
+            # too far — still return odom (better than skip entirely when clocks skew)
+            return T0.copy()
+        if abs(dt) < 1e-4 or len(self._imu) < 2:
+            return T0.copy()
+        # integrate gyro in [t0, t_target]
+        samples = [(t, w) for t, w in self._imu if t0 - 0.01 <= t <= t_target + 0.01]
+        if len(samples) < 2:
+            return T0.copy()
+        R = T0[:3, :3].copy()
+        for i in range(len(samples) - 1):
+            t_a, w_a = samples[i]
+            t_b, w_b = samples[i + 1]
+            if t_b <= t0:
+                continue
+            if t_a >= t_target:
+                break
+            ta = max(t_a, t0)
+            tb = min(t_b, t_target)
+            if tb <= ta:
+                continue
+            w = 0.5 * (w_a + w_b)
+            R = R @ rotvec_to_R(w * (tb - ta))
+        T = T0.copy()
+        T[:3, :3] = R
+        # translation: freeze (short dt); Mid odom already carries vel poorly
+        return T
 
-        Avoids racing the downsample bridge (odom→ds→viz) where viz might pose a
-        stale cloud with a new odom — that lags yaw and fans orange walls.
-        """
-        if not self._odin_fresh or self._pending_odom is None or self._latest_odin_msg is None:
+    def on_odin_imu_prop(self, msg: PointCloud2) -> None:
+        # Critical: pose by receive time on Mid/ROS clock, NOT Odin device stamp.
+        t_recv = self.get_clock().now().nanoseconds * 1e-9
+        T_map_imu = self._prop_mid_pose(t_recv)
+        if T_map_imu is None:
             return
-        odom = self._pending_odom
-        cloud = self._latest_odin_msg
-        self._odin_fresh = False
-        self._pending_odom = None
-        T_map_imu = se3_from_pose(odom.pose.pose)
-        self._pose_odin_sensor(cloud, T_map_imu, odom.header.stamp)
+        arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
+        if arr.size == 0:
+            return
+        T = T_map_imu @ self.T_imu_odin
+        world = (arr @ T[:3, :3].T) + T[:3, 3]
+        self._publish_world(world, self.get_clock().now().to_msg())
+
+    def on_odin_odom(self, msg: Odometry) -> None:
+        self._odin_odom = se3_from_pose(msg.pose.pose)
+
+    def on_odin_own(self, msg: PointCloud2) -> None:
+        if self._odin_odom is None:
+            return
+        arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
+        if arr.size == 0:
+            return
+        T_od = self._odin_odom @ self.T_odin_imu_lidar
+        world_od = (arr @ T_od[:3, :3].T) + T_od[:3, 3]
+        if self._T_align is None:
+            if not self._mid_odom:
+                return
+            # Lock: Mid map pose × Mid-chain extrinsic ≈ align × Odin odom pose
+            T_map_mid = self._mid_odom[-1][1]
+            self._T_align = (T_map_mid @ self.T_imu_odin) @ np.linalg.inv(T_od)
+            self.get_logger().info('Locked T_map<-odin_odom from first Mid/Odin pair')
+        world = (world_od @ self._T_align[:3, :3].T) + self._T_align[:3, 3]
+        self._publish_world(world, self.get_clock().now().to_msg())
 
     def on_odin_registered(self, msg: PointCloud2) -> None:
         arr = self._xyz_stride(msg, self.odin_stride)
         if arr.size == 0:
             return
-        self.pub_odin.publish(
-            make_cloud(self._header(msg.header.stamp, msg.header.frame_id or self.map_frame), arr)
-        )
-        if self._accum_ready() and self._accum_odin.add(arr):
-            self._dirty_odin = True
-
-    def on_odom_raw_mode(self, msg: Odometry) -> None:
-        t = stamp_sec(msg.header.stamp)
-        T = se3_from_pose(msg.pose.pose)
-        self._odom_buf.append((t, T))
-        cutoff = t - self.odom_buffer_sec
-        while self._odom_buf and self._odom_buf[0][0] < cutoff:
-            self._odom_buf.popleft()
-
-    def _interp_odom(self, t_cloud: float) -> Optional[np.ndarray]:
-        if len(self._odom_buf) < 1:
-            return None
-        if t_cloud <= self._odom_buf[0][0]:
-            if abs(t_cloud - self._odom_buf[0][0]) > self.max_odom_cloud_dt:
-                return None
-            return self._odom_buf[0][1].copy()
-        if t_cloud >= self._odom_buf[-1][0]:
-            if abs(t_cloud - self._odom_buf[-1][0]) > self.max_odom_cloud_dt:
-                return None
-            return self._odom_buf[-1][1].copy()
-        for i in range(len(self._odom_buf) - 1):
-            t0, T0 = self._odom_buf[i]
-            t1, T1 = self._odom_buf[i + 1]
-            if t0 <= t_cloud <= t1:
-                if (t1 - t0) < 1e-6:
-                    return T0.copy()
-                a = (t_cloud - t0) / (t1 - t0)
-                T = np.eye(4)
-                T[:3, :3] = slerp_R(T0[:3, :3], T1[:3, :3], a)
-                T[:3, 3] = (1 - a) * T0[:3, 3] + a * T1[:3, 3]
-                return T
-        return None
-
-    def on_odin_raw_interp(self, msg: PointCloud2) -> None:
-        T_map_imu = self._interp_odom(stamp_sec(msg.header.stamp))
-        if T_map_imu is None:
-            return
-        self._pose_odin_sensor(msg, T_map_imu, msg.header.stamp)
+        self._publish_world(arr, msg.header.stamp)
 
     def publish_accum(self) -> None:
         stamp = self.get_clock().now().to_msg()
