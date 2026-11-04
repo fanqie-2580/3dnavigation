@@ -197,12 +197,16 @@ class DualLidarColorViz(Node):
         self._accum_odin = VoxelAccum(voxel, max_n)
         self._dirty_mid = False
         self._dirty_odin = False
+        self._latest_mid = np.zeros((0, 3), dtype=np.float64)
+        self._latest_odin = np.zeros((0, 3), dtype=np.float64)
         self._odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
 
         self.pub_mid = self.create_publisher(PointCloud2, '/viz/cloud_mid360', 5)
         self.pub_odin = self.create_publisher(PointCloud2, '/viz/cloud_odin', 5)
+        self.pub_fused = self.create_publisher(PointCloud2, '/cloud_fused', 5)
         self.pub_accum_mid = self.create_publisher(PointCloud2, '/viz/accum_mid360', 1)
         self.pub_accum_odin = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
+        self.pub_accum_fused = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
 
         self.create_subscription(PointCloud2, self.mid_topic, self.on_mid, 5)
         self.create_timer(max(0.2, period), self.publish_accum)
@@ -233,7 +237,7 @@ class DualLidarColorViz(Node):
         self._dirty_mid = self._dirty_odin = True
         self._t0 = time.time()
         resp.success = True
-        resp.message = 'cleared Mid/Odin voxel accum'
+        resp.message = 'cleared Mid/Odin/fused voxel accum'
         return resp
 
     def _header(self, stamp, frame_id: str | None = None) -> Header:
@@ -241,6 +245,17 @@ class DualLidarColorViz(Node):
         h.stamp = stamp
         h.frame_id = frame_id or self.map_frame
         return h
+
+    def _publish_fused_scan(self, stamp) -> None:
+        parts = []
+        if self._latest_mid.size:
+            parts.append(self._latest_mid)
+        if self._latest_odin.size:
+            parts.append(self._latest_odin)
+        if not parts:
+            return
+        fused = np.vstack(parts) if len(parts) > 1 else parts[0]
+        self.pub_fused.publish(make_cloud(self._header(stamp), fused))
 
     def on_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
@@ -295,9 +310,11 @@ class DualLidarColorViz(Node):
 
     def on_mid(self, msg: PointCloud2) -> None:
         arr = self._xyz_stride(msg, self.mid_stride)
+        self._latest_mid = arr
         self.pub_mid.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)
         )
+        self._publish_fused_scan(msg.header.stamp)
         if self._accum_ready() and self._accum_mid.add(arr):
             self._dirty_mid = True
 
@@ -310,9 +327,11 @@ class DualLidarColorViz(Node):
             arr = arr[(arr[:, 2] >= self.odin_z_min) & (arr[:, 2] <= self.odin_z_max)]
             if arr.size == 0:
                 return
+        self._latest_odin = arr
         self.pub_odin.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id or self.map_frame), arr)
         )
+        self._publish_fused_scan(msg.header.stamp)
         if self._accum_ready() and self._accum_odin.add(arr):
             self._dirty_odin = True
 
@@ -330,7 +349,9 @@ class DualLidarColorViz(Node):
         t = T_map_odin[:3, 3]
         world = (arr @ R.T) + t
 
+        self._latest_odin = world
         self.pub_odin.publish(make_cloud(self._header(msg.header.stamp), world))
+        self._publish_fused_scan(msg.header.stamp)
         if self._accum_ready() and self._accum_odin.add(world):
             self._dirty_odin = True
 
@@ -346,6 +367,15 @@ class DualLidarColorViz(Node):
                 make_cloud(self._header(stamp), self._accum_odin.numpy())
             )
             self._dirty_odin = False
+        # Mid + Odin in one cloud (map frame)
+        if len(self._accum_mid) or len(self._accum_odin):
+            parts = []
+            if len(self._accum_mid):
+                parts.append(self._accum_mid.numpy())
+            if len(self._accum_odin):
+                parts.append(self._accum_odin.numpy())
+            fused = np.vstack(parts) if len(parts) > 1 else parts[0]
+            self.pub_accum_fused.publish(make_cloud(self._header(stamp), fused))
 
 
 def main() -> None:

@@ -37,7 +37,9 @@ Odin TCP 戳是设备 uptime，Mid/LIO 是 ROS 时间——**硬 restamp 再乘 
 | 融合输出 | 导航别名（nav bridge） |
 |----------|------------------------|
 | `/Odometry` | `/baselink2map` |
-| `/cloud_registered` | `/cloud_registered_1` |
+| `/cloud_fused`（Mid+Odin 当前帧合在一起） | `/cloud_registered_1` |
+| `/viz/accum_fused` | Mid+Odin 累积融合图（RViz 主看这个） |
+| `/cloud_registered` / `/cloud_odin_registered` | 分色单雷达当前帧 |
 | `/cloud_registered_body` | `/cloud_registered_body_1` |
 
 **禁止**把 `/odin1/cloud_slam` 喂进 MULTI（已在 Odin 内置位姿下，会双重里程计）。

@@ -93,7 +93,8 @@ def generate_launch_description():
                     parameters=[{
                         'odom_in': '/Odometry',
                         'odom_out': '/baselink2map',
-                        'cloud_in': '/cloud_registered',
+                        # Fused Mid+Odin map cloud for nav (falls back empty until viz runs)
+                        'cloud_in': '/cloud_fused',
                         'cloud_out': '/cloud_registered_1',
                         'cloud_body_in': '/cloud_registered_body',
                         'cloud_body_out': '/cloud_registered_body_1',
