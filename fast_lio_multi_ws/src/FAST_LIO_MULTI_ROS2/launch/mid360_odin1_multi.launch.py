@@ -106,7 +106,8 @@ def generate_launch_description():
                 )
             )
 
-        # Independent Odin: own odom × raw cloud → /viz/accum_odin (odin_map)
+        # Independent Odin: prefer /odin1/cloud_slam (mode1, already in odom).
+        # Node owns map→odin_map TF (one-shot visual lock to Mid; no pose fusion).
         if context.launch_configurations.get('enable_odin_accum', 'true') == 'true':
             nodes.append(
                 Node(
@@ -115,10 +116,14 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
-                        'cloud_topic': '/odin1/cloud_raw',
+                        'cloud_topic': '/odin1/cloud_slam',
                         'odom_topic': '/odin1/odometry',
+                        'mid_odom_topic': '/Odometry',
                         'map_frame': 'odin_map',
-                        'cloud_already_in_odom': False,
+                        'parent_frame': 'map',
+                        'cloud_already_in_odom': True,
+                        'align_mode': 'icp_yaw_xy',
+                        'align_delay_sec': 5.0,
                         'stride': 2,
                         'blind': 0.3,
                         'voxel_size': float(
@@ -128,16 +133,6 @@ def generate_launch_description():
                         'accum_publish_period': 0.5,
                         'accum_skip_sec': 2.0,
                     }],
-                )
-            )
-            # Put odin_map at map origin so both can be viewed with Fixed Frame=map
-            # (maps are independent; they will NOT align — by design).
-            nodes.append(
-                Node(
-                    package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='odin_map_to_map',
-                    arguments=['0', '0', '0', '0', '0', '0', 'map', 'odin_map'],
                 )
             )
 

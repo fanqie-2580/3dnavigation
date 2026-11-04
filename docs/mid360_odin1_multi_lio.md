@@ -2,15 +2,16 @@
 
 工作区：`/home/ll/fast_lio_multi_ws`（包名 `fast_lio_multi`，基于 [FAST_LIO_MULTI_ROS2](https://github.com/Draxran/FAST_LIO_MULTI_ROS2)）
 
-**当前默认**：两路互不关联。
+**当前默认**：两路互不关联建图。
 
-| 传感器 | 位姿 | 累积图 |
-|--------|------|--------|
-| Mid360 | FAST-LIO `/Odometry`（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
-| Odin1 | 自带 `/odin1/odometry` | `/viz/accum_odin`（`odin_map`） |
+| 传感器 | 位姿 / 点云 | 累积图 |
+|--------|-------------|--------|
+| Mid360 | FAST-LIO `/Odometry` + `/cloud_registered`（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
+| Odin1 | **mode1** `/odin1/cloud_slam`（已在 odom，**禁止再乘里程计**） | `/viz/accum_odin`（`odin_map`） |
 
 导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
-两图仅通过恒等 TF `map→odin_map` 方便同屏看，**不会对齐**。
+同屏显示：启动约 5s 后对两幅累积图做一次 **2D ICP（yaw+xy）** 锁 `map→odin_map`（只为 RViz 好看，不融位姿；之后各自漂移属正常）。  
+Odin 独立建图质量请在 RViz **关掉 Mid360** 再转一圈看 `/viz/accum_odin`（mode1 `/odin1/cloud_slam`，禁止再乘里程计）。
 
 ## 时间戳不一致：开源参考 & 本仓库做法
 
