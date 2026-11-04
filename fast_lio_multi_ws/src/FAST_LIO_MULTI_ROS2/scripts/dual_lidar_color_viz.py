@@ -350,20 +350,19 @@ class DualLidarColorViz(Node):
         # translation: freeze (short dt); Mid odom already carries vel poorly
         return T
 
-    def _level_yaw_pose(self, T: np.ndarray) -> np.ndarray:
-        """Keep Mid xy + yaw only. Odin raw is near gravity-level; applying Mid
-        roll/pitch (~IMU mount tilt) makes the whole orange map look slanted."""
-        R = T[:3, :3]
-        yaw = math.atan2(R[1, 0], R[0, 0])
-        c, s = math.cos(yaw), math.sin(yaw)
-        out = np.eye(4, dtype=np.float64)
-        out[0, 0], out[0, 1] = c, -s
-        out[1, 0], out[1, 1] = s, c
-        out[0, 3], out[1, 3], out[2, 3] = T[0, 3], T[1, 3], T[2, 3]
-        return out
+    @staticmethod
+    def _horizontal_yaw(R: np.ndarray) -> float:
+        """Yaw of body X projected onto map XY (stable when roll/pitch nonzero)."""
+        fx, fy = float(R[0, 0]), float(R[1, 0])
+        if math.hypot(fx, fy) < 1e-6:
+            return math.atan2(float(R[1, 0]), float(R[0, 0]))
+        return math.atan2(fy, fx)
 
     def on_odin_imu_prop(self, msg: PointCloud2) -> None:
         # Critical: pose by receive time on Mid/ROS clock, NOT Odin device stamp.
+        # Mid map + Odin raw are both near gravity-level; Mid IMU mount pitch must
+        # NOT rotate Odin points (that constant-tilts orange). Keep Mid yaw tracking
+        # + L2 yaw; lever-arm uses full Mid R so turn/pitch motion stays locked.
         t_recv = self.get_clock().now().nanoseconds * 1e-9
         T_map_imu = self._prop_mid_pose(t_recv)
         if T_map_imu is None:
@@ -371,11 +370,14 @@ class DualLidarColorViz(Node):
         arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
         if arr.size == 0:
             return
-        # Odin raw ≈ gravity-horizontal; Mid IMU/body has mount pitch. Using full
-        # Mid R tilts the whole orange map. Keep Mid yaw+xy only + L2 translation.
-        T_yaw = self._level_yaw_pose(T_map_imu)
-        R = T_yaw[:3, :3]
-        t = T_yaw[:3, 3] + R @ self.T_imu_odin[:3, 3]
+        R_mid = T_map_imu[:3, :3]
+        p_mid = T_map_imu[:3, 3]
+        R_L2 = self.T_imu_odin[:3, :3]
+        t_L2 = self.T_imu_odin[:3, 3]
+        yaw = self._horizontal_yaw(R_mid) + self._horizontal_yaw(R_L2)
+        c, s = math.cos(yaw), math.sin(yaw)
+        R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        t = p_mid + R_mid @ t_L2
         world = (arr @ R.T) + t
         self._publish_world(world, self.get_clock().now().to_msg())
 
