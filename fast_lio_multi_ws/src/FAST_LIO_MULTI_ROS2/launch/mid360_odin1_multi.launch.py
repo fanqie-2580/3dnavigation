@@ -76,6 +76,8 @@ def generate_launch_description():
                         'input_topic': '/odin1/cloud_raw',
                         'output_topic': '/odin1/cloud_raw_ds',
                         'voxel_size': float(context.launch_configurations.get('odin_voxel', '0.08')),
+                        'restamp_from_odom': True,
+                        'one_cloud_per_odom': False,
                     }],
                 )
             )

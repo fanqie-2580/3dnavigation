@@ -360,12 +360,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
 bool sync_packages_async(MeasureGroup &meas)
 {
-    if ( (lidar_buffer.empty() && lidar_buffer2.empty()) || imu_buffer.empty()) {
+    // Viz-only Odin: never pick L2 for IEKF (keeps Mid realtime). Latest L2 is
+    // posed onto /cloud_odin_registered after Mid update (same L2 TF, no extra angles).
+    const bool mid_only_iekf = multi_lidar && !lidar2_update_en;
+    if ((lidar_buffer.empty() && (mid_only_iekf || lidar_buffer2.empty())) || imu_buffer.empty()) {
         return false;
     }
 
     int lidar_use_num_now_ = 0;
-    if (!lidar_buffer.empty() && !lidar_buffer2.empty()) // if both, use older one
+    if (!mid_only_iekf && !lidar_buffer.empty() && !lidar_buffer2.empty()) // if both, use older one
     {
         // lidar 1 is older
         if (time_buffer.front() < time_buffer2.front())
@@ -384,7 +387,7 @@ bool sync_packages_async(MeasureGroup &meas)
         {
             lidar_use_num_now_ = 1;
         }
-        else if (!lidar_buffer2.empty())
+        else if (!mid_only_iekf && !lidar_buffer2.empty())
         {
             lidar_use_num_now_ = 2;
         }
@@ -499,6 +502,7 @@ bool sync_packages_async(MeasureGroup &meas)
         lidar_pushed = false;
         return true;
     }
+    return false;
 }
 bool sync_packages_bundle(MeasureGroup &meas)
 {
@@ -740,6 +744,24 @@ void publish_odin_from_undistorted(
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
     for (int i = 0; i < size; i++)
         RGBpointBodyToWorld(&odin_body->points[i], &laserCloudWorld->points[i]);
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
+// Odin already transformed into Mid L1 frame (LiDAR2_wrt_LiDAR1). Map with current Mid state.
+void publish_odin_from_l1(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &lidar2_l1)
+{
+    if (!pubOdin || !lidar2_l1 || lidar2_l1->empty() || !scan_pub_en)
+        return;
+    const int size = static_cast<int>(lidar2_l1->points.size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+        RGBpointBodyToWorld(&(lidar2_l1->points[i]), &(laserCloudWorld->points[i]));
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
@@ -1355,13 +1377,16 @@ private:
     {
         if (flg_exit)
             return;
-        // When Odin is viz-only, force bundle so Mid+Odin share one IMU undistortion
-        // and the same end pose — async Odin-with-stale-Mid-pose caused orange ghosts.
+        // Viz-only Odin: Mid-only async for IEKF (force-bundle lagged odom by tens of
+        // seconds and made accum look misaligned). After Mid update, pose latest Odin
+        // with yaml L2_wrt_L1 × current Mid state — no extra yaw/pitch on top.
         bool synced = false;
         if (multi_lidar && !lidar2_update_en)
         {
-            bundle_enabled = true;
-            synced = sync_packages_bundle(Measures);
+            bundle_enabled = false;
+            synced = sync_packages_async(Measures);
+            if (synced && current_lidar_num != 1)
+                synced = false;
         }
         else if (bundle_enabled)
             synced = sync_packages_bundle(Measures); // bundle
@@ -1372,7 +1397,7 @@ private:
             // RCLCPP_INFO(this->get_logger(), "Timer tick: synced=%d, bundle=%d", synced, bundle_enabled);
             high_resolution_clock::time_point t1 = high_resolution_clock::now();
 
-            if (bundle_enabled || (multi_lidar && !lidar2_update_en))
+            if (bundle_enabled && lidar2_update_en)
             {
                 p_imu->Process(Measures, kf, feats_undistort, true);
             }
@@ -1526,9 +1551,24 @@ private:
             /******* Publish points *******/
             if (multi_lidar && !lidar2_update_en)
             {
-                // Split undistorted fused scan: Mid -> /cloud_registered, Odin -> /cloud_odin_registered
-                publish_mid_from_undistorted(pubLaserCloudFull_, feats_undistort);
-                publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                // Mid map cloud from Mid undistort. Odin: yaml L2 → Mid L1 → world
+                // with the same state_point (original registered path, no re-pose in viz).
+                publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
+                PointCloudXYZI::Ptr odin_l1;
+                {
+                    std::lock_guard<std::mutex> lock(mtx_buffer);
+                    if (!lidar_buffer2.empty())
+                    {
+                        odin_l1.reset(new PointCloudXYZI(*lidar_buffer2.back()));
+                        lidar_buffer2.clear();
+                        time_buffer2.clear();
+                    }
+                }
+                if (odin_l1 && !odin_l1->empty())
+                {
+                    pcl::transformPointCloud(*odin_l1, *odin_l1, LiDAR2_wrt_LiDAR1);
+                    publish_odin_from_l1(pubLaserCloudOdin_, odin_l1);
+                }
             }
             else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
@@ -1551,7 +1591,7 @@ private:
             }
             else if (multi_lidar && !lidar2_update_en)
             {
-                bundle_enabled = true; // keep Mid+Odin time-aligned for viz
+                bundle_enabled = false;
             }
             high_resolution_clock::time_point t2 = high_resolution_clock::now();
             auto duration = duration_cast<microseconds>(t2 - t1).count() / 1000.0;
