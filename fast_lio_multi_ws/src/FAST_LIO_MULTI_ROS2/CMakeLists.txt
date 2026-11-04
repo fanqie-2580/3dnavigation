@@ -112,6 +112,7 @@ install(
     scripts/dual_lidar_color_viz.py
     scripts/dual_lidar_frames.py
     scripts/odin_independent_accum.py
+    scripts/mid_odin_frame_fuse.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

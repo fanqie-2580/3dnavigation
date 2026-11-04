@@ -12,27 +12,29 @@
 导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
 同屏显示：保持 **mode1 `/odin1/cloud_slam`** 独立累积；启动约 4s 后用 **mode0 外参**（`T/R_L2_wrt_L1`，含 Ry(-13.3°)）一次性锁 `map→odin_map`（不把 Mid 位姿乘进点云；之后各自漂移属正常）。
 
-## 时间戳不一致：开源参考 & 本仓库做法
+## 时间戳不一致：推荐解法（本仓库已采用）
 
-Odin TCP 戳是设备 uptime，Mid/LIO 是 ROS 时间——**硬 restamp 再乘 Mid odom 会在转弯时糊成扇形**，这不是外参 yaw 问题，是跨时钟融合问题。
+Odin TCP 戳常是设备 uptime，Mid/LIO 是 ROS 时间。  
+**禁止**：`Odin 点云 × Mid /Odometry`（跨时钟对姿 → 转弯扇形）。
+
+**正确做法（时钟域隔离 + 外参合帧）**：
+
+1. Mid：FAST-LIO 在自己的时钟域出 `/cloud_registered`（已在 `map`）  
+2. Odin：只用 Odin 时钟域位姿  
+   - mode1：直接叠 `/odin1/cloud_slam`  
+   - mode0：`/odin1/cloud_raw` × `/odin1/odometry`（两边同钟）  
+3. 用 mode0 标定外参一次性锁 `map→odin_map`  
+4. `mid_odin_frame_fuse`：把 Odin（`odin_map`）经 TF 变到 `map`，与 Mid 合成  
+   - `/cloud_fused`、`/viz/accum_fused`  
+   - **从不**用 Mid odom 去乘 Odin 时间戳  
+
+若将来要做紧耦合 IEKF，再考虑 LI-Init 估恒定 time offset / 连续时间方法；日常导航不必。
 
 | 项目 | 链接 | 做法 |
 |------|------|------|
-| FAST-LIO-MULTI | https://github.com/engcang/FAST_LIO_MULTI | bundle / **async** / adaptive；副雷达按自己的到达更新 |
-| MA-LIO | https://github.com/minwoo0611/MA-LIO | ApproximateTime + **连续时间 B 样条**，点级时间不确定度 |
-| M-LOAM | https://github.com/gogojjh/M-LOAM | 多雷达在线外参 + 建图 |
-| SLICT | https://github.com/brytsknguyen/slict | 连续时间、多输入 LIO |
-| LI-Init | https://github.com/hku-mars/LiDAR_IMU_Init | 标定 **time offset** + 外参 |
-| MILIOM (论文) | https://ar5iv.labs.arxiv.org/html/2104.11888 | 主雷达定拍，副雷达靠 **IMU 传播 deskew** |
-
-本仓库橙色累积默认 `odin_mode:=imu_prop`：
-
-1. **忽略** Odin header 时间戳  
-2. 用 **接收时刻**（Mid/ROS 钟）  
-3. 取最近 Mid `/Odometry`，用 `/livox/imu` 陀螺积分补到接收时刻  
-4. 再乘 L2 外参做世界系 voxel 累积  
-
-备选：`odin_own`（跟 `odin_odom_mapper` 一样用 `/odin1/odometry` 自己累，再锁一次到 Mid `map`）。
+| FAST-LIO-MULTI | https://github.com/engcang/FAST_LIO_MULTI | bundle / async / adaptive |
+| MA-LIO | https://github.com/minwoo0611/MA-LIO | ApproximateTime + B 样条 |
+| LI-Init | https://github.com/hku-mars/LiDAR_IMU_Init | 标定 time offset + 外参 |
 
 ## 话题约定
 

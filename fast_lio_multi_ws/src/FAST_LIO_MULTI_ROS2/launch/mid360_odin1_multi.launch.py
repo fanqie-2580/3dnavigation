@@ -38,6 +38,11 @@ def generate_launch_description():
         default_value='0.08',
         description='Voxel size (m) for independent Odin accum',
     )
+    enable_frame_fuse_arg = DeclareLaunchArgument(
+        'enable_frame_fuse',
+        default_value='true',
+        description='Fuse Mid+Odin in map via TF (no cross-clock Mid-odom×Odin)',
+    )
 
     def choose_nodes(context, *args, **kwargs):
         method = context.launch_configurations['update_method']
@@ -145,6 +150,27 @@ def generate_launch_description():
                 )
             )
 
+        # Merge Mid(map) + Odin(odin_map→map TF). Avoids mode0 timestamp fan.
+        if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='mid_odin_frame_fuse.py',
+                    name='mid_odin_frame_fuse',
+                    output='screen',
+                    parameters=[{
+                        'mid_scan_topic': '/cloud_registered',
+                        'odin_scan_topic': '/odin1/cloud_in_odom',
+                        'mid_accum_topic': '/viz/accum_mid360',
+                        'odin_accum_topic': '/viz/accum_odin',
+                        'map_frame': 'map',
+                        'odin_frame': 'odin_map',
+                        'stride': 1,
+                        'accum_period': 0.5,
+                    }],
+                )
+            )
+
         nodes.append(
             Node(
                 package='tf2_ros',
@@ -166,5 +192,6 @@ def generate_launch_description():
         enable_color_viz_arg,
         enable_odin_accum_arg,
         odin_voxel_arg,
+        enable_frame_fuse_arg,
         OpaqueFunction(function=choose_nodes),
     ])
