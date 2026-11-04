@@ -60,10 +60,10 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). NOT gravity-frame.
-      # No extra RotZ(±90°): keep R = I; only lever-arm T. Frame convention
-      # must come from sensor TF / mounting, not a viz yaw hack.
+      # No extra RotZ(±90°): keep R = I; only lever-arm T.
+      # T refined so front-wall depth matches Mid (was ~+0.39 m too far with old Tx).
       extrinsic_L2_gravity_frame: false
-      extrinsic_T_L2_wrt_L1: [0.152932, -0.032606, 0.080137]
+      extrinsic_T_L2_wrt_L1: [-0.2336, -0.0371, 0.0885]
       extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
                              0.0, 1.0, 0.0,
                              0.0, 0.0, 1.0]
