@@ -143,8 +143,8 @@ def generate_launch_description():
                     'gravity_frame': True,
                     'extrinsic_T': [-0.011, -0.02329, 0.04412],
                     'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                    'extrinsic_T_L2_wrt_L1': [-0.030, -0.0371, 0.208],
-                    # keep in sync with config/mid360_odin1.yaml R_L2 (~1.5° tip-up)
+                    # keep in sync with config/mid360_odin1.yaml (Odin front+higher)
+                    'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
                     'extrinsic_R_L2_wrt_L1': [
                         0.99965732, 0.0, -0.02617695,
                         0.0, 1.0, 0.0,

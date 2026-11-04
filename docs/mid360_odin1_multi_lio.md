@@ -162,6 +162,7 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
 - **双色融合累积**：青 `/viz/accum_mid360`←`/cloud_registered`，橙 `/viz/accum_odin`←`/cloud_odin_registered`。Odin 用与 Mid 相同的 LIO `state_point` 进 `map`（不单独用 raw+/Odometry），避免走动后橙图旋转漂移。
 - **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
+- **当前 Go2 安装（目测/卷尺）**：Odin 在前上方、Mid 在后下方；`T_L2_wrt_L1 ≈ [0.150, 0, +0.035]` m（前 150 mm、高 35 mm）。旧值 `z=+0.208` 与实物不符。  
 - Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
 - 无硬时间同步时避免急转首测  
 - 与旧 `open3d_loc` 单雷达链路并存；联调时不要同时发两套 `/baselink2map`
