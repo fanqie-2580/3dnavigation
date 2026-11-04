@@ -161,7 +161,59 @@ bool lidar2_update_en = false;
 M3D odin_mid_R = Eye3d;
 V3D odin_mid_t = Zero3d;
 bool odin_mid_pose_ready = false;
+// Mid pose history: Odin must use pose at its cloud stamp, not "latest".
+// Using latest Mid yaw while turning paints body-frame walls into wrong map
+// headings → orange accum fans/rotates; Mid (deskewed @ scan time) stays fixed.
+struct MidPoseStamp { double t; M3D R; V3D p; };
+deque<MidPoseStamp> mid_pose_hist;
+constexpr size_t kMidPoseHistMax = 400;
 constexpr float kOdinIntensityTag = 100.0f;
+
+static void push_mid_pose_hist(double t, const M3D &R, const V3D &p)
+{
+    std::lock_guard<std::mutex> lk(mtx_state);
+    odin_mid_R = R;
+    odin_mid_t = p;
+    odin_mid_pose_ready = true;
+    if (!mid_pose_hist.empty() && t + 1e-3 < mid_pose_hist.back().t)
+        mid_pose_hist.clear();
+    if (!mid_pose_hist.empty() && fabs(mid_pose_hist.back().t - t) < 1e-6)
+    {
+        mid_pose_hist.back().R = R;
+        mid_pose_hist.back().p = p;
+    }
+    else
+        mid_pose_hist.push_back(MidPoseStamp{t, R, p});
+    while (mid_pose_hist.size() > kMidPoseHistMax)
+        mid_pose_hist.pop_front();
+}
+
+static bool lookup_mid_pose_hist(double t, M3D &R, V3D &p)
+{
+    std::lock_guard<std::mutex> lk(mtx_state);
+    if (mid_pose_hist.empty())
+    {
+        if (!odin_mid_pose_ready)
+            return false;
+        R = odin_mid_R;
+        p = odin_mid_t;
+        return true;
+    }
+    size_t best = 0;
+    double best_dt = fabs(mid_pose_hist[0].t - t);
+    for (size_t i = 1; i < mid_pose_hist.size(); ++i)
+    {
+        const double dt = fabs(mid_pose_hist[i].t - t);
+        if (dt < best_dt)
+        {
+            best_dt = dt;
+            best = i;
+        }
+    }
+    R = mid_pose_hist[best].R;
+    p = mid_pose_hist[best].p;
+    return true;
+}
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
 double lidar_mean_scantime2 = 0.0;
@@ -315,9 +367,9 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         {
             for (auto &pt : ptr->points)
                 pt.intensity = 200.0f;
-            const double stamp = (publish_lidar_time > 0.0)
-                                     ? publish_lidar_time
-                                     : rclcpp::Time(msg->header.stamp).seconds();
+            // Use cloud stamp (bridge restamps to Mid /Odometry time). Do NOT
+            // overwrite with publish_lidar_time — that desyncs pose lookup on yaw.
+            const double stamp = rclcpp::Time(msg->header.stamp).seconds();
             if (extrinsic_L2_gravity_frame)
                 publish_odin_level_to_map(g_pub_odin_registered, ptr, stamp);
             else
@@ -801,8 +853,8 @@ void publish_odin_body_to_world(
 }
 
 // Level Odin cloud -> map using Mid yaw + position only (no Mid pitch/roll).
-// Avoids per-frame Euler cancel that flipped wall lean ~±same angle.
-// p_map = R_yaw * (R_yaml * p + t_L2) + t_mid
+// Pose MUST be Mid state at stamp_sec (cloud time), not the latest IEKF pose.
+// p_map = R_yaw(t) * (R_yaml * p + t_L2) + t_mid(t)
 void publish_odin_level_to_map(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &odin_lidar,
@@ -815,13 +867,8 @@ void publish_odin_level_to_map(
 
     M3D R_mid;
     V3D t_mid;
-    {
-        std::lock_guard<std::mutex> lk(mtx_state);
-        if (!odin_mid_pose_ready)
-            return;
-        R_mid = odin_mid_R;
-        t_mid = odin_mid_t;
-    }
+    if (!lookup_mid_pose_hist(stamp_sec, R_mid, t_mid))
+        return;
 
     const M3D R_yaw = mid_yaw_rotation(R_mid);
     const M3D R_yaml = LiDAR2_R_yaml;
@@ -1502,19 +1549,17 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            {
-                std::lock_guard<std::mutex> lk(mtx_state);
-                odin_mid_R = state_point.rot.toRotationMatrix();
-                odin_mid_t = state_point.pos;
-                odin_mid_pose_ready = p_imu->IMU_inited();
-            }
-            // Level Odin: publish with Mid yaw+pos only (see publish_odin_level_to_map).
+            if (p_imu->IMU_inited())
+                push_mid_pose_hist(publish_lidar_time,
+                                   state_point.rot.toRotationMatrix(),
+                                   state_point.pos);
+            // Level Odin: Mid yaw+pos at cloud stamp (see publish_odin_level_to_map).
             if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 odin_gravity_ext_comp = true;
                 if (extrinsic_L2_gravity_frame)
-                    std::cout << "\033[32;1mOdin L2: Mid yaw+pos only (level cloud; "
-                                 "no Mid pitch/roll, mutex snapshot)\033[0m"
+                    std::cout << "\033[32;1mOdin L2: Mid yaw+pos @ cloud stamp "
+                                 "(pose hist; no Mid pitch/roll)\033[0m"
                               << std::endl;
                 else
                     std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed:\n"
@@ -1607,12 +1652,9 @@ private:
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                {
-                    std::lock_guard<std::mutex> lk(mtx_state);
-                    odin_mid_R = state_point.rot.toRotationMatrix();
-                    odin_mid_t = state_point.pos;
-                    odin_mid_pose_ready = true;
-                }
+                push_mid_pose_hist(publish_lidar_time,
+                                   state_point.rot.toRotationMatrix(),
+                                   state_point.pos);
                 geoQuat.x = state_point.rot.coeffs()[0];
                 geoQuat.y = state_point.rot.coeffs()[1];
                 geoQuat.z = state_point.rot.coeffs()[2];

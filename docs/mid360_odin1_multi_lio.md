@@ -160,7 +160,8 @@ pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_r
   2. Mid 点云用完整 `R_wi`（含 pitch）投到 `map`，所以墙是正的。  
   3. Odin 必须走 `extrinsic_L2_gravity_frame: true`：只用 Mid 的 **yaw + 平移**；**禁止**把 Mid 安装俯仰编进 Odin。Odin 相对墙面若仍微下倾，只加很小的 `Ry` tip-up（当前 ~1.5°），不要再用 ±8°。  
   4. RViz 坐标系：`dual_lidar_frames` 发布 `map→mid360_lidar`、`map→odin1_lidar`（TF 开 Show Names）。  
-- **点云跟着机器人转**：RViz 对 `/cloud_registered` 开长 Decay 时，异步 Odin 帧会整帧顶掉世界系扫描，看起来像地图跟着 yaw 转。现 `lidar2_update_en=false` 时不再发布纯 Odin 帧；RViz 主看 **CloudMap**（`/Laser_map`，世界系固定），当前扫描 Decay=0。  
+- **Odin 累积跟着转圈转（已修）**：旧逻辑用 **最新** Mid 位姿投 Odin body 云，且 stamp 被改成 `publish_lidar_time`，转弯时墙被画到错误航向 → 橙色扇形；Mid 用扫描时刻 deskew 所以仍正。现改为 **按 cloud stamp 在 Mid 位姿历史里取最近姿态** 再做 yaw-only 投影。  
+- **点云跟着机器人转（RViz）**：对当前扫描开长 Decay 也会像地图在转；主看 `/viz/accum_*` / `/Laser_map`，Decay=0。  
 - **双色融合累积**：青 `/viz/accum_mid360`←`/cloud_registered`，橙 `/viz/accum_odin`←`/cloud_odin_registered`。Odin 用与 Mid 相同的 LIO `state_point` 进 `map`（不单独用 raw+/Odometry），避免走动后橙图旋转漂移。
 - **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
 - 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
