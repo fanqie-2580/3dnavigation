@@ -150,7 +150,7 @@ bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
 bool odin_gravity_ext_comp = false; // apply R_wi^T to L2 once after IMU gravity-align
-bool extrinsic_L2_gravity_frame = false; // yaml L2 is body-fixed when false
+bool extrinsic_L2_gravity_frame = false; // yaml L2 R is level-aligned when true
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
@@ -1427,17 +1427,15 @@ private:
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            // Optional: yaml L2 given in gravity/world → convert once with R_wi^T.
-            // When extrinsic_L2_gravity_frame=false, yaml is already body-fixed L2_wrt_L1.
+            // Restore 17:33 behavior: yaml R is level-aligned; convert once with R_wi^T
+            // after IMU init. Keep T as body-fixed lever (do not rotate T).
             if (multi_lidar && extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())
             {
                 M3D R_wi = state_point.rot.toRotationMatrix();
                 M3D R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
-                V3D t_w = LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3);
                 LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_wi.transpose() * R_yaml;
-                LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = R_wi.transpose() * t_w;
                 odin_gravity_ext_comp = true;
-                std::cout << "\033[32;1mOdin L2 extrinsic from gravity yaml via R_wi^T:\n"
+                std::cout << "\033[32;1mOdin L2 R from level yaml via R_wi^T (T body-fixed):\n"
                           << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
             }
             else if (multi_lidar && !extrinsic_L2_gravity_frame && !odin_gravity_ext_comp && p_imu->IMU_inited())

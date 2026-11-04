@@ -59,13 +59,14 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). Mount is level → R = I.
-      # No RotZ/RotY hacks (pitch hacks made FOV look more tilted). Only lever T.
-      extrinsic_L2_gravity_frame: false
+      # L2_wrt_L1 (Odin -> Mid360/L1). Restored 17:33 config that looked level.
+      # gravity_frame=true: yaml R vs gravity-level Mid; convert once with R_wi^T.
+      # R_yaml = Ry(-8.5°). T = body lever (not rotated).
+      extrinsic_L2_gravity_frame: true
       extrinsic_T_L2_wrt_L1: [-0.030, -0.0371, 0.208]
-      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
+      extrinsic_R_L2_wrt_L1: [0.98901659, 0.0, -0.14780941,
                              0.0, 1.0, 0.0,
-                             0.0, 0.0, 1.0]
+                             0.14780941, 0.0, 0.98901659]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

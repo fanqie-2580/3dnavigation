@@ -140,9 +140,8 @@ class DualLidarColorViz(Node):
         self.declare_parameter('mid_stride', 1)
         self.declare_parameter('odin_stride', 1)
         self.declare_parameter('odin_blind', 0.3)
-        # Drop near-ground wedge so side-view does not look like a pitched cloud.
-        # Level forward depth cams always paint a slanted floor sheet in XZ.
-        self.declare_parameter('odin_z_min', 0.25)
+        # No floor wipe by default — wall slant is an extrinsic/pitch issue, not z-filter.
+        self.declare_parameter('odin_z_min', -100.0)
         self.declare_parameter('odin_z_max', 100.0)
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_accum_points', 400000)
