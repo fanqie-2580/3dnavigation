@@ -61,9 +61,9 @@
                      0.0, 0.0, 1.0]
       # Body-fixed L2_wrt_L1 (Odin -> Mid360/L1). NOT gravity-frame.
       # No extra RotZ(±90°): keep R = I; only lever-arm T.
-      # Tx += ~0.204 m vs prior [-0.2336,...]: live front-wall median(Odin-Mid)≈-0.20 m.
+      # Tx tuned for front-wall DX≈0; Tz += ~0.12 m (overlap XY median Z Odin-Mid≈-0.12).
       extrinsic_L2_gravity_frame: false
-      extrinsic_T_L2_wrt_L1: [-0.030, -0.0371, 0.0885]
+      extrinsic_T_L2_wrt_L1: [-0.030, -0.0371, 0.208]
       extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
                              0.0, 1.0, 0.0,
                              0.0, 0.0, 1.0]
