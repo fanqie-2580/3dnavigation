@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Mid360 LIO + independent Odin1 accum (no cross association)."""
+"""Mid360 FAST-LIO + Odin mode0 CT-LIO, fused via extrinsic TF (no cross-clock pose)."""
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
+from nav2_common.launch import RewrittenYaml
 
 
 def generate_launch_description():
@@ -28,20 +32,25 @@ def generate_launch_description():
         default_value='true',
         description='Mid360 independent accum (/viz/accum_mid360)',
     )
-    enable_odin_accum_arg = DeclareLaunchArgument(
-        'enable_odin_accum',
+    enable_ct_lio_arg = DeclareLaunchArgument(
+        'enable_ct_lio',
         default_value='true',
-        description='Odin1 independent accum via /odin1/odometry (no Mid pose)',
+        description='Odin mode0 CT-LIO in odin_map (same-clock domain)',
     )
-    odin_voxel_arg = DeclareLaunchArgument(
-        'odin_voxel',
-        default_value='0.08',
-        description='Voxel size (m) for independent Odin accum',
+    enable_odin_align_arg = DeclareLaunchArgument(
+        'enable_odin_align',
+        default_value='true',
+        description='One-shot map→odin_map TF via mode0 extrinsic',
     )
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
         default_value='true',
-        description='Fuse Mid+Odin in map via TF (no cross-clock Mid-odom×Odin)',
+        description='Fuse Mid+Odin in map via TF (no Mid-odom×Odin-stamp)',
+    )
+    odin_voxel_arg = DeclareLaunchArgument(
+        'odin_voxel',
+        default_value='0.08',
+        description='Unused when CT-LIO owns Laser_map; kept for compatibility',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -61,7 +70,6 @@ def generate_launch_description():
         ])
 
         nodes = [
-            # Mid360-only FAST-LIO (yaml multi_lidar:=false)
             Node(
                 package='fast_lio_multi',
                 executable=exe,
@@ -89,7 +97,6 @@ def generate_launch_description():
                 )
             )
 
-        # Mid accum only (no Odin from Mid LIO)
         if context.launch_configurations.get('enable_color_viz', 'true') == 'true':
             nodes.append(
                 Node(
@@ -99,7 +106,6 @@ def generate_launch_description():
                     output='screen',
                     parameters=[{
                         'mid_topic': '/cloud_registered',
-                        # Mid-only: Odin owns its own accum node (no association).
                         'odin_mode': 'off',
                         'map_frame': 'map',
                         'mid_stride': 1,
@@ -111,9 +117,49 @@ def generate_launch_description():
                 )
             )
 
-        # Independent Odin: prefer /odin1/cloud_slam (mode1, already in odom).
-        # Node owns map→odin_map TF (one-shot visual lock to Mid; no pose fusion).
-        if context.launch_configurations.get('enable_odin_accum', 'true') == 'true':
+        use_ct = context.launch_configurations.get('enable_ct_lio', 'true') == 'true'
+        if use_ct:
+            ct_share = None
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                ct_share = get_package_share_directory('ct_lio')
+            except Exception:
+                ct_share = None
+            src_yaml = '/home/ll/ct_lio_to_ros2-master/config/mapping_odin1.yaml'
+            share_yaml = (
+                os.path.join(ct_share, 'config', 'mapping_odin1.yaml')
+                if ct_share else src_yaml
+            )
+            ct_yaml = src_yaml if os.path.isfile(src_yaml) else share_yaml
+            nodes.append(
+                Node(
+                    package='ct_lio',
+                    executable='ct_lio_eskf',
+                    name='ct_lio',
+                    output='screen',
+                    emulate_tty=True,
+                    parameters=[
+                        ParameterFile(
+                            RewrittenYaml(
+                                source_file=ct_yaml,
+                                root_key='',
+                                param_rewrites={},
+                                convert_types=True,
+                            ),
+                            allow_substs=True,
+                        )
+                    ],
+                    remappings=[
+                        # Avoid colliding with Mid FAST-LIO topics
+                        ('/cloud_registered', '/odin1/cloud_in_odom'),
+                        ('/Laser_map', '/viz/accum_odin'),
+                        ('/odom', '/odin1/ct_lio/odom'),
+                        ('/odometry_path', '/odin1/ct_lio/path'),
+                    ],
+                )
+            )
+
+        if context.launch_configurations.get('enable_odin_align', 'true') == 'true':
             nodes.append(
                 Node(
                     package='fast_lio_multi',
@@ -121,13 +167,14 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
-                        'cloud_topic': '/odin1/cloud_slam',
-                        'odom_topic': '/odin1/odometry',
+                        # CT-LIO owns cloud/accum; this node only locks map→odin_map TF
+                        'align_only': use_ct,
+                        'cloud_topic': '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw',
+                        'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry',
                         'map_frame': 'odin_map',
                         'parent_frame': 'map',
-                        'cloud_already_in_odom': True,
-                        # Keep mode1 cloud_slam; lock TF with mode0 Mid↔Odin extrinsic.
+                        'cloud_already_in_odom': True if use_ct else False,
                         'align_mode': 'extrinsic',
                         'align_delay_sec': 4.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
@@ -150,7 +197,6 @@ def generate_launch_description():
                 )
             )
 
-        # Merge Mid(map) + Odin(odin_map→map TF). Avoids mode0 timestamp fan.
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
             nodes.append(
                 Node(
@@ -190,8 +236,9 @@ def generate_launch_description():
         config_arg,
         enable_nav_bridge_arg,
         enable_color_viz_arg,
-        enable_odin_accum_arg,
-        odin_voxel_arg,
+        enable_ct_lio_arg,
+        enable_odin_align_arg,
         enable_frame_fuse_arg,
+        odin_voxel_arg,
         OpaqueFunction(function=choose_nodes),
     ])

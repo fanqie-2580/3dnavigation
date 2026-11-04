@@ -166,7 +166,9 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('mid_odom_topic', '/Odometry')
         self.declare_parameter('map_frame', 'odin_map')
         self.declare_parameter('parent_frame', 'map')
-        # true: cloud already in odom (cloud_slam). false: lidar-frame raw × odom.
+        # true: only publish map→odin_map TF (CT-LIO owns cloud/accum topics)
+        self.declare_parameter('align_only', False)
+        # true: cloud already in odom (cloud_slam / CT-LIO registered). false: raw × odom.
         self.declare_parameter('cloud_already_in_odom', True)
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
@@ -205,6 +207,7 @@ class OdinIndependentAccum(Node):
         self.mid_odom_topic = str(self.get_parameter('mid_odom_topic').value)
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.parent_frame = str(self.get_parameter('parent_frame').value)
+        self.align_only = bool(self.get_parameter('align_only').value)
         self.cloud_already_in_odom = bool(self.get_parameter('cloud_already_in_odom').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.blind2 = float(self.get_parameter('blind').value) ** 2
@@ -250,30 +253,35 @@ class OdinIndependentAccum(Node):
 
         from rclpy.qos import qos_profile_sensor_data
 
-        self.pub_scan = self.create_publisher(PointCloud2, '/odin1/cloud_in_odom', 5)
-        self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
+        self.pub_scan = None
+        self.pub_accum = None
+        if not self.align_only:
+            self.pub_scan = self.create_publisher(PointCloud2, '/odin1/cloud_in_odom', 5)
+            self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
         self._static_br = StaticTransformBroadcaster(self)
         self._publish_identity_tf()
 
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, 50)
         if self.align_to_mid_once:
             self.create_subscription(Odometry, self.mid_odom_topic, self.on_mid_odom, 50)
-            if self.align_mode.startswith('icp'):
+            if self.align_mode.startswith('icp') and not self.align_only:
                 self.create_subscription(
                     PointCloud2, self.mid_accum_topic, self.on_mid_accum, 1
                 )
-        self.create_subscription(
-            PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data
-        )
-        self.create_timer(max(0.2, period), self.publish_accum)
+        if not self.align_only:
+            self.create_subscription(
+                PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data
+            )
+            self.create_timer(max(0.2, period), self.publish_accum)
+            self.create_service(Trigger, '~/clear_accum', self.on_clear)
         if self.align_to_mid_once:
             self.create_timer(0.5, self._try_align)
-        self.create_service(Trigger, '~/clear_accum', self.on_clear)
 
         self.get_logger().info(
-            f'INDEPENDENT Odin accum: cloud={self.cloud_topic} odom={self.odom_topic} '
+            f'INDEPENDENT Odin: cloud={self.cloud_topic} odom={self.odom_topic} '
             f'frame={self.map_frame} already_in_odom={self.cloud_already_in_odom} '
-            f'align_mode={self.align_mode} (no Mid pose for points)'
+            f'align_only={self.align_only} align_mode={self.align_mode} '
+            f'(no Mid pose for points)'
         )
 
     def _publish_identity_tf(self) -> None:
@@ -501,16 +509,19 @@ class OdinIndependentAccum(Node):
             world = (arr @ R.T) + t
             stamp = msg.header.stamp
 
-        header = Header()
-        header.stamp = stamp
-        header.frame_id = self.map_frame
-        self.pub_scan.publish(make_cloud(header, world))
+        if self.pub_scan is not None:
+            header = Header()
+            header.stamp = stamp
+            header.frame_id = self.map_frame
+            self.pub_scan.publish(make_cloud(header, world))
 
         if (time.time() - self._t0) >= self.accum_skip_sec:
             if self._accum.add(world):
                 self._dirty = True
 
     def publish_accum(self) -> None:
+        if self.pub_accum is None:
+            return
         if not (self._dirty or len(self._accum)):
             return
         header = Header()

@@ -2,15 +2,15 @@
 
 工作区：`/home/ll/fast_lio_multi_ws`（包名 `fast_lio_multi`，基于 [FAST_LIO_MULTI_ROS2](https://github.com/Draxran/FAST_LIO_MULTI_ROS2)）
 
-**当前默认**：两路互不关联建图。
+**当前默认**：mode0 + 时钟域隔离融合。
 
-| 传感器 | 位姿 / 点云 | 累积图 |
-|--------|-------------|--------|
-| Mid360 | FAST-LIO `/Odometry` + `/cloud_registered`（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
-| Odin1 | **mode1** `/odin1/cloud_slam`（已在 odom，**禁止再乘里程计**） | `/viz/accum_odin`（`odin_map`） |
+| 传感器 | 建图 | 累积图 |
+|--------|------|--------|
+| Mid360 | FAST-LIO（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
+| Odin1 | **mode0** + **CT-LIO**（`/odin1/cloud_raw`+`/odin1/imu`） | `/viz/accum_odin` ← CT `/Laser_map`（`odin_map`） |
 
 导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
-同屏显示：保持 **mode1 `/odin1/cloud_slam`** 独立累积；启动约 4s 后用 **mode0 外参**（`T/R_L2_wrt_L1`，含 Ry(-13.3°)）一次性锁 `map→odin_map`（不把 Mid 位姿乘进点云；之后各自漂移属正常）。
+约 4s 后用 mode0 外参锁 `map→odin_map`；`mid_odin_frame_fuse` 合成 `/cloud_fused`、`/viz/accum_fused`（**从不** Mid-odom×Odin-stamp）。
 
 ## 时间戳不一致：推荐解法（本仓库已采用）
 
