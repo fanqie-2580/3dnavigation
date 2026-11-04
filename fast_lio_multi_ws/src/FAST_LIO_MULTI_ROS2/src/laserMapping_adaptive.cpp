@@ -1375,13 +1375,26 @@ private:
     {
         if (flg_exit)
             return;
-        // When Odin is viz-only, force bundle so Mid+Odin share one IMU undistortion
-        // and the same end pose — async Odin-with-stale-Mid-pose caused orange ghosts.
+        // When Odin is viz-only (lidar2_update_en=false): Mid-only async.
+        // Forcing bundle here made Mid wait on Odin and process a growing backlog
+        // (odom stamp lag hundreds of seconds → Mid cloud looks frozen when turning).
+        // Drop unused Odin buffer so async never prefers stale L2 device stamps.
         bool synced = false;
         if (multi_lidar && !lidar2_update_en)
         {
-            bundle_enabled = true;
-            synced = sync_packages_bundle(Measures);
+            while (!lidar_buffer2.empty())
+            {
+                lidar_buffer2.pop_front();
+                if (!time_buffer2.empty())
+                    time_buffer2.pop_front();
+            }
+            bundle_enabled = false;
+            synced = sync_packages_async(Measures);
+            // Guard: only Mid may update IEKF in this mode.
+            if (synced && current_lidar_num != 1)
+            {
+                synced = false;
+            }
         }
         else if (bundle_enabled)
             synced = sync_packages_bundle(Measures); // bundle
@@ -1392,7 +1405,7 @@ private:
             // RCLCPP_INFO(this->get_logger(), "Timer tick: synced=%d, bundle=%d", synced, bundle_enabled);
             high_resolution_clock::time_point t1 = high_resolution_clock::now();
 
-            if (bundle_enabled || (multi_lidar && !lidar2_update_en))
+            if (bundle_enabled && lidar2_update_en)
             {
                 p_imu->Process(Measures, kf, feats_undistort, true);
             }
@@ -1546,13 +1559,9 @@ private:
             /******* Publish points *******/
             if (multi_lidar && !lidar2_update_en)
             {
-                // Mid from undistorted fused scan; Odin from L1-frame lidar2 × current pose
-                // (snapshot sensor — same end pose as Mid, no intensity-split dependency).
-                publish_mid_from_undistorted(pubLaserCloudFull_, feats_undistort);
-                if (Measures.lidar2 && !Measures.lidar2->empty())
-                    publish_odin_from_l1(pubLaserCloudOdin_, Measures.lidar2);
-                else
-                    publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                // Mid-only IEKF: publish Mid world cloud. Orange accum is soft-synced
+                // in dual_lidar_color_viz (imu_prop), not here.
+                publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
             }
             else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
@@ -1575,7 +1584,7 @@ private:
             }
             else if (multi_lidar && !lidar2_update_en)
             {
-                bundle_enabled = true; // keep Mid+Odin time-aligned for viz
+                bundle_enabled = false; // Mid-only; Odin soft-synced in viz
             }
             high_resolution_clock::time_point t2 = high_resolution_clock::now();
             auto duration = duration_cast<microseconds>(t2 - t1).count() / 1000.0;

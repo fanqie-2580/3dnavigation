@@ -30,3 +30,7 @@ ros_logs/
 .DS_Store
 .env
 *.pem
+
+# local map dumps
+**/PCD/
+

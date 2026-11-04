@@ -350,6 +350,18 @@ class DualLidarColorViz(Node):
         # translation: freeze (short dt); Mid odom already carries vel poorly
         return T
 
+    def _level_yaw_pose(self, T: np.ndarray) -> np.ndarray:
+        """Keep Mid xy + yaw only. Odin raw is near gravity-level; applying Mid
+        roll/pitch (~IMU mount tilt) makes the whole orange map look slanted."""
+        R = T[:3, :3]
+        yaw = math.atan2(R[1, 0], R[0, 0])
+        c, s = math.cos(yaw), math.sin(yaw)
+        out = np.eye(4, dtype=np.float64)
+        out[0, 0], out[0, 1] = c, -s
+        out[1, 0], out[1, 1] = s, c
+        out[0, 3], out[1, 3], out[2, 3] = T[0, 3], T[1, 3], T[2, 3]
+        return out
+
     def on_odin_imu_prop(self, msg: PointCloud2) -> None:
         # Critical: pose by receive time on Mid/ROS clock, NOT Odin device stamp.
         t_recv = self.get_clock().now().nanoseconds * 1e-9
@@ -359,8 +371,12 @@ class DualLidarColorViz(Node):
         arr = self._xyz_stride(msg, self.odin_stride, self.odin_blind2)
         if arr.size == 0:
             return
-        T = T_map_imu @ self.T_imu_odin
-        world = (arr @ T[:3, :3].T) + T[:3, 3]
+        # Odin raw ≈ gravity-horizontal; Mid IMU/body has mount pitch. Using full
+        # Mid R tilts the whole orange map. Keep Mid yaw+xy only + L2 translation.
+        T_yaw = self._level_yaw_pose(T_map_imu)
+        R = T_yaw[:3, :3]
+        t = T_yaw[:3, 3] + R @ self.T_imu_odin[:3, 3]
+        world = (arr @ R.T) + t
         self._publish_world(world, self.get_clock().now().to_msg())
 
     def on_odin_odom(self, msg: Odometry) -> None:
