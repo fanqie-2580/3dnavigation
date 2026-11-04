@@ -107,6 +107,13 @@ def se3_inv(T: np.ndarray) -> np.ndarray:
     return Ti
 
 
+def se3_from_rt(R9, t3) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = np.asarray(R9, dtype=np.float64).reshape(3, 3)
+    T[:3, 3] = np.asarray(t3, dtype=np.float64).reshape(3)
+    return T
+
+
 def rpy_deg_to_R(rpy_deg) -> np.ndarray:
     r, p, y = [math.radians(float(v)) for v in rpy_deg]
     cr, sr = math.cos(r), math.sin(r)
@@ -172,13 +179,26 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('imu_to_lidar_xyz', [-0.004, 0.013, 0.026])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.66, -0.11, -0.29])
         # Visual-only TF lock (does not fuse poses into the cloud).
-        #   off       : identity
-        #   yaw_xy    : Mid/Odin body horizontal yaw + xy
-        #   icp_yaw_xy: 2D search on first accum clouds (preferred)
-        #   full      : full SE3 (tilts gravity map — debug only)
-        self.declare_parameter('align_mode', 'icp_yaw_xy')
-        self.declare_parameter('align_delay_sec', 5.0)
+        #   extrinsic : mode0 Mid↔Odin calib (default) — T_map_odinmap at lock
+        #   off / yaw_xy / icp_yaw_xy / full : alternatives
+        self.declare_parameter('align_mode', 'extrinsic')
+        self.declare_parameter('align_delay_sec', 4.0)
         self.declare_parameter('mid_accum_topic', '/viz/accum_mid360')
+        # Same numbers as mid360_odin1.yaml mapping.extrinsic_* (mode0 calibration)
+        self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
+        self.declare_parameter(
+            'extrinsic_R',
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.035])
+        self.declare_parameter(
+            'extrinsic_R_L2_wrt_L1',
+            [
+                0.97317887, 0.0, -0.23004974,
+                0.0, 1.0, 0.0,
+                0.23004974, 0.0, 0.97317887,
+            ],
+        )
 
         self.cloud_topic = str(self.get_parameter('cloud_topic').value)
         self.odom_topic = str(self.get_parameter('odom_topic').value)
@@ -208,6 +228,18 @@ class OdinIndependentAccum(Node):
         self.T_imu_lidar = np.eye(4, dtype=np.float64)
         self.T_imu_lidar[:3, :3] = rpy_deg_to_R(rpy)
         self.T_imu_lidar[:3, 3] = [float(v) for v in xyz]
+
+        # Mid IMU→L1, L1→L2 (Odin) — mode0 extrinsic used only for map↔odin_map TF
+        self.T_imu_L1 = se3_from_rt(
+            self.get_parameter('extrinsic_R').value,
+            self.get_parameter('extrinsic_T').value,
+        )
+        self.T_L1_L2 = se3_from_rt(
+            self.get_parameter('extrinsic_R_L2_wrt_L1').value,
+            self.get_parameter('extrinsic_T_L2_wrt_L1').value,
+        )
+        # Mid body(=imu) → Odin lidar
+        self.T_body_odin_lidar = self.T_imu_L1 @ self.T_L1_L2
 
         self._accum = VoxelAccum(voxel, max_n)
         self._dirty = False
@@ -373,8 +405,19 @@ class OdinIndependentAccum(Node):
         if (time.time() - self._t0) < self.align_delay_sec:
             return
 
-        if self.align_mode.startswith('icp'):
-            # Need both accum clouds (odin from our own voxel map)
+        if self.align_mode in ('extrinsic', 'mode0', 'calib'):
+            # mode0 extrinsic: place odin_map so Odin lidar matches Mid's estimate at lock.
+            # T_map_odinmap * T_odom_imu * T_imu_L2 = T_map_body * T_body_odin_lidar
+            if self._mid_T is None or self._odin_T is None:
+                return
+            T_odom_odin_lidar = self._odin_T @ self.T_imu_lidar
+            T_map_odin_lidar = self._mid_T @ self.T_body_odin_lidar
+            T_map_odinmap = T_map_odin_lidar @ se3_inv(T_odom_odin_lidar)
+            self.get_logger().info(
+                'Align via mode0 extrinsic '
+                f'T_L2=[{self.T_L1_L2[0,3]:.3f},{self.T_L1_L2[1,3]:.3f},{self.T_L1_L2[2,3]:.3f}]'
+            )
+        elif self.align_mode.startswith('icp'):
             if self._mid_cloud is None or len(self._accum) < 300:
                 return
             odin = self._accum.numpy()

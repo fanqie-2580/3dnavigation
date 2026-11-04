@@ -122,8 +122,17 @@ def generate_launch_description():
                         'map_frame': 'odin_map',
                         'parent_frame': 'map',
                         'cloud_already_in_odom': True,
-                        'align_mode': 'icp_yaw_xy',
-                        'align_delay_sec': 5.0,
+                        # Keep mode1 cloud_slam; lock TF with mode0 Mid↔Odin extrinsic.
+                        'align_mode': 'extrinsic',
+                        'align_delay_sec': 4.0,
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.97317887, 0.0, -0.23004974,
+                            0.0, 1.0, 0.0,
+                            0.23004974, 0.0, 0.97317887,
+                        ],
                         'stride': 2,
                         'blind': 0.3,
                         'voxel_size': float(

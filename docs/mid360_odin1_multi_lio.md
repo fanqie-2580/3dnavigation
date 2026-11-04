@@ -10,8 +10,7 @@
 | Odin1 | **mode1** `/odin1/cloud_slam`（已在 odom，**禁止再乘里程计**） | `/viz/accum_odin`（`odin_map`） |
 
 导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
-同屏显示：启动约 5s 后对两幅累积图做一次 **2D ICP（yaw+xy）** 锁 `map→odin_map`（只为 RViz 好看，不融位姿；之后各自漂移属正常）。  
-Odin 独立建图质量请在 RViz **关掉 Mid360** 再转一圈看 `/viz/accum_odin`（mode1 `/odin1/cloud_slam`，禁止再乘里程计）。
+同屏显示：保持 **mode1 `/odin1/cloud_slam`** 独立累积；启动约 4s 后用 **mode0 外参**（`T/R_L2_wrt_L1`，含 Ry(-13.3°)）一次性锁 `map→odin_map`（不把 Mid 位姿乘进点云；之后各自漂移属正常）。
 
 ## 时间戳不一致：开源参考 & 本仓库做法
 
