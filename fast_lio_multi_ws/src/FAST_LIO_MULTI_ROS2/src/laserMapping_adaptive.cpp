@@ -360,12 +360,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
 bool sync_packages_async(MeasureGroup &meas)
 {
-    if ( (lidar_buffer.empty() && lidar_buffer2.empty()) || imu_buffer.empty()) {
+    // Viz-only Odin: never select L2 for IEKF (keeps Mid realtime). Odin is posed
+    // onto /cloud_odin_registered after Mid update via publish_odin_from_l1.
+    const bool mid_only_iekf = multi_lidar && !lidar2_update_en;
+    if ((lidar_buffer.empty() && (mid_only_iekf || lidar_buffer2.empty())) || imu_buffer.empty()) {
         return false;
     }
 
     int lidar_use_num_now_ = 0;
-    if (!lidar_buffer.empty() && !lidar_buffer2.empty()) // if both, use older one
+    if (!mid_only_iekf && !lidar_buffer.empty() && !lidar_buffer2.empty()) // if both, use older one
     {
         // lidar 1 is older
         if (time_buffer.front() < time_buffer2.front())
@@ -384,7 +387,7 @@ bool sync_packages_async(MeasureGroup &meas)
         {
             lidar_use_num_now_ = 1;
         }
-        else if (!lidar_buffer2.empty())
+        else if (!mid_only_iekf && !lidar_buffer2.empty())
         {
             lidar_use_num_now_ = 2;
         }
@@ -499,6 +502,7 @@ bool sync_packages_async(MeasureGroup &meas)
         lidar_pushed = false;
         return true;
     }
+    return false;
 }
 bool sync_packages_bundle(MeasureGroup &meas)
 {
@@ -1375,26 +1379,16 @@ private:
     {
         if (flg_exit)
             return;
-        // When Odin is viz-only (lidar2_update_en=false): Mid-only async.
-        // Forcing bundle here made Mid wait on Odin and process a growing backlog
-        // (odom stamp lag hundreds of seconds → Mid cloud looks frozen when turning).
-        // Drop unused Odin buffer so async never prefers stale L2 device stamps.
+        // When Odin is viz-only (lidar2_update_en=false): Mid-only async for IEKF.
+        // Do NOT force bundle (that lagged Mid ~hundreds of seconds). Do NOT drain
+        // Odin here — after Mid update we pose latest L2 onto /cloud_odin_registered.
         bool synced = false;
         if (multi_lidar && !lidar2_update_en)
         {
-            while (!lidar_buffer2.empty())
-            {
-                lidar_buffer2.pop_front();
-                if (!time_buffer2.empty())
-                    time_buffer2.pop_front();
-            }
             bundle_enabled = false;
             synced = sync_packages_async(Measures);
-            // Guard: only Mid may update IEKF in this mode.
             if (synced && current_lidar_num != 1)
-            {
                 synced = false;
-            }
         }
         else if (bundle_enabled)
             synced = sync_packages_bundle(Measures); // bundle
@@ -1559,9 +1553,24 @@ private:
             /******* Publish points *******/
             if (multi_lidar && !lidar2_update_en)
             {
-                // Mid-only IEKF: publish Mid world cloud. Orange accum is soft-synced
-                // in dual_lidar_color_viz (imu_prop), not here.
+                // Mid-only IEKF: Mid map cloud + pose latest Odin with same Mid state
+                // (L2→L1→world) so /cloud_odin_registered stays aligned for viz.
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
+                PointCloudXYZI::Ptr odin_l1;
+                {
+                    std::lock_guard<std::mutex> lock(mtx_buffer);
+                    if (!lidar_buffer2.empty())
+                    {
+                        odin_l1.reset(new PointCloudXYZI(*lidar_buffer2.back()));
+                        lidar_buffer2.clear();
+                        time_buffer2.clear();
+                    }
+                }
+                if (odin_l1 && !odin_l1->empty())
+                {
+                    pcl::transformPointCloud(*odin_l1, *odin_l1, LiDAR2_wrt_LiDAR1);
+                    publish_odin_from_l1(pubLaserCloudOdin_, odin_l1);
+                }
             }
             else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
@@ -1584,7 +1593,7 @@ private:
             }
             else if (multi_lidar && !lidar2_update_en)
             {
-                bundle_enabled = false; // Mid-only; Odin soft-synced in viz
+                bundle_enabled = false; // Mid-only IEKF; Odin viz via /cloud_odin_registered
             }
             high_resolution_clock::time_point t2 = high_resolution_clock::now();
             auto duration = duration_cast<microseconds>(t2 - t1).count() / 1000.0;
