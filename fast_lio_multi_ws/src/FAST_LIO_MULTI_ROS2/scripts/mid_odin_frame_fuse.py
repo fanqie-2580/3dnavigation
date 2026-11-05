@@ -81,11 +81,14 @@ class MidOdinFrameFuse(Node):
         self.declare_parameter('odin_accum_topic', '/viz/accum_odin')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odin_frame', 'odin_map')
+        # true: Odin scan/accum already in map (e.g. odin_mid_timed_project)
+        self.declare_parameter('odin_already_in_map', False)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
 
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.odin_frame = str(self.get_parameter('odin_frame').value)
+        self.odin_already_in_map = bool(self.get_parameter('odin_already_in_map').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
 
         self._mid_scan: Optional[np.ndarray] = None
@@ -98,14 +101,23 @@ class MidOdinFrameFuse(Node):
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
 
+        from rclpy.qos import qos_profile_sensor_data
+
         self.pub_scan = self.create_publisher(PointCloud2, '/cloud_fused', 5)
         self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
 
+        # Match lidar publishers (BEST_EFFORT); Reliable here drops /odin1/cloud_in_map.
         self.create_subscription(
-            PointCloud2, self.get_parameter('mid_scan_topic').value, self.on_mid_scan, 5
+            PointCloud2,
+            self.get_parameter('mid_scan_topic').value,
+            self.on_mid_scan,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
-            PointCloud2, self.get_parameter('odin_scan_topic').value, self.on_odin_scan, 5
+            PointCloud2,
+            self.get_parameter('odin_scan_topic').value,
+            self.on_odin_scan,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
             PointCloud2, self.get_parameter('mid_accum_topic').value, self.on_mid_accum, 1
@@ -116,9 +128,9 @@ class MidOdinFrameFuse(Node):
         period = float(self.get_parameter('accum_period').value)
         self.create_timer(max(0.2, period), self.publish_accum)
 
+        mode = 'already-in-map' if self.odin_already_in_map else 'TF(map←odin_map)'
         self.get_logger().info(
-            'Frame-domain fuse: Mid(map) + TF(map←odin_map)×Odin(odin_map) '
-            '— never Mid-odom × Odin-stamp'
+            f'Frame fuse: Mid(map) + Odin via {mode}'
         )
 
     def _lookup_T(self) -> Optional[np.ndarray]:
@@ -133,6 +145,8 @@ class MidOdinFrameFuse(Node):
     def _odin_to_map(self, pts: np.ndarray) -> Optional[np.ndarray]:
         if pts is None or pts.size == 0:
             return None
+        if self.odin_already_in_map:
+            return pts
         T = self._lookup_T()
         if T is None:
             return None

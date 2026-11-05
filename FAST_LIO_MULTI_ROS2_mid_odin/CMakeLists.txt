@@ -108,6 +108,12 @@ install(
 install(
   PROGRAMS
     scripts/odin_raw_downsample_bridge.py
+    scripts/multi_lio_nav_bridge.py
+    scripts/dual_lidar_color_viz.py
+    scripts/dual_lidar_frames.py
+    scripts/odin_independent_accum.py
+    scripts/mid_odin_frame_fuse.py
+    scripts/odin_mid_timed_project.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

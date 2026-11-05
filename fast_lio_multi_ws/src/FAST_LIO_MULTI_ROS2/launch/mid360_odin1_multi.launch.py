@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Mid360 FAST-LIO + Odin mode0 CT-LIO, fused via extrinsic TF (no cross-clock pose)."""
+"""Mid360 FAST-LIO mapping + Odin densify into Mid map (no CT-LIO).
+
+Default: project delayed Odin raw into map using Mid TF at Odin stamp + extrinsic.
+"""
 import os
 
 from launch import LaunchDescription
@@ -34,18 +37,23 @@ def generate_launch_description():
     )
     enable_ct_lio_arg = DeclareLaunchArgument(
         'enable_ct_lio',
-        default_value='true',
+        default_value='false',
         description='Odin mode0 CT-LIO in odin_map (same-clock domain)',
     )
     enable_odin_align_arg = DeclareLaunchArgument(
         'enable_odin_align',
+        default_value='false',
+        description='Legacy independent Odin odom accum + map→odin_map TF',
+    )
+    enable_odin_timed_arg = DeclareLaunchArgument(
+        'enable_odin_timed',
         default_value='true',
-        description='One-shot map→odin_map TF via mode0 extrinsic',
+        description='Project Odin raw into Mid map via Mid TF at Odin stamp',
     )
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
         default_value='true',
-        description='Fuse Mid+Odin in map via TF (no Mid-odom×Odin-stamp)',
+        description='Fuse Mid + Odin-in-map into /cloud_fused',
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
@@ -159,7 +167,37 @@ def generate_launch_description():
                 )
             )
 
-        if context.launch_configurations.get('enable_odin_align', 'true') == 'true':
+        use_timed = context.launch_configurations.get('enable_odin_timed', 'true') == 'true'
+        if use_timed:
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='odin_mid_timed_project.py',
+                    name='odin_mid_timed_project',
+                    output='screen',
+                    parameters=[{
+                        'cloud_topic': '/odin1/cloud_raw',
+                        'out_topic': '/odin1/cloud_in_map',
+                        'map_frame': 'map',
+                        'body_frame': 'body',
+                        'tf_cache_sec': 12.0,
+                        'max_stamp_delay_sec': 6.0,
+                        'stride': 2,
+                        'blind': 0.3,
+                        'min_confidence': 30.0,
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.97317887, 0.0, -0.23004974,
+                            0.0, 1.0, 0.0,
+                            0.23004974, 0.0, 0.97317887,
+                        ],
+                    }],
+                )
+            )
+
+        if context.launch_configurations.get('enable_odin_align', 'false') == 'true':
             nodes.append(
                 Node(
                     package='fast_lio_multi',
@@ -167,7 +205,6 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
-                        # CT-LIO owns cloud/accum; this node only locks map→odin_map TF
                         'align_only': use_ct,
                         'cloud_topic': '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw',
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
@@ -198,6 +235,7 @@ def generate_launch_description():
             )
 
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
+            odin_scan = '/odin1/cloud_in_map' if use_timed else '/odin1/cloud_in_odom'
             nodes.append(
                 Node(
                     package='fast_lio_multi',
@@ -206,11 +244,12 @@ def generate_launch_description():
                     output='screen',
                     parameters=[{
                         'mid_scan_topic': '/cloud_registered',
-                        'odin_scan_topic': '/odin1/cloud_in_odom',
+                        'odin_scan_topic': odin_scan,
                         'mid_accum_topic': '/viz/accum_mid360',
                         'odin_accum_topic': '/viz/accum_odin',
                         'map_frame': 'map',
                         'odin_frame': 'odin_map',
+                        'odin_already_in_map': use_timed,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],
@@ -238,6 +277,7 @@ def generate_launch_description():
         enable_color_viz_arg,
         enable_ct_lio_arg,
         enable_odin_align_arg,
+        enable_odin_timed_arg,
         enable_frame_fuse_arg,
         odin_voxel_arg,
         OpaqueFunction(function=choose_nodes),

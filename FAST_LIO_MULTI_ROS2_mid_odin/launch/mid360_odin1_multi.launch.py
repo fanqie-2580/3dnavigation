@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Mid360 + Odin1 on clean FAST_LIO_MULTI (tight fusion path).
+"""Mid360 FAST-LIO mapping + Odin densify into Mid map (no CT-LIO).
 
-Prereq:
-  - Odin mode0, use_host_ros_time: 2 (host-aligned stamps)
-  - Mid /livox/lidar (CustomMsg) + /livox/imu
-  - Do NOT feed /odin1/cloud_slam into MULTI
+Default: project delayed Odin raw into map using Mid TF at Odin stamp + extrinsic.
 """
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterFile
 from launch_ros.substitutions import FindPackageShare
+from nav2_common.launch import RewrittenYaml
 
 
 def generate_launch_description():
@@ -24,25 +25,40 @@ def generate_launch_description():
         default_value='mid360_odin1.yaml',
         description='Config YAML under fast_lio_multi/config',
     )
-    enable_odin_ds_arg = DeclareLaunchArgument(
-        'enable_odin_ds',
+    enable_nav_bridge_arg = DeclareLaunchArgument(
+        'enable_nav_bridge',
         default_value='true',
-        description='Start odin_raw_downsample_bridge',
+        description='Republish Mid /Odometry and /cloud_registered to nav names',
+    )
+    enable_color_viz_arg = DeclareLaunchArgument(
+        'enable_color_viz',
+        default_value='true',
+        description='Mid360 independent accum (/viz/accum_mid360)',
+    )
+    enable_ct_lio_arg = DeclareLaunchArgument(
+        'enable_ct_lio',
+        default_value='false',
+        description='Odin mode0 CT-LIO in odin_map (same-clock domain)',
+    )
+    enable_odin_align_arg = DeclareLaunchArgument(
+        'enable_odin_align',
+        default_value='false',
+        description='Legacy independent Odin odom accum + map→odin_map TF',
+    )
+    enable_odin_timed_arg = DeclareLaunchArgument(
+        'enable_odin_timed',
+        default_value='true',
+        description='Project Odin raw into Mid map via Mid TF at Odin stamp',
+    )
+    enable_frame_fuse_arg = DeclareLaunchArgument(
+        'enable_frame_fuse',
+        default_value='true',
+        description='Fuse Mid + Odin-in-map into /cloud_fused',
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
         default_value='0.08',
-        description='Voxel size for Odin downsample bridge',
-    )
-    odin_conf_min_arg = DeclareLaunchArgument(
-        'odin_conf_min',
-        default_value='30.0',
-        description='Confidence filter in downsample bridge',
-    )
-    stamp_offset_arg = DeclareLaunchArgument(
-        'stamp_offset_sec',
-        default_value='0.0',
-        description='Constant Odin stamp offset (sec) after host align',
+        description='Unused when CT-LIO owns Laser_map; kept for compatibility',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -71,34 +87,198 @@ def generate_launch_description():
             )
         ]
 
-        if context.launch_configurations.get('enable_odin_ds', 'true') == 'true':
+        if context.launch_configurations.get('enable_nav_bridge', 'true') == 'true':
             nodes.append(
                 Node(
                     package='fast_lio_multi',
-                    executable='odin_raw_downsample_bridge.py',
-                    name='odin_raw_downsample_bridge',
+                    executable='multi_lio_nav_bridge.py',
+                    name='multi_lio_nav_bridge',
                     output='screen',
                     parameters=[{
-                        'input_topic': '/odin1/cloud_raw',
-                        'output_topic': '/odin1/cloud_raw_ds',
-                        'voxel_size': float(context.launch_configurations.get('odin_voxel', '0.08')),
-                        'max_points': 20000,
-                        'conf_min': float(context.launch_configurations.get('odin_conf_min', '30.0')),
-                        'stamp_offset_sec': float(
-                            context.launch_configurations.get('stamp_offset_sec', '0.0')
-                        ),
-                        'restamp_from_odom': False,
+                        'odom_in': '/Odometry',
+                        'odom_out': '/baselink2map',
+                        'cloud_in': '/cloud_registered',
+                        'cloud_out': '/cloud_registered_1',
+                        'cloud_body_in': '/cloud_registered_body',
+                        'cloud_body_out': '/cloud_registered_body_1',
                     }],
                 )
             )
+
+        if context.launch_configurations.get('enable_color_viz', 'true') == 'true':
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='dual_lidar_color_viz.py',
+                    name='dual_lidar_color_viz',
+                    output='screen',
+                    parameters=[{
+                        'mid_topic': '/cloud_registered',
+                        'odin_mode': 'off',
+                        'map_frame': 'map',
+                        'mid_stride': 1,
+                        'voxel_size': 0.08,
+                        'max_accum_points': 400000,
+                        'accum_publish_period': 0.5,
+                        'accum_skip_sec': 3.0,
+                    }],
+                )
+            )
+
+        use_ct = context.launch_configurations.get('enable_ct_lio', 'true') == 'true'
+        if use_ct:
+            ct_share = None
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                ct_share = get_package_share_directory('ct_lio')
+            except Exception:
+                ct_share = None
+            src_yaml = '/home/ll/ct_lio_to_ros2-master/config/mapping_odin1.yaml'
+            share_yaml = (
+                os.path.join(ct_share, 'config', 'mapping_odin1.yaml')
+                if ct_share else src_yaml
+            )
+            ct_yaml = src_yaml if os.path.isfile(src_yaml) else share_yaml
+            nodes.append(
+                Node(
+                    package='ct_lio',
+                    executable='ct_lio_eskf',
+                    name='ct_lio',
+                    output='screen',
+                    emulate_tty=True,
+                    parameters=[
+                        ParameterFile(
+                            RewrittenYaml(
+                                source_file=ct_yaml,
+                                root_key='',
+                                param_rewrites={},
+                                convert_types=True,
+                            ),
+                            allow_substs=True,
+                        )
+                    ],
+                    remappings=[
+                        # Avoid colliding with Mid FAST-LIO topics
+                        ('/cloud_registered', '/odin1/cloud_in_odom'),
+                        ('/Laser_map', '/viz/accum_odin'),
+                        ('/odom', '/odin1/ct_lio/odom'),
+                        ('/odometry_path', '/odin1/ct_lio/path'),
+                    ],
+                )
+            )
+
+        use_timed = context.launch_configurations.get('enable_odin_timed', 'true') == 'true'
+        if use_timed:
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='odin_mid_timed_project.py',
+                    name='odin_mid_timed_project',
+                    output='screen',
+                    parameters=[{
+                        'cloud_topic': '/odin1/cloud_raw',
+                        'out_topic': '/odin1/cloud_in_map',
+                        'map_frame': 'map',
+                        'body_frame': 'body',
+                        'tf_cache_sec': 12.0,
+                        'max_stamp_delay_sec': 6.0,
+                        'stride': 2,
+                        'blind': 0.3,
+                        'min_confidence': 30.0,
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.97317887, 0.0, -0.23004974,
+                            0.0, 1.0, 0.0,
+                            0.23004974, 0.0, 0.97317887,
+                        ],
+                    }],
+                )
+            )
+
+        if context.launch_configurations.get('enable_odin_align', 'false') == 'true':
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='odin_independent_accum.py',
+                    name='odin_independent_accum',
+                    output='screen',
+                    parameters=[{
+                        'align_only': use_ct,
+                        'cloud_topic': '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw',
+                        'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
+                        'mid_odom_topic': '/Odometry',
+                        'map_frame': 'odin_map',
+                        'parent_frame': 'map',
+                        'cloud_already_in_odom': True if use_ct else False,
+                        'align_mode': 'extrinsic',
+                        'align_delay_sec': 4.0,
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.035],
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.97317887, 0.0, -0.23004974,
+                            0.0, 1.0, 0.0,
+                            0.23004974, 0.0, 0.97317887,
+                        ],
+                        'stride': 2,
+                        'blind': 0.3,
+                        'voxel_size': float(
+                            context.launch_configurations.get('odin_voxel', '0.08')
+                        ),
+                        'max_accum_points': 400000,
+                        'accum_publish_period': 0.5,
+                        'accum_skip_sec': 2.0,
+                    }],
+                )
+            )
+
+        if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
+            odin_scan = '/odin1/cloud_in_map' if use_timed else '/odin1/cloud_in_odom'
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='mid_odin_frame_fuse.py',
+                    name='mid_odin_frame_fuse',
+                    output='screen',
+                    parameters=[{
+                        'mid_scan_topic': '/cloud_registered',
+                        'odin_scan_topic': odin_scan,
+                        'mid_accum_topic': '/viz/accum_mid360',
+                        'odin_accum_topic': '/viz/accum_odin',
+                        'map_frame': 'map',
+                        'odin_frame': 'odin_map',
+                        'odin_already_in_map': use_timed,
+                        'stride': 1,
+                        'accum_period': 0.5,
+                    }],
+                )
+            )
+
+        nodes.append(
+            Node(
+                package='tf2_ros',
+                executable='static_transform_publisher',
+                name='multi_lio_body_to_base',
+                arguments=[
+                    '0', '0', '0',
+                    '0', '-0.227', '0',
+                    'body', 'base_link',
+                ],
+            )
+        )
         return nodes
 
     return LaunchDescription([
         update_method_arg,
         config_arg,
-        enable_odin_ds_arg,
+        enable_nav_bridge_arg,
+        enable_color_viz_arg,
+        enable_ct_lio_arg,
+        enable_odin_align_arg,
+        enable_odin_timed_arg,
+        enable_frame_fuse_arg,
         odin_voxel_arg,
-        odin_conf_min_arg,
-        stamp_offset_arg,
         OpaqueFunction(function=choose_nodes),
     ])
