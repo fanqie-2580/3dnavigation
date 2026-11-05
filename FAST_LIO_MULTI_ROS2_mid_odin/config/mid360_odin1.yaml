@@ -60,15 +60,14 @@
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
       # L2_wrt_L1 = Odin origin in Mid360 lidar frame (X fwd, Y left, Z up).
-      # Live cloud calib 2026-11-05 (stationary Mid↔Odin NN): yaw≈+4.5°, pitch≈-5.5°,
-      # T≈[0.150,0,0.055]. Uses full Mid body TF so do NOT bake Mid mount pitch again
-      # (old Ry(-13.3°)=-(8.8+4.5) over-compensated).
+      # Odin cloud_raw ≈ gravity-level. Timed project uses Mid body yaw+translation
+      # only (use_yaw_only_body), so L2 rotation stays Identity; T from mount tape.
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.055]
-      # R = Rz(+4.5°) * Ry(-5.5°)
-      extrinsic_R_L2_wrt_L1: [0.99232772, -0.07845910, 0.09555029,
-                             0.07809789, 0.99691733, 0.00751997,
-                             -0.09584575, 0.00000000, 0.99539620]
+      # ICP vs Mid (yaw-only body): Rz(+12.84°)
+      extrinsic_R_L2_wrt_L1: [0.97499445, -0.22222923, 0.0,
+                             0.22222923, 0.97499445, 0.0,
+                             0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

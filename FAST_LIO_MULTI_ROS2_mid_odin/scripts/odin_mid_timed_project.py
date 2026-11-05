@@ -5,8 +5,10 @@ After host-time align, Odin stamps are on the same timeline as Mid, but arrive
 ~3s late over TCP. Using Odin's own odom builds a second drifting map → ghost/fan
 when fused. Instead:
 
-  T_map_odin_lidar(t) = T_map_body(t) * T_body_L1 * T_L1_L2
+  T_map_odin_lidar(t) = T_map_body_yaw(t) * T_body_L1 * T_L1_L2
 
+Odin /odin1/cloud_raw is approximately gravity-level. Applying Mid's full body
+pitch/roll tips Odin walls. Default: keep Mid translation + yaw only at stamp.
 Lookup Mid TF at the cloud's stamp (needs long TF cache). Drop if |dt| too large.
 """
 from __future__ import annotations
@@ -56,6 +58,19 @@ def se3(Rflat, Txyz) -> np.ndarray:
     return T
 
 
+def yaw_only_pose(T: np.ndarray) -> np.ndarray:
+    """Keep map translation and yaw; zero pitch/roll (for gravity-level Odin)."""
+    yaw = math.atan2(T[1, 0], T[0, 0])
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = np.eye(4, dtype=np.float64)
+    out[0, 0] = c
+    out[0, 1] = -s
+    out[1, 0] = s
+    out[1, 1] = c
+    out[:3, 3] = T[:3, 3]
+    return out
+
+
 class OdinMidTimedProject(Node):
     def __init__(self) -> None:
         super().__init__('odin_mid_timed_project')
@@ -68,19 +83,18 @@ class OdinMidTimedProject(Node):
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
         self.declare_parameter('min_confidence', 30.0)
+        # Odin raw ≈ gravity-level; strip Mid pitch/roll from body TF.
+        self.declare_parameter('use_yaw_only_body', True)
         # Mid IMU(body) → Mid lidar, Odin lidar in Mid lidar (same as mid360_odin1.yaml)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
         self.declare_parameter(
             'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.055])
+        # Near-identity: do not bake Mid mount pitch into L2 when yaw-only body is on.
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
-            [
-                0.99232772, -0.07845910, 0.09555029,
-                0.07809789, 0.99691733, 0.00751997,
-                -0.09584575, 0.00000000, 0.99539620,
-            ],
+            [0.97499445, -0.22222923, 0.0, 0.22222923, 0.97499445, 0.0, 0.0, 0.0, 1.0],
         )
 
         self.map_frame = str(self.get_parameter('map_frame').value)
@@ -89,6 +103,7 @@ class OdinMidTimedProject(Node):
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.blind2 = float(self.get_parameter('blind').value) ** 2
         self.min_conf = float(self.get_parameter('min_confidence').value)
+        self.use_yaw_only = bool(self.get_parameter('use_yaw_only_body').value)
         cache = float(self.get_parameter('tf_cache_sec').value)
 
         T_body_L1 = se3(
@@ -115,7 +130,8 @@ class OdinMidTimedProject(Node):
         self.create_timer(2.0, self._stats)
         self.get_logger().info(
             f'Odin→Mid-map timed project: {inn} → {out}, '
-            f'TF {self.map_frame}←{self.body_frame} cache={cache}s max_delay={self.max_delay}s'
+            f'TF {self.map_frame}←{self.body_frame} '
+            f'yaw_only={self.use_yaw_only} cache={cache}s max_delay={self.max_delay}s'
         )
 
     def _stats(self) -> None:
@@ -177,7 +193,10 @@ class OdinMidTimedProject(Node):
         arr = self._xyz(msg)
         if arr.size == 0:
             return
-        T = mat_from_tf(tf) @ self.T_body_odin
+        T_mb = mat_from_tf(tf)
+        if self.use_yaw_only:
+            T_mb = yaw_only_pose(T_mb)
+        T = T_mb @ self.T_body_odin
         world = (arr @ T[:3, :3].T) + T[:3, 3]
         header = Header()
         header.stamp = stamp
