@@ -1,0 +1,80 @@
+/**:
+  ros__parameters:
+
+    common:
+      async_debug: false
+      multi_lidar: true
+      publish_tf_results: false
+      max_iteration: 3
+      map_frame: "map"
+      # Mid360 Livox CustomMsg + Odin1 PointCloud2 (downsampled)
+      lid_topic: "/livox/lidar"
+      lid_topic2: "/odin1/cloud_raw_ds"
+      imu_topic: "/livox/imu"
+
+    method:
+      voxelized_pt_num_thres: 1000
+      effect_pt_num_ratio_thres: 0.4
+      bundle_enabled_tic_thres: 10
+
+    preprocess:
+      filter_size_surf: 0.4
+      point_filter_num: 3
+      point_filter_num2: 8
+      lidar_type: 1                   # Livox CustomMsg (Mid360)
+      lidar_type2: 4                  # XYZ_ONLY / Odin PointCloud2
+      scan_line: 4
+      scan_line2: 1
+      scan_rate: 10
+      scan_rate2: 10
+      timestamp_unit: 3
+      timestamp_unit2: 0              # Odin offset_time already in seconds (handler *1000)
+      blind: 0.5
+      blind2: 0.3
+      conf_min: -1.0                  # Mid unused
+      conf_min2: 30.0                 # Odin confidence (bridge may already filter)
+
+    mapping:
+      zero_start_pose: true
+      zero_start_delay_scans: 40
+      cube_side_length: 1000.0
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      det_range: 100.0
+      extrinsic_est_en: false
+      # false: IMU->L1 + L2_wrt_L1
+      extrinsic_imu_to_lidars: false
+
+      # Mid360 IMU -> Mid360 lidar (from existing robot calib)
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      extrinsic_T2: [0.0, 0.0, 0.0]
+      extrinsic_R2: [1.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0,
+                     0.0, 0.0, 1.0]
+
+      # Odin lidar in Mid360 lidar frame (X fwd, Y left, Z up). Coarse mount + Ry(-13.3°).
+      # Recalibrate before trusting IEKF fusion.
+      extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.035]
+      extrinsic_R_L2_wrt_L1: [0.97317887, 0.0, -0.23004974,
+                             0.0, 1.0, 0.0,
+                             0.23004974, 0.0, 0.97317887]
+
+      extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
+      extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
+                                 0.0, 1.0, 0.0,
+                                 0.0, 0.0, 1.0]
+
+    publish:
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: false
+      interval: -1
