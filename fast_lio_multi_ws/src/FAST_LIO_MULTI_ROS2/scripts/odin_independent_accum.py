@@ -192,13 +192,13 @@ class OdinIndependentAccum(Node):
             'extrinsic_R',
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
-        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.035])
+        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.055])
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
             [
-                0.97317887, 0.0, -0.23004974,
-                0.0, 1.0, 0.0,
-                0.23004974, 0.0, 0.97317887,
+                0.99232772, -0.07845910, 0.09555029,
+                0.07809789, 0.99691733, 0.00751997,
+                -0.09584575, 0.00000000, 0.99539620,
             ],
         )
 

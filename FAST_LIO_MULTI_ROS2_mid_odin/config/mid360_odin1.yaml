@@ -3,11 +3,12 @@
 
     common:
       async_debug: false
-      multi_lidar: true
+      # false: Mid360-only LIO. Odin accumulates independently (no association).
+      multi_lidar: false
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
-      # Mid360 Livox CustomMsg + Odin1 PointCloud2 (downsampled)
+      # Mid360 Livox CustomMsg + Odin1 dToF raw PointCloud2
       lid_topic: "/livox/lidar"
       lid_topic2: "/odin1/cloud_raw_ds"
       imu_topic: "/livox/imu"
@@ -20,19 +21,18 @@
     preprocess:
       filter_size_surf: 0.4
       point_filter_num: 3
+      # Odin is dense (~240x180); stride aggressively before IEKF
       point_filter_num2: 8
       lidar_type: 1                   # Livox CustomMsg (Mid360)
-      lidar_type2: 4                  # XYZ_ONLY / Odin PointCloud2
+      lidar_type2: 4                  # XYZ_ONLY generic PointCloud2 (Odin1)
       scan_line: 4
       scan_line2: 1
       scan_rate: 10
       scan_rate2: 10
       timestamp_unit: 3
-      timestamp_unit2: 0              # Odin offset_time already in seconds (handler *1000)
+      timestamp_unit2: 3
       blind: 0.5
       blind2: 0.3
-      conf_min: -1.0                  # Mid unused
-      conf_min2: 30.0                 # Odin confidence (bridge may already filter)
 
     mapping:
       zero_start_pose: true
@@ -44,10 +44,13 @@
       b_gyr_cov: 0.0001
       det_range: 100.0
       extrinsic_est_en: false
-      # false: IMU->L1 + L2_wrt_L1
-      extrinsic_imu_to_lidars: false
+      # false: Mid IEKF only; Odin posed via L2 extrinsic for viz (official async).
+      # motion immediately smears CloudMap. Odin still tagged in /cloud_registered.
+      lidar2_update_en: false
 
-      # Mid360 IMU -> Mid360 lidar (from existing robot calib)
+      # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
+      # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
+      extrinsic_imu_to_lidars: false
       extrinsic_T: [-0.011, -0.02329, 0.04412]
       extrinsic_R: [1.0, 0.0, 0.0,
                     0.0, 1.0, 0.0,
@@ -56,14 +59,16 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-
-      # Odin lidar in Mid360 lidar frame (X fwd, Y left, Z up). Coarse mount + Ry(-13.3°).
-      # Recalibrate before trusting IEKF fusion.
-      extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.035]
-      extrinsic_R_L2_wrt_L1: [0.97317887, 0.0, -0.23004974,
-                             0.0, 1.0, 0.0,
-                             0.23004974, 0.0, 0.97317887]
-
+      # L2_wrt_L1 = Odin origin in Mid360 lidar frame (X fwd, Y left, Z up).
+      # Live cloud calib 2026-11-05 (stationary Mid↔Odin NN): yaw≈+4.5°, pitch≈-5.5°,
+      # T≈[0.150,0,0.055]. Uses full Mid body TF so do NOT bake Mid mount pitch again
+      # (old Ry(-13.3°)=-(8.8+4.5) over-compensated).
+      extrinsic_L2_gravity_frame: false
+      extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.055]
+      # R = Rz(+4.5°) * Ry(-5.5°)
+      extrinsic_R_L2_wrt_L1: [0.99232772, -0.07845910, 0.09555029,
+                             0.07809789, 0.99691733, 0.00751997,
+                             -0.09584575, 0.00000000, 0.99539620]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
@@ -72,9 +77,10 @@
     publish:
       path_en: true
       scan_publish_en: true
+      # true: /cloud_registered keeps full undistorted scan (better RViz accum while moving)
       dense_publish_en: true
       scan_bodyframe_pub_en: true
 
     pcd_save:
-      pcd_save_en: false
+      pcd_save_en: true
       interval: -1
