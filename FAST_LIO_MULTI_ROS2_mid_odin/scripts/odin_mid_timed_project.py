@@ -114,13 +114,14 @@ class OdinMidTimedProject(Node):
             'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.12157888, 0.00549610, 0.03169932])
-        # Live gravity+ICP: rpy≈[-0.28,-10.15,-0.13] deg (CAD translation kept).
+        # Go2-relative: Odin≈I, Mid@Go2 Ry(+13°) → Mid←Odin Ry(-13°). CAD T kept.
+        # (Old ICP Ry(-10.15°) was fit before odom-cloud unproject; left ~+3.6° pitch.)
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
             [
-                0.98434257, 0.00309114, -0.17623892,
-                -0.00219007, 0.99998352, 0.00530702,
-                0.17625242, -0.00483795, 0.98433311,
+                0.97437006, 0.0, -0.22495105,
+                0.0, 1.0, 0.0,
+                0.22495105, 0.0, 0.97437006,
             ],
         )
         # Official Odin IMU→lidar (wiki), used when un-projecting odom-frame cloud.

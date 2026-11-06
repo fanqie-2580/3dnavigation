@@ -23,14 +23,16 @@
 | Odin L2 / Odin IMU | `/odin1/cloud_raw`；官方 `T_imu_L` 的 R=I |
 | `map` | Mid LIO 地图系 |
 
-投影链（timed project，实机重力+ICP 姿态版）：
+投影链（timed project，**已验证墙面对齐** 2026-11-06）：
 
 ```text
-p_map = T_map_body * T_body_L1 * T_L1_L2 * p_odin
+p_L   = inv(T_odin_odom * T_imu_L) * p_cloud   # frame_id=odom/map（dock 转发 cloud_slam）时
+p_map = T_map_body * T_body_L1 * T_L1_L2 * p_L
 ```
 
-`use_yaw_only_body=false`；`T_L1_L2` 平移用 CAD，旋转用实机重力+ICP：  
-`rpy≈[-0.28°, -10.15°, -0.13°]`（原先 CAD 补偿约 `Ry(-13°)`）。
+`use_yaw_only_body=false`；`cloud_in_odom=auto`；  
+`T_L1_L2` 平移用 CAD，旋转用 Go2 相对链：`Ry(-13°)`（Odin≈I，Mid@Go2 `Ry(+13°)`）。  
+注意：未做 odom 反投影时 ICP 的 `≈Ry(-10.15°)` 是在错误点云系下拟合的，反投影后必须改回 `≈Ry(-13°)`，否则俯仰欠约 3～4°。
 
 ---
 
@@ -225,17 +227,34 @@ python3 /home/ll/3dnavigation/docs/scripts/measure_odin_attitude.py --ref mid --
 - `launch/mid360_odin1_multi.launch.py`  
   - `odin_mid_timed_project`（及可选 `odin_independent_accum`）里同名参数  
 
-建议：`use_yaw_only_body: false`（L2 已含相对 Mid 的俯仰时）。  
+建议：`use_yaw_only_body: false`（L2 已含相对 Mid 的俯仰时）；  
+`cloud_in_odom: auto`（`/odin1/cloud_raw` 的 `frame_id=odom` 时先用 `/odin1/odometry` 反投影回雷达系）。
 
 同步到 `fast_lio_multi_ws` 的 install/share 后重启 launch。
 
-本次（2026-11-06）实机结果示例：
+### 已验证可用配置（2026-11-06，墙面偏航+俯仰对齐）
+
+投影链：
+
+```text
+p_L   = inv(T_odin_odom * T_imu_L) * p_cloud   # 仅当 frame_id=odom/map
+p_map = T_map_body * T_body_L1 * T_L1_L2 * p_L
+```
+
+| 项 | 值 |
+|----|----|
+| `use_yaw_only_body` | `false` |
+| `cloud_in_odom` | `auto` |
+| `extrinsic_T_L2_wrt_L1` | CAD `[0.12157888, 0.00549610, 0.03169932]` |
+| `extrinsic_R_L2_wrt_L1` | **`Ry(-13°)`**（Go2 相对：Odin≈I，Mid@Go2 `Ry(+13°)`） |
+
+历史对照（勿再当正式写入值）：
 
 | 方法 | rpy (deg) |
 |------|-----------|
 | 重力 | ≈ [-1.28, -13.01, -0.09] |
-| CAD Ry(-13°) | [0, -13, 0] |
-| 重力+ICP 合成 | ≈ **[-0.28, -10.15, -0.13]** ← 已写入 |
+| CAD / Go2 链 Ry(-13°) | **[0, -13, 0]** ← 当前写入 |
+| 未反投影时 ICP | ≈ [-0.28, -10.15, -0.13]（会欠俯仰约 3～4°） |
 
 ---
 

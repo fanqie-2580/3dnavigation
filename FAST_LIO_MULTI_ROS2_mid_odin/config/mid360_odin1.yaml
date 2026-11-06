@@ -68,11 +68,11 @@
       #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
-      # Live attitude 2026-11-06: gravity + ICP residual on /odin1/cloud_in_map
-      # vs /cloud_registered → rpy≈[-0.28°, -10.15°, -0.13°] (keep CAD translation)
-      extrinsic_R_L2_wrt_L1: [0.98434257, 0.00309114, -0.17623892,
-                             -0.00219007, 0.99998352, 0.00530702,
-                             0.17625242, -0.00483795, 0.98433311]
+      # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
+      # Keep CAD translation. (ICP -10.15° was pre-unproject; under-pitched ~3.6°.)
+      extrinsic_R_L2_wrt_L1: [0.97437006, 0.0, -0.22495105,
+                             0.0, 1.0, 0.0,
+                             0.22495105, 0.0, 0.97437006]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

@@ -270,13 +270,13 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
     const double t2 = rclcpp::Time(msg->header.stamp).seconds();
-    // Soft guard: if Mid is running and Odin stamp is wildly off (wrong clock domain), drop.
-    if (last_timestamp_lidar > 1.0 && std::fabs(t2 - last_timestamp_lidar) > 1.0)
+    // Soft guard: drop only if still in wrong clock domain (hours+), not TCP/align jitter.
+    if (last_timestamp_lidar > 1.0 && std::fabs(t2 - last_timestamp_lidar) > 30.0)
     {
         static int drop_n = 0;
         if ((++drop_n % 50) == 1)
             std::cerr << "[L2] stamp far from Mid (" << (t2 - last_timestamp_lidar)
-                      << " s); check Odin use_host_ros_time=2. drop#" << drop_n << std::endl;
+                      << " s); check Odin host-time align. drop#" << drop_n << std::endl;
         return;
     }
 
