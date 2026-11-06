@@ -293,6 +293,8 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 
 - `multi_lidar: true`
 - `lidar2_update_en: true`（**紧耦合**：Odin L2 残差更新 IEKF + ikdtree）
+- `lidar2_pose_gyr_gate: 0.35`（|gyro| 超阈值转身时暂不让 Odin 更新位姿/地图）
+- `/cloud_registered` **只发 Mid**（Odin 在 `/cloud_odin_registered`）
 - `lid_topic2: /odin1/cloud_raw_ds`
 - `min_confidence2: 30`
 - L2 外参：CAD 平移 + `Ry(-13°)`

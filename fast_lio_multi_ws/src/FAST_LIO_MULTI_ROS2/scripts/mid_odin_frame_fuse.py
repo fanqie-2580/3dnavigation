@@ -23,6 +23,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
@@ -126,6 +127,9 @@ class MidOdinFrameFuse(Node):
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_skip_sec', 2.0)
+        # Skip Odin voxel accum while Mid yaw rate (from /Odometry pose delta) is high.
+        self.declare_parameter('mid_odom_topic', '/Odometry')
+        self.declare_parameter('accum_gyr_gate', 0.35)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
 
@@ -135,6 +139,10 @@ class MidOdinFrameFuse(Node):
         self.accumulate_odin = bool(self.get_parameter('accumulate_odin_from_scan').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
+        self.accum_gyr_gate = float(self.get_parameter('accum_gyr_gate').value)
+        self._mid_gyr_norm = 0.0
+        self._prev_mid_yaw: Optional[float] = None
+        self._prev_mid_t: Optional[float] = None
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
 
@@ -173,6 +181,12 @@ class MidOdinFrameFuse(Node):
         self.create_subscription(
             PointCloud2, self.get_parameter('mid_accum_topic').value, self.on_mid_accum, 1
         )
+        self.create_subscription(
+            Odometry,
+            str(self.get_parameter('mid_odom_topic').value),
+            self.on_mid_odom,
+            50,
+        )
         # External Odin accum only when we are NOT the publisher (avoid self-echo).
         if not self.accumulate_odin:
             self.create_subscription(
@@ -187,7 +201,8 @@ class MidOdinFrameFuse(Node):
         mode = 'already-in-map' if self.odin_already_in_map else 'TF(map←odin_map)'
         self.get_logger().info(
             f'Frame fuse Mid360+Odin1: Mid(map) + Odin via {mode}; '
-            f'odin_scan_accum={self.accumulate_odin} voxel={voxel}'
+            f'odin_scan_accum={self.accumulate_odin} voxel={voxel} '
+            f'accum_gyr_gate={self.accum_gyr_gate}'
         )
 
     def _accum_ready(self) -> bool:
@@ -218,6 +233,24 @@ class MidOdinFrameFuse(Node):
         self._stamp_scan = msg.header.stamp
         self._publish_scan()
 
+    def on_mid_odom(self, msg: Odometry) -> None:
+        # FAST_LIO /Odometry often has empty twist — estimate yaw rate from pose.
+        q = msg.pose.pose.orientation
+        # yaw from quaternion (ZXY body)
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny, cosy)
+        t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        if self._prev_mid_t is not None and t > self._prev_mid_t + 1e-4:
+            dyaw = yaw - self._prev_mid_yaw
+            while dyaw > math.pi:
+                dyaw -= 2.0 * math.pi
+            while dyaw < -math.pi:
+                dyaw += 2.0 * math.pi
+            self._mid_gyr_norm = abs(dyaw) / (t - self._prev_mid_t)
+        self._prev_mid_yaw = yaw
+        self._prev_mid_t = t
+
     def on_odin_scan(self, msg: PointCloud2) -> None:
         pts = xyz_from_msg(msg, self.stride)
         self._odin_scan = pts
@@ -226,6 +259,9 @@ class MidOdinFrameFuse(Node):
         self._publish_scan()
 
         if not self.accumulate_odin or not self._accum_ready():
+            return
+        # Turning: Mid pose / Odin association is least reliable — skip voxel add.
+        if self._mid_gyr_norm >= self.accum_gyr_gate:
             return
         odin_m = self._odin_to_map(pts)
         if odin_m is None:

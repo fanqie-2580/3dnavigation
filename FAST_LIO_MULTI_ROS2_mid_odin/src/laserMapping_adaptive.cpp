@@ -158,6 +158,10 @@ bool extrinsic_L2_gravity_frame = false; // true: pose Odin with Mid yaw+pos onl
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
+// During fast yaw, cloud_slam L2 residuals pull Mid pose → /cloud_registered
+// smears for a few seconds. Gate Odin IEKF/map by IMU |gyro|.
+double last_imu_gyr_norm = 0.0;
+double lidar2_pose_gyr_gate = 0.35; // rad/s; above => Odin densify-off + no pose update
 // Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
 // state_point right after IEKF. Stamp-based lookup failed in practice:
 // /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
@@ -166,6 +170,11 @@ PointCloudXYZI::Ptr odin_pending_body;
 bool odin_pending_ready = false;
 bool odin_mid_pose_ready = false;
 constexpr float kOdinIntensityTag = 100.0f;
+
+inline bool odin_pose_update_allowed()
+{
+    return lidar2_update_en && (last_imu_gyr_norm < lidar2_pose_gyr_gate);
+}
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
 double lidar_mean_scantime2 = 0.0;
@@ -409,6 +418,13 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     }
 
     last_timestamp_imu = timestamp;
+
+    {
+        const double gx = msg->angular_velocity.x;
+        const double gy = msg->angular_velocity.y;
+        const double gz = msg->angular_velocity.z;
+        last_imu_gyr_norm = std::sqrt(gx * gx + gy * gy + gz * gz);
+    }
 
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
@@ -741,7 +757,7 @@ void map_incremental()
     PointNoNeedDownsample.reserve(feats_down_size);
     for (int i = 0; i < feats_down_size; i++)
     {
-        if (!lidar2_update_en &&
+        if (!odin_pose_update_allowed() &&
             (feats_down_body->points[i].intensity >= kOdinIntensityTag ||
              (!bundle_enabled && current_lidar_num == 2)))
             continue;
@@ -1114,7 +1130,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_world = feats_down_world->points[i]; 
 
         // Bundle: Odin tagged intensity>=100. Async lidar2 scan: whole frame is L2.
-        if (!lidar2_update_en &&
+        // Also skip Odin residuals when yaw-rate gate says hold (cloud_slam turn smear).
+        if (!odin_pose_update_allowed() &&
             (point_body.intensity >= kOdinIntensityTag ||
              (!bundle_enabled && current_lidar_num == 2)))
         {
@@ -1269,6 +1286,7 @@ public:
 
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("mapping.lidar2_update_en", false);
+        this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
@@ -1336,6 +1354,7 @@ public:
         this->get_parameter_or("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
+        this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
@@ -1465,7 +1484,8 @@ public:
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
-                 << " (false => Mid360-only IEKF/map)" << endl
+                 << " gyr_gate=" << lidar2_pose_gyr_gate
+                 << " rad/s (hold Odin IEKF above)" << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
                  << LiDAR2_wrt_LiDAR1 << "\033[0m" << endl
@@ -1590,7 +1610,7 @@ private:
                         init_pts.reserve(feats_down_size);
                         for (int i = 0; i < feats_down_size; i++)
                         {
-                            if (!lidar2_update_en &&
+                            if (!odin_pose_update_allowed() &&
                                 feats_down_body->points[i].intensity >= kOdinIntensityTag)
                                 continue;
                             pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
@@ -1630,8 +1650,9 @@ private:
                 return;
             }
 
+            // Odin-only async while yaw-rate gate holds: do not touch Mid IEKF.
             const bool skip_l2_update =
-                !lidar2_update_en && !bundle_enabled && current_lidar_num == 2;
+                !odin_pose_update_allowed() && !bundle_enabled && current_lidar_num == 2;
 
             if (!skip_l2_update)
             {
@@ -1673,17 +1694,20 @@ private:
             }
             else
             {
-                // Safety net if an Odin frame reached IEKF path.
+                // Safety net if an Odin frame reached IEKF path during hold.
                 publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
                 return;
             }
 
             /******* Publish points *******/
-            if (multi_lidar && !lidar2_update_en)
+            // Always split Mid/Odin: RViz /cloud_registered must stay Mid-only.
+            // Fused Mid+Odin made turns look like Mid was misaligned.
+            if (multi_lidar)
             {
-                // Mid from IEKF undistort; Odin from pending buffer × same Mid state.
                 publish_mid_from_undistorted(pubLaserCloudFull_, feats_undistort);
-                flush_pending_odin_to_map(publish_lidar_time);
+                publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                if (!lidar2_update_en)
+                    flush_pending_odin_to_map(publish_lidar_time);
             }
             else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
@@ -1693,7 +1717,15 @@ private:
             /*** Bundle update or async update ***/
             if (multi_lidar && lidar2_update_en)
             {
-                if (feats_down_size < voxelized_pt_num_thres && (double)effect_feat_num / feats_down_size < effect_pt_num_ratio_thres)
+                // Do NOT force bundle on weak Mid features during turns — that is
+                // when cloud_slam L2 most corrupts yaw. Only bundle when gyro is calm.
+                if (last_imu_gyr_norm >= lidar2_pose_gyr_gate)
+                {
+                    bundle_enabled = false;
+                    bundle_enabled_tic = 0;
+                }
+                else if (feats_down_size < voxelized_pt_num_thres &&
+                         (double)effect_feat_num / feats_down_size < effect_pt_num_ratio_thres)
                 {
                     bundle_enabled = true;
                     bundle_enabled_tic = 0;
