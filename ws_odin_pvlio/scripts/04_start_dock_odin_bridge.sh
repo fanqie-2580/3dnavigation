@@ -55,7 +55,7 @@ sleep 6
 # Fusion: raw cloud + drop-old TCP (see odin_ros1_tcp_server.py).
 setsid python3 /home/unitree/odin_bridge/odin_ros1_tcp_server.py \
   _cloud_topic:=/odin1/cloud_raw \
-  _cloud_stride:=4 \
+  _cloud_stride:=2 \
   > "$LOGDIR/tcp_server.log" 2>&1 < /dev/null &
 echo $! > /home/unitree/odin_bridge/tcp_server.pid
 INNER

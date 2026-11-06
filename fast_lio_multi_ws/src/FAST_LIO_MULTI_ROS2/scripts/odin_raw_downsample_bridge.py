@@ -180,6 +180,11 @@ class OdinRawDownsampleBridge(Node):
         self._n_skip_unproj = 0
         self._n_skip_empty = 0
         self._n_skip_age = 0
+        self._last_mid_wall = -1.0
+        # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
+        # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
+        self.declare_parameter('mid_stall_fallback_sec', 0.5)
+        self.mid_stall_fallback_sec = float(self.get_parameter('mid_stall_fallback_sec').value)
 
         reliable = QoSProfile(
             depth=20,
@@ -229,6 +234,7 @@ class OdinRawDownsampleBridge(Node):
 
     def on_mid_odom(self, msg: Odometry) -> None:
         self._n_mid += 1
+        self._last_mid_wall = self.get_clock().now().nanoseconds * 1e-9
         key = _stamp_key(msg.header.stamp)
         t = _stamp_sec(msg.header.stamp)
         self._mid_odom_stamp = msg.header.stamp
@@ -239,6 +245,12 @@ class OdinRawDownsampleBridge(Node):
             if self._publish_from_msg(self._pending, None):
                 self._last_pub_key = key
             self._pending = None
+
+    def _mid_stalled(self) -> bool:
+        if self._last_mid_wall < 0.0:
+            return True
+        now = self.get_clock().now().nanoseconds * 1e-9
+        return (now - self._last_mid_wall) > self.mid_stall_fallback_sec
 
     def _lookup_odin_odom(self, stamp) -> Optional[np.ndarray]:
         if not self._odin_odom:
@@ -268,8 +280,12 @@ class OdinRawDownsampleBridge(Node):
                 self._n_skip_age += 1
                 return
         # Prefer Mid-odom gated publish when Mid is alive; otherwise publish on a
-        # fallback period so LIO can bootstrap without chicken-egg deadlock.
-        if self.one_cloud_per_odom and self._mid_odom_stamp is not None:
+        # fallback period so LIO can bootstrap / recover from Mid↔L2 deadlock.
+        if (
+            self.one_cloud_per_odom
+            and self._mid_odom_stamp is not None
+            and not self._mid_stalled()
+        ):
             self._pending = msg
             if self._mid_odom_key is not None and self._last_pub_key != self._mid_odom_key:
                 if self._publish_from_msg(msg, None):
@@ -277,7 +293,7 @@ class OdinRawDownsampleBridge(Node):
                 self._pending = None
             return
 
-        # No Mid odom yet: rate-limit by wall time / cloud stamp.
+        # No Mid odom yet, or Mid stalled: rate-limit by wall time / cloud stamp.
         stamp = msg.header.stamp
         pub_sec = _stamp_sec(stamp)
         if self._last_pub_sec >= 0.0 and (pub_sec - self._last_pub_sec) < self.fallback_period:

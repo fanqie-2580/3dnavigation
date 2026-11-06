@@ -217,9 +217,11 @@ def generate_launch_description():
                         'max_cloud_age_sec': 3.0,
                         'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
-                        'stride': 2,
-                        'blind': 0.3,
-                        'min_confidence': 30.0,
+                        # Dock already strides TCP; keep all remaining pts for dense yellow live FOV.
+                        'stride': 1,
+                        'blind': 0.2,
+                        # Lower than driver default 35 so live yellow FOV denser in RViz.
+                        'min_confidence': 15.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'use_yaw_only_body': False,

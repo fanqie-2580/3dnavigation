@@ -136,7 +136,7 @@ Visualization Manager:
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /cloud_registered
       Use Fixed Frame: true
       Use rainbow: false
@@ -162,15 +162,15 @@ Visualization Manager:
       Name: Odin1_Realtime
       Position Transformer: XYZ
       Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.03
+      Size (Pixels): 3
+      Size (m): 0.04
       Style: Flat Squares
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /odin1/cloud_in_map
       Use Fixed Frame: true
       Use rainbow: false

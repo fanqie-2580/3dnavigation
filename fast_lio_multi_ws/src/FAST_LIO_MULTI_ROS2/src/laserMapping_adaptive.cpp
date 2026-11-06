@@ -1539,9 +1539,15 @@ private:
         if (flg_exit)
             return;
         // Stock FAST_LIO_MULTI adaptive: bundle when enabled, else async.
+        // If bundle is on but L2 dried up (downsample waiting on Mid odom), fall
+        // back to async Mid-only so /Odometry keeps flowing and breaks the deadlock.
         bool synced = false;
         if (bundle_enabled)
+        {
             synced = sync_packages_bundle(Measures); // bundle
+            if (!synced && !lidar_buffer.empty() && lidar_buffer2.empty() && !imu_buffer.empty())
+                synced = sync_packages_async(Measures);
+        }
         else
             synced = sync_packages_async(Measures); // single or async
         if (synced)
