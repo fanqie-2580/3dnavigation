@@ -299,11 +299,10 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 - `min_confidence2: 30`
 - L2 外参：CAD 平移 + `Ry(-13°)`
 
-**紧耦合输入**：dock 常把 `cloud_slam`（odom 系）当作 `/odin1/cloud_raw`。必须经
-`odin_raw_downsample_bridge`：反投影→雷达系、体素、按 Mid `/Odometry` 重打戳 →
-`/odin1/cloud_raw_ds`。`laserMapping_adaptive` 已允许 Mid 先建图发 odom（不因等首帧
-Odin 死锁）。可视化 Odin 另走 `odin_mid_timed_project`（EXACT Mid 戳）+
-`mid_odin_frame_fuse`；Mid 累积过滤 `intensity < 100`。
+**紧耦合输入**：dock 常把 `cloud_slam` 当作 `/odin1/cloud_raw`，经 bridge 反投影+按 Mid
+`/Odometry` 重打戳 → `/odin1/cloud_raw_ds`。可视化：`odin_mid_timed_project` 用**最新
+Mid 位姿 × 最新 Odin 云**（避免 Odin 戳慢 ~4s 的迟滞/追赶过头/跳动）；`mid_odin_frame_fuse`
+转身及 hold、yaw 跳变时不累积。
 
 链路：
 

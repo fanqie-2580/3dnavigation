@@ -129,7 +129,12 @@ class MidOdinFrameFuse(Node):
         self.declare_parameter('accum_skip_sec', 2.0)
         # Skip Odin voxel accum while Mid yaw rate (from /Odometry pose delta) is high.
         self.declare_parameter('mid_odom_topic', '/Odometry')
-        self.declare_parameter('accum_gyr_gate', 0.35)
+        self.declare_parameter('accum_gyr_gate', 0.25)
+        # After a turn, keep skipping accum for this long (seconds) so catch-up
+        # / overshoot frames do not paint the map.
+        self.declare_parameter('accum_hold_after_turn_sec', 0.8)
+        # Skip accum if Mid yaw jumped more than this between Odin frames (rad).
+        self.declare_parameter('accum_max_yaw_jump', 0.12)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
 
@@ -140,9 +145,13 @@ class MidOdinFrameFuse(Node):
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
         self.accum_gyr_gate = float(self.get_parameter('accum_gyr_gate').value)
+        self.accum_hold_after = float(self.get_parameter('accum_hold_after_turn_sec').value)
+        self.accum_max_yaw_jump = float(self.get_parameter('accum_max_yaw_jump').value)
         self._mid_gyr_norm = 0.0
         self._prev_mid_yaw: Optional[float] = None
         self._prev_mid_t: Optional[float] = None
+        self._accum_hold_until = 0.0
+        self._last_accum_yaw: Optional[float] = None
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
 
@@ -202,7 +211,7 @@ class MidOdinFrameFuse(Node):
         self.get_logger().info(
             f'Frame fuse Mid360+Odin1: Mid(map) + Odin via {mode}; '
             f'odin_scan_accum={self.accumulate_odin} voxel={voxel} '
-            f'accum_gyr_gate={self.accum_gyr_gate}'
+            f'accum_gyr_gate={self.accum_gyr_gate} hold_after={self.accum_hold_after}s'
         )
 
     def _accum_ready(self) -> bool:
@@ -236,7 +245,6 @@ class MidOdinFrameFuse(Node):
     def on_mid_odom(self, msg: Odometry) -> None:
         # FAST_LIO /Odometry often has empty twist — estimate yaw rate from pose.
         q = msg.pose.pose.orientation
-        # yaw from quaternion (ZXY body)
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw = math.atan2(siny, cosy)
@@ -248,6 +256,8 @@ class MidOdinFrameFuse(Node):
             while dyaw < -math.pi:
                 dyaw += 2.0 * math.pi
             self._mid_gyr_norm = abs(dyaw) / (t - self._prev_mid_t)
+            if self._mid_gyr_norm >= self.accum_gyr_gate:
+                self._accum_hold_until = time.time() + self.accum_hold_after
         self._prev_mid_yaw = yaw
         self._prev_mid_t = t
 
@@ -260,14 +270,25 @@ class MidOdinFrameFuse(Node):
 
         if not self.accumulate_odin or not self._accum_ready():
             return
-        # Turning: Mid pose / Odin association is least reliable — skip voxel add.
-        if self._mid_gyr_norm >= self.accum_gyr_gate:
+        now = time.time()
+        if self._mid_gyr_norm >= self.accum_gyr_gate or now < self._accum_hold_until:
             return
+        # Reject discontinuous Mid yaw between accum frames (overshoot/jump).
+        if self._prev_mid_yaw is not None and self._last_accum_yaw is not None:
+            dyaw = self._prev_mid_yaw - self._last_accum_yaw
+            while dyaw > math.pi:
+                dyaw -= 2.0 * math.pi
+            while dyaw < -math.pi:
+                dyaw += 2.0 * math.pi
+            if abs(dyaw) > self.accum_max_yaw_jump:
+                self._accum_hold_until = now + self.accum_hold_after
+                return
         odin_m = self._odin_to_map(pts)
         if odin_m is None:
             return
         if self._odin_voxel.add(odin_m):
             self._dirty_odin = True
+            self._last_accum_yaw = self._prev_mid_yaw
 
     def on_mid_accum(self, msg: PointCloud2) -> None:
         self._mid_accum = xyz_from_msg(msg, 1)
