@@ -46,6 +46,34 @@ def encode_imu(msg):
     )
 
 
+def subsample_cloud(msg, stride):
+    """Keep every stride-th point to cut TCP payload / Jetson decode CPU."""
+    stride = int(stride)
+    if stride <= 1:
+        return msg
+    n = int(msg.width) * int(msg.height)
+    step = int(msg.point_step)
+    if n <= 0 or step <= 0:
+        return msg
+    raw = bytes(bytearray(msg.data))
+    out = bytearray()
+    for i in range(0, n, stride):
+        b = i * step
+        out.extend(raw[b : b + step])
+    n_keep = len(out) // step
+    msg2 = PointCloud2()
+    msg2.header = msg.header
+    msg2.height = 1
+    msg2.width = n_keep
+    msg2.fields = msg.fields
+    msg2.is_bigendian = msg.is_bigendian
+    msg2.point_step = step
+    msg2.row_step = n_keep * step
+    msg2.is_dense = msg.is_dense
+    msg2.data = bytes(out)
+    return msg2
+
+
 def encode_cloud(msg):
     frame = msg.header.frame_id.encode("utf-8")
     parts = [
@@ -201,6 +229,9 @@ def main():
     # Nav may override to /odin1/cloud_slam.
     cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_raw")
     odom_topic = rospy.get_param("~odom_topic", "/odin1/odometry")
+    # Default stride=4: ~49k → ~12k pts/frame. Cuts Jetson TCP client CPU so
+    # host keeps closer to device 10 Hz instead of drop-old ~5 Hz "一段一段".
+    cloud_stride = int(rospy.get_param("~cloud_stride", 4))
 
     hub = ClientHub(light_queue_max=64)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -208,7 +239,10 @@ def main():
     sock.bind(("0.0.0.0", port))
     sock.listen(4)
     print("[bridge-server] listen 0.0.0.0:%d" % port)
-    print("[bridge-server] bridge %s + %s + %s (cloud=drop-old)" % (imu_topic, cloud_topic, odom_topic))
+    print(
+        "[bridge-server] bridge %s + %s + %s (cloud=drop-old stride=%d)"
+        % (imu_topic, cloud_topic, odom_topic, cloud_stride)
+    )
 
     t = threading.Thread(target=accept_loop, args=(sock, hub), daemon=True)
     t.start()
@@ -217,7 +251,9 @@ def main():
         hub.enqueue_light(pack_frame(TYPE_IMU, encode_imu(msg)))
 
     def on_cloud(msg):
-        hub.enqueue_cloud(pack_frame(TYPE_CLOUD, encode_cloud(msg)))
+        hub.enqueue_cloud(
+            pack_frame(TYPE_CLOUD, encode_cloud(subsample_cloud(msg, cloud_stride)))
+        )
 
     def on_odom(msg):
         hub.enqueue_light(pack_frame(TYPE_ODOM, encode_odom(msg)))
