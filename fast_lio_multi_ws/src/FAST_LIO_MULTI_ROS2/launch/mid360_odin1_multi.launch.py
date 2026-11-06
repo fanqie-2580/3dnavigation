@@ -187,13 +187,14 @@ def generate_launch_description():
                         'min_confidence': 30.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        'use_yaw_only_body': True,
-                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.055],
-                        # ICP yaw≈12.84° vs Mid; pitch/roll ~0 with yaw-only body.
+                        # Full body attitude: L2 carries Ry(-13°) vs official Mid mount.
+                        'use_yaw_only_body': False,
+                        # CAD T_base_odinIMU + official Mid@Go2IMU + URDF + wiki T_imu_L
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            0.97499445, -0.22222923, 0.0,
-                            0.22222923, 0.97499445, 0.0,
-                            0.0, 0.0, 1.0,
+                            0.97437006, 0.0, -0.22495105,
+                            0.0, 1.0, 0.0,
+                            0.22495105, 0.0, 0.97437006,
                         ],
                     }],
                 )
@@ -218,11 +219,11 @@ def generate_launch_description():
                         'align_delay_sec': 4.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        'extrinsic_T_L2_wrt_L1': [0.150, 0.0, 0.055],
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            1.0, 0.0, 0.0,
+                            0.97437006, 0.0, -0.22495105,
                             0.0, 1.0, 0.0,
-                            0.0, 0.0, 1.0,
+                            0.22495105, 0.0, 0.97437006,
                         ],
                         'stride': 2,
                         'blind': 0.3,
@@ -263,9 +264,10 @@ def generate_launch_description():
                 package='tf2_ros',
                 executable='static_transform_publisher',
                 name='multi_lio_body_to_base',
+                # MidIMU(body)→Go2 base_link from official Mid@Go2IMU + URDF + Mid board extrinsic
                 arguments=[
-                    '0', '0', '0',
-                    '0', '-0.227', '0',
+                    '-0.140709', '-0.02329', '-0.111671',
+                    '0', '-0.226893', '0',
                     'body', 'base_link',
                 ],
             )

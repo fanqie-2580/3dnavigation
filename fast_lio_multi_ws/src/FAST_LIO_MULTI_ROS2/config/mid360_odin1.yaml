@@ -59,15 +59,19 @@
       extrinsic_R2: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
-      # L2_wrt_L1 = Odin origin in Mid360 lidar frame (X fwd, Y left, Z up).
-      # Odin cloud_raw ≈ gravity-level. Timed project uses Mid body yaw+translation
-      # only (use_yaw_only_body), so L2 rotation stays Identity; T from mount tape.
+      # L2_wrt_L1 = Odin lidar in Mid360 lidar (X fwd, Y left, Z up).
+      # Derived 2026-11-06:
+      #   T_base_odinIMU (hand/CAD) t=[0.313654,-0.028974,0.104418] R=I
+      #   T_odinIMU_L (wiki) t=[-0.02663,0.03447,0.02174] R=I
+      #   T_go2IMU_midL (Unitree official) t=[0.187,0,0.0803] Ry(+13°)
+      #   T_base_go2IMU (URDF) t=[-0.02557,0,0.04232] R=I
+      #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
       extrinsic_L2_gravity_frame: false
-      extrinsic_T_L2_wrt_L1: [0.150, 0.0, 0.055]
-      # ICP vs Mid (yaw-only body): Rz(+12.84°)
-      extrinsic_R_L2_wrt_L1: [0.97499445, -0.22222923, 0.0,
-                             0.22222923, 0.97499445, 0.0,
-                             0.0, 0.0, 1.0]
+      extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
+      # Ry(-13°): compensates official Mid mount pitch vs gravity-level Odin
+      extrinsic_R_L2_wrt_L1: [0.97437006, 0.0, -0.22495105,
+                             0.0, 1.0, 0.0,
+                             0.22495105, 0.0, 0.97437006]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
