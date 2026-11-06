@@ -93,8 +93,9 @@ class OdinMidTimedProject(Node):
         # Pose + Odin-odom + output stamp all use the *same* Mid /Odometry time.
         self.declare_parameter('mid_pair_max_dt', 0.05)
         self.declare_parameter('odin_pair_max_dt', 0.05)
-        # Drop clouds older than this relative to newest Mid odom (live viz freshness).
-        self.declare_parameter('max_cloud_age_sec', 0.35)
+        # Drop only extreme backlog vs newest Mid. Residual dock lag is ~1–2s;
+        # do NOT set this to 0.25 (that kills EXACT viz). Accum age-gate is separate.
+        self.declare_parameter('max_cloud_age_sec', 3.0)
         self.declare_parameter('cloud_buffer_sec', 8.0)
         self.declare_parameter('odom_buffer_sec', 10.0)
         self.declare_parameter('stride', 2)

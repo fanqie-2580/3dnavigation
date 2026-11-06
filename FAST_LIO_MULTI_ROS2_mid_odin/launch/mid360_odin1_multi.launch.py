@@ -213,7 +213,8 @@ def generate_launch_description():
                         # Exact Mid pairing. 0.15s: host_receive Odin stamps vs Mid capture lag.
                         'mid_pair_max_dt': 0.15,
                         'odin_pair_max_dt': 0.15,
-                        'max_cloud_age_sec': 0.35,
+                        # Allow EXACT viz under residual dock lag; fuse accum uses 0.25s.
+                        'max_cloud_age_sec': 3.0,
                         'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
                         'stride': 2,
@@ -294,7 +295,9 @@ def generate_launch_description():
                         'max_accum_points': 400000,
                         'accum_skip_sec': 2.0,
                         'accum_gyr_gate': 0.35,
-                        'max_scan_age_sec': 0.35,
+                        'accum_gyr_cooldown_sec': 1.0,
+                        # Residual dock lag ~1–2s ⇒ Odin voxel accum stays off until lag drops.
+                        'max_scan_age_sec': 0.25,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],

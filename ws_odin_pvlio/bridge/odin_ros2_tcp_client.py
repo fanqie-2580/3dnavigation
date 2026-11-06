@@ -118,11 +118,12 @@ class OdinBridgeClient(Node):
         # Dock often publishes device uptime; map once onto host ROS time.
         self.declare_parameter("align_to_host_time", True)
         self.declare_parameter("uptime_stamp_threshold_sec", 1.6e9)
-        # device: keep aligned device stamp; host_receive: stamp clouds at arrival
-        # (fusion with mode0 lidar-frame raw — kills multi-second systematic lag).
-        self.declare_parameter("cloud_stamp_policy", "host_receive")
-        # Drop only extreme backlog (after policy). Soft gate; dock drop-old is primary.
-        self.declare_parameter("max_cloud_age_sec", 1.0)
+        # device: keep aligned device stamp (CORRECT for map: pose@t × cloud@t).
+        # host_receive: stamp at arrival — looks "live" but paints OLD geometry with
+        # NEW Mid pose → turn smear / wrong accum (do NOT use for mapping).
+        self.declare_parameter("cloud_stamp_policy", "device")
+        # Drop extreme TCP backlog only (seconds). Primary freshness = dock drop-old.
+        self.declare_parameter("max_cloud_age_sec", 3.0)
         self.host = self.get_parameter("server_host").value
         self.port = int(self.get_parameter("server_port").value)
         imu_topic = self.get_parameter("imu_topic").value
