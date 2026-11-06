@@ -66,37 +66,111 @@ source /home/ll/unitree_ros2/setup.sh
 
 ---
 
-## 2. 相对 Go2 测姿态（`--ref go2`）
+## 2. 相对 Go2 机身测姿态——实现说明（文字详解）
 
-### 原理
+这一节说明：**不拆机器、不用 Mid、不用 CAD 旋转**，怎样用实机数据得到  
+「Odin 坐标系相对 Go2 机身（`base_link`）的姿态」。
 
-Go2 `lf/lowstate.imu_state.accelerometer` 与 Odin `/odin1/imu` 加速度，求：
+### 2.1 要测的是什么
+
+刚体安装下，Odin 相对机身有固定外参 \(T^{\text{base}}_{\text{odin}}=\{R,t\}\)。
+
+- **平移 \(t\)**：Odin 原点在 `base_link` 下的位置（前/左/上各多少米）。静止时两个 IMU **测不出来**，仍靠 CAD 或卷尺。
+- **旋转 \(R\)**：Odin 三轴相对 `base_link` 三轴怎么转。静止时可以用 **两边加速度计看到的重力方向** 估出其中 **2 个自由度**（滚转、俯仰），**绕竖直轴的航向（yaw）估不出来**。
+
+脚本 `--ref go2` 做的就是估这个 \(R\)（更准确说：与重力对齐的那部分）。
+
+机身参考轴取 **Go2 机身 IMU**。Unitree URDF 里：
 
 ```text
-R_go2_odin :  R * g_odin ≈ g_go2
+base → imu : xyz = [-0.02557, 0, 0.04232], rpy = [0,0,0]
 ```
 
-因 URDF 里 Go2 IMU 相对 `base_link` **R=I**，该 R 即 **Odin IMU（≈L）相对 base 的姿态**（yaw-free）。
+即 IMU 相对 `base_link` **只有平移、没有旋转**。因此「相对机身 IMU 的姿态」=「相对 `base_link` 的姿态」。  
+Odin 侧官方 `T_{\text{imu}\leftarrow L}` 的旋转也是单位阵，点云系 L 与 Odin IMU 姿态一致，测到的 \(R\) 可同时当作相对 Odin 雷达系。
 
-再用宇树官方 Mid 在 Go2 IMU 下的 **Ry(+13°)** 换算到 Mid←Odin：
+### 2.2 物理依据：静止时加速度计 = 重力在本体下的投影
 
-```text
-R_L1_L2 ≈ Ry(-13°) · R_go2_odin     # 即 R_go2_mid^T @ R_go2_odin
-```
+机器人静置时，每个 IMU 的加速度计主要测的是重力（外加一点偏置/噪声）。  
+设世界系里重力竖直向下，则：
 
-### 操作
+- 在 Go2 机身 IMU 坐标系里，测得向量 \(\mathbf{a}_{\text{go2}}\)；
+- 在 Odin IMU 坐标系里，测得向量 \(\mathbf{a}_{\text{odin}}\)。
+
+二者是 **同一条物理重力**，只是表达在两个固联坐标系里。  
+若 \(R\) 表示「把 Odin 系下的向量变到 Go2 系」（即 \(p_{\text{go2}} = R\, p_{\text{odin}}\)），则应有：
+
+\[
+R\,\mathbf{a}_{\text{odin}} \;\approx\; \mathbf{a}_{\text{go2}}
+\]
+
+（两边都先单位化成方向，与加速度是「g」还是「m/s²」无关。）
+
+绕重力轴再转任意角度，重力方向不变，所以 **仅靠重力无法约束相对 yaw**。算法求的是满足上式的 **最小旋转**（转角最小的那一个），等价于：只对齐两个重力向量，不引入额外绕竖直轴的转动。
+
+### 2.3 数据从哪来
+
+| 侧 | 话题 / 字段 | 用法 |
+|----|-------------|------|
+| Go2 | `lf/lowstate`（或 `lowstate`）→ `imu_state.accelerometer` | 机身 IMU 三轴加速度，若干秒取平均 |
+| Odin | `/odin1/imu` → `linear_acceleration` | Odin IMU 加速度，同样平均 |
+
+注意：
+
+1. `/odin1/imu` 的 **orientation 四元数经常是假的（单位阵）**，不能用来比姿态；只用加速度（或 `/odin1/odometry` 的姿态作对照）。
+2. 订阅 Go2 状态需要宇树 ROS2/DDS 环境（`source unitree_ros2/setup.sh`，网卡指向 `192.168.123.x`）。
+3. 同一进程里还要能收到 `/odin1/imu`（Odin TCP 桥已在跑，且 ROS_DOMAIN 一致）。
+
+实现上脚本会连续采集约 2～3 秒样本，对 Go2、Odin 加速度分别做 **时间平均**，压低抖动后再算 \(R\)。
+
+### 2.4 算法步骤（脚本里实际做的事）
+
+1. **采集**：在静止条件下缓冲 `acc_go2[k]`、`acc_odin[k]`。  
+2. **平均**：\(\bar{\mathbf{a}}_{\text{go2}}=\mathrm{mean}(\cdot)\)，\(\bar{\mathbf{a}}_{\text{odin}}=\mathrm{mean}(\cdot)\)。  
+3. **单位化**：\(\hat{g}_{\text{go2}}=\bar{a}_{\text{go2}}/\|\cdot\|\)，\(\hat{g}_{\text{odin}}\) 同理。  
+4. **最小旋转（Rodrigues / 叉积公式）**：求 \(R\) 使 \(R\hat{g}_{\text{odin}}=\hat{g}_{\text{go2}}\)，且转角最小：
+   - \(\mathbf{v}=\hat{g}_{\text{odin}}\times\hat{g}_{\text{go2}}\)，\(c=\hat{g}_{\text{odin}}\cdot\hat{g}_{\text{go2}}\)；
+   - 用反对称矩阵 \([\mathbf{v}]_\times\) 构造  
+     \(R=I+[\mathbf{v}]_\times+[\mathbf{v}]_\times^2\dfrac{1}{1+c}\)（共线时单独处理）。  
+5. **输出**：打印 \(R\)、对应 RPY、以及 \(\|R-I\|\) 的转角。  
+   - 若接近单位阵：Odin 与机身轴近似平行（前装、Z 朝上时的预期）。  
+   - 若有明显 pitch/roll：说明安装相对机身有俯仰/横滚。
+
+同时可读 `lowstate.imu_state.rpy` 与 `/odin1/odometry` 的 RPY，作 **各自相对重力的绝对姿态** 对照；两边 yaw 零点独立，**不要直接相减当外参 yaw**。
+
+### 2.5 和 CAD、和融合外参的关系
+
+- **对照 CAD**：CAD 量的 `T_base_odin` 里旋转若为 \(I\)，则实机 \(\|R-I\|\) 也应很小；若 CAD 写成绕 Y 转 180° 而实机接近 \(I\)，说明 CAD 轴建反了（此前已出现过）。  
+- **写入 FAST-LIO 的 L2**：融合链是 Mid 雷达 ← Odin，不是 base ← Odin。已知官方「Mid 在 Go2 机身 IMU 下 Ry(+13°)」时，可换算：
+
+\[
+R^{\text{Mid}}_{\text{Odin}}
+= \bigl(R^{\text{Go2}}_{\text{Mid}}\bigr)^{\mathsf T} R^{\text{Go2}}_{\text{Odin}}
+= R_y(-13^\circ)\, R^{\text{Go2}}_{\text{Odin}}
+\]
+
+脚本在 `--ref go2` 时会多打印这一版，便于粘到 `extrinsic_R_L2_wrt_L1`；是否采用取决于你是否信任官方 Mid 安装角。更稳的 L2 仍建议用 `--ref mid` 的重力 + 点云 ICP。
+
+### 2.6 做不到什么（避免误解）
+
+1. **求不出 \(t\)**（前后左右上下偏移）。  
+2. **求不出相对 yaw**（机头偏左/偏右安装）。要 yaw 需视觉/点云相对机身标志，或相对 Mid 做 ICP。  
+3. **狗在动时** 加速度含线加速度，重力方向被污染，结果会偏；务必静止。  
+4. 趴下与站立时若机身相对水平姿态不同，测的是「当前机身姿态下的相对安装」，刚体外参 \(R\) 本身不变，但两边绝对 RPY 会变——所以用 **相对 \(R\)**，不要只看某一侧的绝对 pitch。
+
+### 2.7 操作命令
 
 ```bash
 source /home/ll/unitree_ros2/setup.sh
-# Odin /odin1/imu 需在同一 ROS 域可见
+# 同时保证 /odin1/imu 可订阅
 python3 /home/ll/3dnavigation/docs/scripts/measure_odin_attitude.py --ref go2 --mode gravity
 ```
 
-### 判读
+### 2.8 判读要点
 
-- `|R_go2_odin - I|` 很小 → Odin 相对机身接近水平同向（与前装 CAD R=I 一致）  
-- 脚本会额外打印建议的 `extrinsic_R_L2_wrt_L1`（经官方 Mid 安装换算）  
-- **测不到** 相对 base 的完整平移；平移继续用 CAD/卷尺  
+- `|R_go2_odin - I|` 很小 → 相对机身近似同向（与前装 CAD `R=I` 一致）  
+- 脚本会附带打印经官方 Mid Ry(+13°) 换算的 L2 建议 R  
+- **平移** 仍用 CAD/卷尺，本方法不管平移  
 
 ---
 
