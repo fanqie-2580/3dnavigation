@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Measure Odin1 attitude relative to Mid360 (live).
+"""Measure Odin1 attitude live vs Mid360 or Go2.
 
-Modes:
-  gravity — yaw-free R from accelerometer directions (Mid IMU ← Odin IMU)
-  icp     — residual SE3 of /odin1/cloud_in_map → /cloud_registered, then
-            R_L2_new ≈ R_delta @ R_L2_old
-  both    — run gravity then icp (default)
+--ref mid  (default): Mid IMU / map clouds → extrinsic_R_L2_wrt_L1
+--ref go2: Go2 body IMU (lf/lowstate) → R_base_odin (≈ Go2 IMU / base_link)
+
+Modes (mid):
+  gravity — yaw-free R from accel (Mid ← Odin)
+  icp     — residual /odin1/cloud_in_map → /cloud_registered
+  both    — gravity + icp
+
+Modes (go2):
+  gravity — yaw-free R from accel (Go2 ← Odin); ICP vs Mid map 不适用 Go2 真值系
 
 Examples:
-  python3 measure_odin_attitude.py --mode gravity
-  python3 measure_odin_attitude.py --mode both --l2-rpy-deg 0 -13 0
+  python3 measure_odin_attitude.py --ref mid --mode both --l2-rpy-deg 0 -10.15 0
+  python3 measure_odin_attitude.py --ref go2 --mode gravity
 """
 from __future__ import annotations
 
 import argparse
 import math
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -26,6 +31,23 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2
 from sensor_msgs_py import point_cloud2
+
+try:
+    from unitree_go.msg import LowState
+except ImportError:  # pragma: no cover
+    LowState = None  # type: ignore
+
+
+# URDF: Go2 base → Go2 IMU (attitude identical: R=I)
+T_BASE_GO2IMU_T = np.array([-0.02557, 0.0, 0.04232], dtype=np.float64)
+# Official Mid lidar in Go2 body-IMU frame
+def Ry(deg: float) -> np.ndarray:
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
+
+
+R_GO2IMU_MIDL = Ry(13.0)
 
 
 def quat_to_R(x: float, y: float, z: float, w: float) -> np.ndarray:
@@ -54,7 +76,6 @@ def rot_angle_deg(A: np.ndarray, B: np.ndarray) -> float:
 
 
 def gravity_align(g_from: np.ndarray, g_to: np.ndarray) -> np.ndarray:
-    """Minimal rotation R with R @ g_from ≈ g_to (direction only)."""
     a = g_from / (np.linalg.norm(g_from) + 1e-12)
     b = g_to / (np.linalg.norm(g_to) + 1e-12)
     v = np.cross(a, b)
@@ -128,7 +149,6 @@ def nearest_idx(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
 def icp_se3(
     src: np.ndarray, dst: np.ndarray, iters: int = 40, trim: float = 0.55
 ) -> Tuple[np.ndarray, float, float]:
-    """Rigid T: p_dst ≈ T @ p_src. Returns (T, median_nn, mean_nn)."""
     T = np.eye(4)
     X = src.copy()
     for _ in range(iters):
@@ -167,87 +187,136 @@ def print_R(name: str, R: np.ndarray) -> None:
     print("rpy_deg [roll,pitch,yaw] =", np.round(rpy_deg(R), 4).tolist())
     print("|R-I|_deg =", round(rot_angle_deg(np.eye(3), R), 4))
     flat = ", ".join(f"{v:.8f}" for v in R.reshape(-1))
-    print(f"yaml R flat:\n  extrinsic_R_L2_wrt_L1: [{flat}]")
+    print(f"R flat 9:\n  [{flat}]")
 
 
 class MeasureNode(Node):
-    def __init__(self) -> None:
+    def __init__(self, ref: str) -> None:
         super().__init__("measure_odin_attitude")
+        self.ref = ref
         self.buf: Dict[str, object] = {}
-        self.acc_mid = []
-        self.acc_odin = []
+        self.acc_ref: List[List[float]] = []
+        self.acc_odin: List[List[float]] = []
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=20,
         )
 
-        def take(key: str, keep_latest: bool = True):
+        def take(key: str):
             def cb(msg):
-                if keep_latest or key not in self.buf:
-                    self.buf[key] = msg
+                self.buf[key] = msg
 
             return cb
 
-        self.create_subscription(Imu, "/livox/imu", self._on_mid_imu, qos)
         self.create_subscription(Imu, "/odin1/imu", self._on_odin_imu, qos)
-        self.create_subscription(Odometry, "/Odometry", take("mid_odom"), 10)
         self.create_subscription(Odometry, "/odin1/odometry", take("odin_odom"), qos)
-        self.create_subscription(PointCloud2, "/cloud_registered", take("mid_cloud"), qos)
-        self.create_subscription(
-            PointCloud2, "/odin1/cloud_in_map", take("odin_map"), qos
-        )
 
-    def _on_mid_imu(self, msg: Imu) -> None:
-        self.buf["mid_imu"] = msg
-        a = msg.linear_acceleration
-        self.acc_mid.append([a.x, a.y, a.z])
+        if ref == "mid":
+            self.create_subscription(Imu, "/livox/imu", self._on_ref_imu, qos)
+            self.create_subscription(Odometry, "/Odometry", take("mid_odom"), 10)
+            self.create_subscription(
+                PointCloud2, "/cloud_registered", take("mid_cloud"), qos
+            )
+            self.create_subscription(
+                PointCloud2, "/odin1/cloud_in_map", take("odin_map"), qos
+            )
+        else:
+            if LowState is None:
+                raise RuntimeError(
+                    "unitree_go not importable. First:\n"
+                    "  source /home/ll/unitree_ros2/setup.sh\n"
+                    "then re-run with --ref go2"
+                )
+            self.create_subscription(LowState, "lf/lowstate", self._on_go2, 10)
+            self.create_subscription(LowState, "lowstate", self._on_go2, 10)
 
     def _on_odin_imu(self, msg: Imu) -> None:
         self.buf["odin_imu"] = msg
         a = msg.linear_acceleration
         self.acc_odin.append([a.x, a.y, a.z])
 
+    def _on_ref_imu(self, msg: Imu) -> None:
+        self.buf["ref_imu"] = msg
+        a = msg.linear_acceleration
+        self.acc_ref.append([a.x, a.y, a.z])
 
-def run_gravity(node: MeasureNode, collect_sec: float = 3.0) -> np.ndarray:
-    print(f"\n[gravity] collecting IMU for {collect_sec:.1f}s ...")
-    node.acc_mid.clear()
+    def _on_go2(self, msg) -> None:
+        self.buf["go2"] = msg
+        a = msg.imu_state.accelerometer
+        self.acc_ref.append([float(a[0]), float(a[1]), float(a[2])])
+
+
+def run_gravity_mid(node: MeasureNode, collect_sec: float) -> np.ndarray:
+    print(f"\n[gravity/mid] collecting {collect_sec:.1f}s ...")
+    node.acc_ref.clear()
     node.acc_odin.clear()
     t0 = time.time()
     while time.time() - t0 < collect_sec:
         rclpy.spin_once(node, timeout_sec=0.05)
-    if len(node.acc_mid) < 10 or len(node.acc_odin) < 10:
+    if len(node.acc_ref) < 10 or len(node.acc_odin) < 10:
         raise RuntimeError(
-            f"not enough IMU samples mid={len(node.acc_mid)} odin={len(node.acc_odin)}"
+            f"IMU samples mid={len(node.acc_ref)} odin={len(node.acc_odin)}"
         )
-    am = np.mean(node.acc_mid, axis=0)
+    am = np.mean(node.acc_ref, axis=0)
     ao = np.mean(node.acc_odin, axis=0)
-    print("Mid  acc mean", np.round(am, 4).tolist(), "norm", round(float(np.linalg.norm(am)), 4))
-    print("Odin acc mean", np.round(ao, 4).tolist(), "norm", round(float(np.linalg.norm(ao)), 4))
+    print("Mid  acc", np.round(am, 4).tolist(), "norm", round(float(np.linalg.norm(am)), 4))
+    print("Odin acc", np.round(ao, 4).tolist(), "norm", round(float(np.linalg.norm(ao)), 4))
     R = gravity_align(ao, am)
-    print_R("Gravity R_midIMU_odinIMU (≈ R_L1_L2 if Mid extrinsic R=I)", R)
-
-    if "mid_odom" in node.buf and "odin_odom" in node.buf:
-        qm = node.buf["mid_odom"].pose.pose.orientation
-        qo = node.buf["odin_odom"].pose.pose.orientation
-        Rm = quat_to_R(qm.x, qm.y, qm.z, qm.w)
-        Ro = quat_to_R(qo.x, qo.y, qo.z, qo.w)
-        print("\nAbsolute odom rpy (yaw origins independent, compare pitch/roll only):")
-        print("  Mid /Odometry      ", np.round(rpy_deg(Rm), 3).tolist())
-        print("  Odin /odin1/odometry", np.round(rpy_deg(Ro), 3).tolist())
-        print(
-            "  Δ(roll,pitch) Odin-Mid",
-            np.round(rpy_deg(Ro)[:2] - rpy_deg(Rm)[:2], 3).tolist(),
-        )
+    print_R("R_midIMU_odinIMU ≈ R_L1_L2 (Mid extrinsic R≈I)", R)
     return R
 
 
+def run_gravity_go2(node: MeasureNode, collect_sec: float) -> np.ndarray:
+    print(f"\n[gravity/go2] collecting {collect_sec:.1f}s (need unitree DDS on robot NIC) ...")
+    node.acc_ref.clear()
+    node.acc_odin.clear()
+    t0 = time.time()
+    while time.time() - t0 < collect_sec:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if len(node.acc_ref) < 10 or len(node.acc_odin) < 10:
+        raise RuntimeError(
+            f"IMU samples go2={len(node.acc_ref)} odin={len(node.acc_odin)}. "
+            "Check: source unitree_ros2/setup.sh and robot lf/lowstate."
+        )
+    ag = np.mean(node.acc_ref, axis=0)
+    ao = np.mean(node.acc_odin, axis=0)
+    print("Go2  acc", np.round(ag, 4).tolist(), "norm", round(float(np.linalg.norm(ag)), 4))
+    print("Odin acc", np.round(ao, 4).tolist(), "norm", round(float(np.linalg.norm(ao)), 4))
+
+    # R maps Odin → Go2 IMU (== base attitude, URDF R=I)
+    R_go2_odin = gravity_align(ao, ag)
+    print_R("R_go2IMU_odinIMU ≈ R_base_odin (attitude; yaw-free)", R_go2_odin)
+
+    if "go2" in node.buf:
+        rpy = node.buf["go2"].imu_state.rpy
+        print(
+            "Go2 lowstate.rpy deg",
+            [round(math.degrees(float(v)), 3) for v in rpy],
+        )
+    if "odin_odom" in node.buf:
+        q = node.buf["odin_odom"].pose.pose.orientation
+        print("Odin odom rpy deg", np.round(rpy_deg(quat_to_R(q.x, q.y, q.z, q.w)), 3).tolist())
+
+    # Convert to Mid←Odin using official Mid@Go2IMU Ry(+13°)
+    R_mid_odin = R_GO2IMU_MIDL.T @ R_go2_odin
+    print_R(
+        "Derived R_midL_odin ≈ R_L1_L2  (via official Mid Ry(+13°) in Go2 IMU)",
+        R_mid_odin,
+    )
+    print(
+        "\nNote: translation still needs CAD/tape. Go2 IMU origin vs base_link:\n"
+        f"  t_base_go2IMU = {T_BASE_GO2IMU_T.tolist()} m (URDF), R=I"
+    )
+    print("|R_go2_odin - I|_deg (should be small if Odin level on dog) =",
+          round(rot_angle_deg(np.eye(3), R_go2_odin), 3))
+    return R_go2_odin
+
+
 def run_icp(
-    node: MeasureNode,
-    R_l2_old: np.ndarray,
-    wait_sec: float = 6.0,
+    node: MeasureNode, R_l2_old: np.ndarray, wait_sec: float
 ) -> Tuple[np.ndarray, np.ndarray]:
-    print(f"\n[icp] waiting clouds up to {wait_sec:.1f}s ...")
+    print(f"\n[icp/mid] waiting clouds up to {wait_sec:.1f}s ...")
     node.buf.pop("mid_cloud", None)
     node.buf.pop("odin_map", None)
     t0 = time.time()
@@ -265,9 +334,8 @@ def run_icp(
         raise RuntimeError("too few points after voxel filter")
 
     T_delta, med, mean = icp_se3(Po, Pm, iters=40, trim=0.55)
-    R_delta = T_delta[:3, :3]
-    t_delta = T_delta[:3, 3]
-    print("\nICP residual T_delta (Odin_in_map → Mid cloud_registered):")
+    R_delta, t_delta = T_delta[:3, :3], T_delta[:3, 3]
+    print("\nICP residual T_delta (Odin_in_map → Mid):")
     print("  t_mm", np.round(t_delta * 1000, 2).tolist())
     print("  rpy_deg", np.round(rpy_deg(R_delta), 4).tolist())
     print("  |R_delta|_deg", round(rot_angle_deg(np.eye(3), R_delta), 4))
@@ -275,22 +343,22 @@ def run_icp(
 
     R_new = R_delta @ R_l2_old
     print_R("Suggested R_L2_new = R_delta @ R_L2_old", R_new)
-    print(
-        "\nvs old L2: ΔR_deg =",
-        round(rot_angle_deg(R_l2_old, R_new), 4),
-        " old rpy",
-        np.round(rpy_deg(R_l2_old), 3).tolist(),
-    )
     return R_delta, R_new
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
+        "--ref",
+        choices=("mid", "go2"),
+        default="mid",
+        help="attitude reference: mid (default) or go2 body IMU",
+    )
+    ap.add_argument(
         "--mode",
         choices=("gravity", "icp", "both"),
         default="both",
-        help="measurement mode (default: both)",
+        help="mid: gravity|icp|both; go2: only gravity (icp ignored)",
     )
     ap.add_argument(
         "--l2-rpy-deg",
@@ -298,39 +366,48 @@ def main() -> int:
         type=float,
         metavar=("ROLL", "PITCH", "YAW"),
         default=[0.0, -13.0, 0.0],
-        help="current extrinsic_R_L2_wrt_L1 as RPY ZYX degrees (default: 0 -13 0)",
+        help="current L2 RPY deg for ICP compose (mid only)",
     )
     ap.add_argument("--collect-sec", type=float, default=3.0)
     ap.add_argument("--icp-wait-sec", type=float, default=6.0)
     args = ap.parse_args()
 
+    if args.ref == "go2" and args.mode in ("icp", "both"):
+        print("[warn] --ref go2: ICP against Mid map skipped; running gravity only.")
+        args.mode = "gravity"
+
     R_l2_old = rpy_deg_to_R(*args.l2_rpy_deg)
-    print("Current L2 RPY deg (input):", args.l2_rpy_deg)
-    print_R("R_L2_old", R_l2_old)
+    if args.ref == "mid":
+        print("Current L2 RPY deg (input):", args.l2_rpy_deg)
+        print_R("R_L2_old", R_l2_old)
 
     rclpy.init()
-    node = MeasureNode()
+    node = MeasureNode(args.ref)
     try:
-        R_grav: Optional[np.ndarray] = None
-        if args.mode in ("gravity", "both"):
-            R_grav = run_gravity(node, collect_sec=args.collect_sec)
-            print(
-                "\nGravity vs CAD/old L2 ΔR_deg =",
-                round(rot_angle_deg(R_l2_old, R_grav), 4),
-            )
-
-        if args.mode in ("icp", "both"):
-            _, R_new = run_icp(node, R_l2_old, wait_sec=args.icp_wait_sec)
-            if R_grav is not None:
-                print(
-                    "\nICP-suggested vs gravity ΔR_deg =",
-                    round(rot_angle_deg(R_grav, R_new), 4),
-                )
-            print(
-                "\n>>> Paste into mid360_odin1.yaml / launch (attitude only; keep T):"
-            )
-            flat = ", ".join(f"{v:.8f}" for v in R_new.reshape(-1))
+        if args.ref == "go2":
+            R_go2 = run_gravity_go2(node, args.collect_sec)
+            R_l2 = R_GO2IMU_MIDL.T @ R_go2
+            print("\n>>> Optional paste for Mid L2 R (derived via official Mid@Go2):")
+            flat = ", ".join(f"{v:.8f}" for v in R_l2.reshape(-1))
             print(f"extrinsic_R_L2_wrt_L1: [{flat}]")
+        else:
+            R_grav = None
+            if args.mode in ("gravity", "both"):
+                R_grav = run_gravity_mid(node, args.collect_sec)
+                print(
+                    "\nGravity vs old L2 ΔR_deg =",
+                    round(rot_angle_deg(R_l2_old, R_grav), 4),
+                )
+            if args.mode in ("icp", "both"):
+                _, R_new = run_icp(node, R_l2_old, args.icp_wait_sec)
+                if R_grav is not None:
+                    print(
+                        "\nICP vs gravity ΔR_deg =",
+                        round(rot_angle_deg(R_grav, R_new), 4),
+                    )
+                flat = ", ".join(f"{v:.8f}" for v in R_new.reshape(-1))
+                print("\n>>> Paste into yaml/launch (attitude only):")
+                print(f"extrinsic_R_L2_wrt_L1: [{flat}]")
     finally:
         node.destroy_node()
         rclpy.shutdown()
