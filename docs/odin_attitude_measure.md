@@ -278,6 +278,17 @@ python3 /home/ll/3dnavigation/docs/scripts/measure_odin_attitude.py --ref mid --
 
 ---
 
+## 5.1 Mid360+Odin1 融合累积图（2026-11-06）
+
+`dual_lidar_color_viz` 对 mid360+odin1 使用 `odin_mode=off`（只累积 Mid→`/viz/accum_mid360`）。
+Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_odin_frame_fuse`：
+
+- 体素累积 Odin → `/viz/accum_odin`
+- 与 Mid 累积合并 → `/viz/accum_fused`
+- 当前帧合并 → `/cloud_fused`
+
+`/Laser_map` 仍只有 Mid（`multi_lidar: false`），这是 IEKF 开关，不是可视化融合。
+
 ## 6. 注意
 
 1. **Yaw**：重力法测不准相对航向；`--ref mid` 时用 ICP 补小 yaw。  

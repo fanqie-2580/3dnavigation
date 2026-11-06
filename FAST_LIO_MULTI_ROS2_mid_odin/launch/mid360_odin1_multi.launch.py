@@ -33,7 +33,7 @@ def generate_launch_description():
     enable_color_viz_arg = DeclareLaunchArgument(
         'enable_color_viz',
         default_value='true',
-        description='Mid360 independent accum (/viz/accum_mid360)',
+        description='Mid360-only accum (/viz/accum_mid360); Odin accum is in frame_fuse',
     )
     enable_ct_lio_arg = DeclareLaunchArgument(
         'enable_ct_lio',
@@ -53,12 +53,12 @@ def generate_launch_description():
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
         default_value='true',
-        description='Fuse Mid + Odin-in-map into /cloud_fused',
+        description='Fuse Mid + Odin-in-map into /cloud_fused and /viz/accum_fused',
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
         default_value='0.08',
-        description='Unused when CT-LIO owns Laser_map; kept for compatibility',
+        description='Voxel size for Odin accum inside mid_odin_frame_fuse',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -238,6 +238,8 @@ def generate_launch_description():
             )
 
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
+            # Mid360+Odin1: timed project → /odin1/cloud_in_map; color_viz is Mid-only
+            # (odin_mode=off), so frame_fuse must voxel-accum Odin itself.
             odin_scan = '/odin1/cloud_in_map' if use_timed else '/odin1/cloud_in_odom'
             nodes.append(
                 Node(
@@ -253,6 +255,12 @@ def generate_launch_description():
                         'map_frame': 'map',
                         'odin_frame': 'odin_map',
                         'odin_already_in_map': use_timed,
+                        'accumulate_odin_from_scan': True,
+                        'voxel_size': float(
+                            context.launch_configurations.get('odin_voxel', '0.08')
+                        ),
+                        'max_accum_points': 400000,
+                        'accum_skip_sec': 2.0,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],

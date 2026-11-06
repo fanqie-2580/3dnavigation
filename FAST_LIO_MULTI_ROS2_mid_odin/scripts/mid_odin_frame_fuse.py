@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Fuse Mid + Odin without crossing clock domains (fixes mode0 fan root cause).
+"""Fuse Mid360 + Odin1 into map-frame scan / accum (mid360_odin1 path).
 
-Bad (mode0 fan):
-  Odin cloud_raw(stamp=device) × Mid /Odometry(stamp=ROS)  → wrong pose on turn
+Mid360 FAST-LIO already publishes map-fixed /cloud_registered and (via
+dual_lidar_color_viz) /viz/accum_mid360.
 
-Good (this node):
-  Mid points already in map (FAST-LIO clock)
-  Odin points already in odin_map (Odin clock / cloud_slam or Odin-odom×raw)
-  Transform Odin → map via TF map→odin_map (extrinsic lock), then merge
+Odin1 with enable_odin_timed goes through odin_mid_timed_project →
+/odin1/cloud_in_map (already in map). color_viz intentionally runs
+odin_mode=off so it does NOT own Odin accum; this node therefore:
 
-Never multiplies Odin points by Mid odometry.
+  - merges current-frame Mid + Odin → /cloud_fused
+  - voxel-accumulates Odin from odin_scan_topic → /viz/accum_odin
+  - merges Mid accum + Odin accum → /viz/accum_fused
+
+Never multiplies Odin by Mid odometry (that caused mode0 fan).
 """
 from __future__ import annotations
 
 import math
 import struct
-from typing import Optional
+import time
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -72,31 +76,76 @@ def tf_to_mat(tf) -> np.ndarray:
     return T
 
 
+class VoxelAccum:
+    """Simple voxel grid accumulator (same idea as dual_lidar_color_viz)."""
+
+    def __init__(self, voxel: float, max_points: int) -> None:
+        self.voxel = max(1e-3, float(voxel))
+        self.max_points = max(1000, int(max_points))
+        self._grid: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+    def clear(self) -> None:
+        self._grid.clear()
+
+    def __len__(self) -> int:
+        return len(self._grid)
+
+    def add(self, pts: np.ndarray) -> bool:
+        if pts is None or pts.size == 0:
+            return False
+        inv = 1.0 / self.voxel
+        changed = False
+        for p in pts:
+            key = (int(math.floor(p[0] * inv)), int(math.floor(p[1] * inv)), int(math.floor(p[2] * inv)))
+            if key not in self._grid:
+                if len(self._grid) >= self.max_points:
+                    continue
+                self._grid[key] = p.astype(np.float64, copy=False)
+                changed = True
+        return changed
+
+    def numpy(self) -> np.ndarray:
+        if not self._grid:
+            return np.zeros((0, 3), dtype=np.float64)
+        return np.vstack(list(self._grid.values()))
+
+
 class MidOdinFrameFuse(Node):
     def __init__(self) -> None:
         super().__init__('mid_odin_frame_fuse')
         self.declare_parameter('mid_scan_topic', '/cloud_registered')
-        self.declare_parameter('odin_scan_topic', '/odin1/cloud_in_odom')
+        self.declare_parameter('odin_scan_topic', '/odin1/cloud_in_map')
         self.declare_parameter('mid_accum_topic', '/viz/accum_mid360')
         self.declare_parameter('odin_accum_topic', '/viz/accum_odin')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odin_frame', 'odin_map')
-        # true: Odin scan/accum already in map (e.g. odin_mid_timed_project)
-        self.declare_parameter('odin_already_in_map', False)
+        # true: Odin scan already in map (odin_mid_timed_project for mid360+odin1)
+        self.declare_parameter('odin_already_in_map', True)
+        # Build Odin voxel accum from odin_scan (needed when color_viz odin_mode=off).
+        self.declare_parameter('accumulate_odin_from_scan', True)
+        self.declare_parameter('voxel_size', 0.08)
+        self.declare_parameter('max_accum_points', 400000)
+        self.declare_parameter('accum_skip_sec', 2.0)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
 
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.odin_frame = str(self.get_parameter('odin_frame').value)
         self.odin_already_in_map = bool(self.get_parameter('odin_already_in_map').value)
+        self.accumulate_odin = bool(self.get_parameter('accumulate_odin_from_scan').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
+        self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
+        voxel = float(self.get_parameter('voxel_size').value)
+        max_n = int(self.get_parameter('max_accum_points').value)
 
         self._mid_scan: Optional[np.ndarray] = None
         self._odin_scan: Optional[np.ndarray] = None
         self._mid_accum: Optional[np.ndarray] = None
-        self._odin_accum: Optional[np.ndarray] = None
+        self._odin_accum_ext: Optional[np.ndarray] = None
         self._stamp_scan = None
-        self._stamp_accum = None
+        self._t0 = time.time()
+        self._odin_voxel = VoxelAccum(voxel, max_n)
+        self._dirty_odin = False
 
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
@@ -105,8 +154,10 @@ class MidOdinFrameFuse(Node):
 
         self.pub_scan = self.create_publisher(PointCloud2, '/cloud_fused', 5)
         self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
+        self.pub_accum_odin = self.create_publisher(
+            PointCloud2, str(self.get_parameter('odin_accum_topic').value), 1
+        )
 
-        # Match lidar publishers (BEST_EFFORT); Reliable here drops /odin1/cloud_in_map.
         self.create_subscription(
             PointCloud2,
             self.get_parameter('mid_scan_topic').value,
@@ -122,16 +173,25 @@ class MidOdinFrameFuse(Node):
         self.create_subscription(
             PointCloud2, self.get_parameter('mid_accum_topic').value, self.on_mid_accum, 1
         )
-        self.create_subscription(
-            PointCloud2, self.get_parameter('odin_accum_topic').value, self.on_odin_accum, 1
-        )
+        # External Odin accum only when we are NOT the publisher (avoid self-echo).
+        if not self.accumulate_odin:
+            self.create_subscription(
+                PointCloud2,
+                self.get_parameter('odin_accum_topic').value,
+                self.on_odin_accum_ext,
+                1,
+            )
         period = float(self.get_parameter('accum_period').value)
         self.create_timer(max(0.2, period), self.publish_accum)
 
         mode = 'already-in-map' if self.odin_already_in_map else 'TF(map←odin_map)'
         self.get_logger().info(
-            f'Frame fuse: Mid(map) + Odin via {mode}'
+            f'Frame fuse Mid360+Odin1: Mid(map) + Odin via {mode}; '
+            f'odin_scan_accum={self.accumulate_odin} voxel={voxel}'
         )
+
+    def _accum_ready(self) -> bool:
+        return (time.time() - self._t0) >= self.accum_skip_sec
 
     def _lookup_T(self) -> Optional[np.ndarray]:
         try:
@@ -159,19 +219,26 @@ class MidOdinFrameFuse(Node):
         self._publish_scan()
 
     def on_odin_scan(self, msg: PointCloud2) -> None:
-        self._odin_scan = xyz_from_msg(msg, self.stride)
+        pts = xyz_from_msg(msg, self.stride)
+        self._odin_scan = pts
         if self._stamp_scan is None:
             self._stamp_scan = msg.header.stamp
         self._publish_scan()
 
+        if not self.accumulate_odin or not self._accum_ready():
+            return
+        odin_m = self._odin_to_map(pts)
+        if odin_m is None:
+            return
+        if self._odin_voxel.add(odin_m):
+            self._dirty_odin = True
+
     def on_mid_accum(self, msg: PointCloud2) -> None:
         self._mid_accum = xyz_from_msg(msg, 1)
-        self._stamp_accum = msg.header.stamp
 
-    def on_odin_accum(self, msg: PointCloud2) -> None:
-        self._odin_accum = xyz_from_msg(msg, 1)
-        if self._stamp_accum is None:
-            self._stamp_accum = msg.header.stamp
+    def on_odin_accum_ext(self, msg: PointCloud2) -> None:
+        # Ignore our own republish echo if DDS loops; size check is enough for now.
+        self._odin_accum_ext = xyz_from_msg(msg, 1)
 
     def _publish_scan(self) -> None:
         parts = []
@@ -188,19 +255,33 @@ class MidOdinFrameFuse(Node):
         h.frame_id = self.map_frame
         self.pub_scan.publish(make_cloud(h, fused))
 
+    def _odin_accum_cloud(self) -> Optional[np.ndarray]:
+        # Prefer local voxel from timed-project scans (mid360+odin1 default).
+        if self.accumulate_odin and len(self._odin_voxel):
+            return self._odin_voxel.numpy()
+        if self._odin_accum_ext is not None and self._odin_accum_ext.size:
+            return self._odin_to_map(self._odin_accum_ext)
+        return None
+
     def publish_accum(self) -> None:
+        odin_m = self._odin_accum_cloud()
+        stamp = self.get_clock().now().to_msg()
+        h = Header()
+        h.stamp = stamp
+        h.frame_id = self.map_frame
+
+        if self.accumulate_odin and odin_m is not None and odin_m.size:
+            self.pub_accum_odin.publish(make_cloud(h, odin_m))
+            self._dirty_odin = False
+
         parts = []
         if self._mid_accum is not None and self._mid_accum.size:
             parts.append(self._mid_accum)
-        odin_m = self._odin_to_map(self._odin_accum) if self._odin_accum is not None else None
         if odin_m is not None and odin_m.size:
             parts.append(odin_m)
         if not parts:
             return
         fused = np.vstack(parts) if len(parts) > 1 else parts[0]
-        h = Header()
-        h.stamp = self.get_clock().now().to_msg()
-        h.frame_id = self.map_frame
         self.pub_accum.publish(make_cloud(h, fused))
 
 
