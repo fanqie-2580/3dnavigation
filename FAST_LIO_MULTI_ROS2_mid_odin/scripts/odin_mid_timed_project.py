@@ -83,18 +83,22 @@ class OdinMidTimedProject(Node):
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
         self.declare_parameter('min_confidence', 30.0)
-        # Odin raw ≈ gravity-level; strip Mid pitch/roll from body TF.
-        self.declare_parameter('use_yaw_only_body', True)
+        # Full Mid body TF; L2 carries live gravity+ICP pitch (~-10.15°).
+        self.declare_parameter('use_yaw_only_body', False)
         # Mid IMU(body) → Mid lidar, Odin lidar in Mid lidar (same as mid360_odin1.yaml)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
         self.declare_parameter(
             'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.12157888, 0.00549610, 0.03169932])
-        # Pure Rz(-6.5°) with yaw-only body (no Mid mount pitch in L2).
+        # Live gravity+ICP: rpy≈[-0.28,-10.15,-0.13] deg (CAD translation kept).
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
-            [0.99357186, 0.11320321, 0.0, -0.11320321, 0.99357186, 0.0, 0.0, 0.0, 1.0],
+            [
+                0.98434257, 0.00309114, -0.17623892,
+                -0.00219007, 0.99998352, 0.00530702,
+                0.17625242, -0.00483795, 0.98433311,
+            ],
         )
 
         self.map_frame = str(self.get_parameter('map_frame').value)
