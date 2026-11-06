@@ -190,11 +190,11 @@ def generate_launch_description():
                         # Odin cloud_raw ≈ gravity-level: strip Mid body pitch/roll so walls
                         # do not co-rotate/tip when the dog yaws. L2 R stays Identity.
                         'use_yaw_only_body': True,
-                        # CAD translation MidL→OdinL; R=I with yaw-only body
+                        # CAD translation MidL→OdinL; yaw-only body + live wall yaw fit Rz(-6.5°)
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            1.0, 0.0, 0.0,
-                            0.0, 1.0, 0.0,
+                            0.99357186, 0.11320321, 0.0,
+                            -0.11320321, 0.99357186, 0.0,
                             0.0, 0.0, 1.0,
                         ],
                     }],
@@ -222,8 +222,8 @@ def generate_launch_description():
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            1.0, 0.0, 0.0,
-                            0.0, 1.0, 0.0,
+                            0.99357186, 0.11320321, 0.0,
+                            -0.11320321, 0.99357186, 0.0,
                             0.0, 0.0, 1.0,
                         ],
                         'stride': 2,
