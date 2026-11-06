@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start Odin ROS1 driver + TCP bridge on Go2 dock (survives SSH disconnect)
+# Start Odin ROS1 driver + TCP bridge on Go2 dock (survives SSH disconnect).
+# Fusion path: mode0 + /odin1/cloud_raw + TCP cloud drop-old.
 set -eo pipefail
 DOCK=unitree@192.168.123.18
 PASS=123
@@ -18,6 +19,21 @@ pkill -f 'roslaunch .*odin1_ros1' 2>/dev/null || true
 pkill -f odin1_ros1.launch 2>/dev/null || true
 sleep 1
 
+# Force mode0 so /odin1/cloud_raw is sensor-frame (not cloud_slam/odom).
+for cfg in \
+  /home/unitree/ws_odin/src/odin_ros_driver/config/control_command.yaml \
+  /home/unitree/ws_odin/devel/share/odin_ros_driver/config/control_command.yaml
+do
+  if [[ -f "$cfg" ]]; then
+    if grep -q 'custom_map_mode:' "$cfg"; then
+      sed -i 's/custom_map_mode:[[:space:]]*[0-9]/custom_map_mode: 0/' "$cfg"
+    else
+      echo "  custom_map_mode: 0" >> "$cfg"
+    fi
+    echo "[dock] $cfg -> $(grep -E 'custom_map_mode' "$cfg" | head -1)"
+  fi
+done
+
 cat > /home/unitree/odin_bridge/start_all.sh <<'INNER'
 #!/usr/bin/env bash
 set -eo pipefail
@@ -29,7 +45,6 @@ LAUNCH=/home/unitree/ws_odin/src/odin_ros_driver/launch_ROS1/odin1_ros1.launch
 LOGDIR=/home/unitree/odin_bridge/logs
 mkdir -p "$LOGDIR"
 
-# kill stale master if any
 killall -q roscore rosmaster 2>/dev/null || true
 sleep 1
 
@@ -37,7 +52,9 @@ setsid roslaunch "$LAUNCH" > "$LOGDIR/odin_driver.log" 2>&1 < /dev/null &
 echo $! > /home/unitree/odin_bridge/odin_driver.pid
 sleep 6
 
+# Fusion: raw cloud + drop-old TCP (see odin_ros1_tcp_server.py).
 setsid python3 /home/unitree/odin_bridge/odin_ros1_tcp_server.py \
+  _cloud_topic:=/odin1/cloud_raw \
   > "$LOGDIR/tcp_server.log" 2>&1 < /dev/null &
 echo $! > /home/unitree/odin_bridge/tcp_server.pid
 INNER
@@ -54,6 +71,7 @@ pgrep -a odin_ros1_tcp_server | head -2 || echo 'NO tcp_server'
 ss -ltn | grep 5601 || echo 'NO listen 5601'
 timeout 3 rostopic hz /odin1/imu 2>&1 | head -4 || true
 timeout 3 rostopic hz /odin1/cloud_raw 2>&1 | head -4 || true
+grep -E 'custom_map_mode|bridge |cloud=drop' /home/unitree/odin_bridge/logs/tcp_server.log | tail -5 || true
 tail -5 /home/unitree/odin_bridge/logs/tcp_server.log || true
 echo DOCK_BRIDGE_OK
 EOF

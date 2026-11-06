@@ -108,6 +108,8 @@ def generate_launch_description():
                     'odom_topic': '/Odometry',
                     'odin_odom_topic': '/odin1/odometry',
                     'odin_odom_max_dt': 1.0,
+                    'mid_restamp_max_dt': 0.15,
+                    'max_cloud_age_sec': 0.35,
                     'fallback_period': 0.1,
                 }],
             )
@@ -208,9 +210,10 @@ def generate_launch_description():
                         'odin_odom_topic': '/odin1/odometry',
                         'map_frame': 'map',
                         'body_frame': 'body',
-                        # Exact Mid-/Odometry pairing (no TF interp). Output stamp == Mid stamp.
-                        'mid_pair_max_dt': 0.05,
-                        'odin_pair_max_dt': 0.05,
+                        # Exact Mid pairing. 0.15s: host_receive Odin stamps vs Mid capture lag.
+                        'mid_pair_max_dt': 0.15,
+                        'odin_pair_max_dt': 0.15,
+                        'max_cloud_age_sec': 0.35,
                         'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
                         'stride': 2,
@@ -290,6 +293,8 @@ def generate_launch_description():
                         ),
                         'max_accum_points': 400000,
                         'accum_skip_sec': 2.0,
+                        'accum_gyr_gate': 0.35,
+                        'max_scan_age_sec': 0.35,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],

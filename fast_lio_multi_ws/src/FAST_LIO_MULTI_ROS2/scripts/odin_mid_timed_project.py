@@ -93,6 +93,8 @@ class OdinMidTimedProject(Node):
         # Pose + Odin-odom + output stamp all use the *same* Mid /Odometry time.
         self.declare_parameter('mid_pair_max_dt', 0.05)
         self.declare_parameter('odin_pair_max_dt', 0.05)
+        # Drop clouds older than this relative to newest Mid odom (live viz freshness).
+        self.declare_parameter('max_cloud_age_sec', 0.35)
         self.declare_parameter('cloud_buffer_sec', 8.0)
         self.declare_parameter('odom_buffer_sec', 10.0)
         self.declare_parameter('stride', 2)
@@ -122,6 +124,7 @@ class OdinMidTimedProject(Node):
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.mid_pair_max_dt = float(self.get_parameter('mid_pair_max_dt').value)
         self.odin_pair_max_dt = float(self.get_parameter('odin_pair_max_dt').value)
+        self.max_cloud_age_sec = float(self.get_parameter('max_cloud_age_sec').value)
         self.cloud_buffer_sec = float(self.get_parameter('cloud_buffer_sec').value)
         self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
@@ -159,6 +162,7 @@ class OdinMidTimedProject(Node):
         self._drop_mid = 0
         self._drop_odin = 0
         self._drop_empty = 0
+        self._drop_age = 0
         self._sum_dt_mid = 0.0
         self._sum_dt_odin = 0.0
 
@@ -181,7 +185,8 @@ class OdinMidTimedProject(Node):
             f'Odin→Mid-map EXACT-stamp project: {inn} → {out}, '
             f'mid_odom={mid_odom_topic} odin_odom={odin_odom_topic} '
             f'mid_dt<={self.mid_pair_max_dt:.3f}s odin_dt<={self.odin_pair_max_dt:.3f}s '
-            f'cloud_in_odom={self.cloud_in_odom_mode} (output stamp == Mid /Odometry stamp)'
+            f'max_age={self.max_cloud_age_sec:.2f}s cloud_in_odom={self.cloud_in_odom_mode} '
+            f'(output stamp == Mid /Odometry stamp)'
         )
 
     def _trim(self, buf: deque, newest_t: float, horizon: float) -> None:
@@ -189,14 +194,14 @@ class OdinMidTimedProject(Node):
             buf.popleft()
 
     def _stats(self) -> None:
-        total = self._ok + self._drop_mid + self._drop_odin + self._drop_empty
+        total = self._ok + self._drop_mid + self._drop_odin + self._drop_empty + self._drop_age
         if total == 0:
             return
         avg_mid = self._sum_dt_mid / self._ok if self._ok else 0.0
         avg_odin = self._sum_dt_odin / self._ok if self._ok else 0.0
         self.get_logger().info(
             f'timed_project ok={self._ok} drop_mid={self._drop_mid} '
-            f'drop_odin={self._drop_odin} empty={self._drop_empty} '
+            f'drop_odin={self._drop_odin} drop_age={self._drop_age} empty={self._drop_empty} '
             f'avg|dt_mid|={avg_mid * 1000:.1f}ms avg|dt_odin|={avg_odin * 1000:.1f}ms '
             f'buf_cloud={len(self._cloud_buf)} buf_mid={len(self._mid_odom)}'
         )
@@ -204,6 +209,7 @@ class OdinMidTimedProject(Node):
         self._drop_mid = 0
         self._drop_odin = 0
         self._drop_empty = 0
+        self._drop_age = 0
         self._sum_dt_mid = 0.0
         self._sum_dt_odin = 0.0
 
@@ -287,9 +293,15 @@ class OdinMidTimedProject(Node):
         # Process oldest clouds first so delayed frames still bind to historical Mid.
         pending = list(self._cloud_buf)
         self._cloud_buf.clear()
+        newest_mid = self._mid_odom[-1][0]
         for t_cloud, cloud_stamp, msg in pending:
             ckey = stamp_key(cloud_stamp)
             if ckey in self._used_cloud_keys:
+                continue
+
+            # Too old vs live Mid → would paint a delayed turn; drop.
+            if self.max_cloud_age_sec > 0.0 and (newest_mid - t_cloud) > self.max_cloud_age_sec:
+                self._drop_age += 1
                 continue
 
             mid = self._nearest_mid(t_cloud)

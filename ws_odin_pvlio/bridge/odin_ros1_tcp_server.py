@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""ROS1 (dock) -> TCP bridge for Odin /imu, /cloud_slam (or raw), /odometry.
+"""ROS1 (dock) -> TCP bridge for Odin /imu, cloud, /odometry.
 
-In custom_map_mode=1, prefer /odin1/cloud_slam (already in odom frame).
+Fusion default: /odin1/cloud_raw (sensor frame, smaller than cloud_slam).
+Nav/open3d may still pass ~cloud_topic:=/odin1/cloud_slam.
+
+Cloud path is drop-old (keep latest only) so a slow TCP client cannot
+build multi-second backlog — that backlog was painting Mid poses ~4s late.
 """
 from __future__ import print_function
-import queue
 import socket
 import struct
 import threading
@@ -89,46 +92,69 @@ def encode_odom(msg):
 
 
 class ClientHub(object):
-    def __init__(self):
+    """IMU/odom: small FIFO. Cloud: single slot (drop-old)."""
+
+    def __init__(self, light_queue_max=64):
         self._lock = threading.Lock()
         self._clients = []
-        self._q = queue.Queue(maxsize=500)
+        self._light = []  # list of packed imu/odom frames
+        self._light_max = int(light_queue_max)
+        self._cloud = None  # latest packed cloud or None
+        self._cv = threading.Condition(self._lock)
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._writer.start()
+        self._n_cloud_drop = 0
 
     def add(self, conn):
         with self._lock:
             self._clients.append(conn)
         print("[bridge-server] client +1 total=%d" % len(self._clients))
 
-    def enqueue(self, data, drop_old_same_type=None):
-        # drop_old_same_type unused; if full, drop oldest then put
-        try:
-            self._q.put_nowait(data)
-        except queue.Full:
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._q.put_nowait(data)
-            except queue.Full:
-                pass
+    def enqueue_light(self, data):
+        with self._cv:
+            self._light.append(data)
+            while len(self._light) > self._light_max:
+                self._light.pop(0)
+            self._cv.notify()
+
+    def enqueue_cloud(self, data):
+        with self._cv:
+            if self._cloud is not None:
+                self._n_cloud_drop += 1
+            self._cloud = data
+            self._cv.notify()
+
+    def _pop_batch(self):
+        with self._cv:
+            while not self._light and self._cloud is None and not rospy.is_shutdown():
+                self._cv.wait(timeout=0.5)
+            if rospy.is_shutdown():
+                return []
+            out = list(self._light)
+            self._light = []
+            if self._cloud is not None:
+                out.append(self._cloud)
+                self._cloud = None
+            return out
 
     def _write_loop(self):
+        last_report = time.time()
         while not rospy.is_shutdown():
-            try:
-                data = self._q.get(timeout=0.5)
-            except queue.Empty:
+            batch = self._pop_batch()
+            if not batch:
                 continue
             dead = []
             with self._lock:
                 clients = list(self._clients)
-            for c in clients:
-                try:
-                    c.sendall(data)
-                except Exception:
-                    dead.append(c)
+                drops = self._n_cloud_drop
+                self._n_cloud_drop = 0
+            for data in batch:
+                for c in clients:
+                    try:
+                        c.sendall(data)
+                    except Exception:
+                        if c not in dead:
+                            dead.append(c)
             if dead:
                 with self._lock:
                     for c in dead:
@@ -139,6 +165,10 @@ class ClientHub(object):
                         except Exception:
                             pass
                 print("[bridge-server] client -%d total=%d" % (len(dead), len(self._clients)))
+            now = time.time()
+            if drops and (now - last_report) > 2.0:
+                print("[bridge-server] cloud drop-old count=%d (keep latest only)" % drops)
+                last_report = now
 
 
 def accept_loop(sock, hub):
@@ -155,7 +185,6 @@ def accept_loop(sock, hub):
             time.sleep(0.5)
             continue
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # larger buffer helps bursty clouds
         try:
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
         except Exception:
@@ -168,33 +197,35 @@ def main():
     rospy.init_node("odin_ros1_tcp_server", anonymous=False)
     port = int(rospy.get_param("~port", DEFAULT_PORT))
     imu_topic = rospy.get_param("~imu_topic", "/odin1/imu")
-    # SLAM cloud is already in odom frame; raw lidar frame needs host-side transform
-    cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_slam")
+    # Fusion: raw sensor-frame cloud (smaller, correct for L2/unproject).
+    # Nav may override to /odin1/cloud_slam.
+    cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_raw")
     odom_topic = rospy.get_param("~odom_topic", "/odin1/odometry")
 
-    hub = ClientHub()
+    hub = ClientHub(light_queue_max=64)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", port))
     sock.listen(4)
     print("[bridge-server] listen 0.0.0.0:%d" % port)
-    print("[bridge-server] bridge %s + %s + %s" % (imu_topic, cloud_topic, odom_topic))
+    print("[bridge-server] bridge %s + %s + %s (cloud=drop-old)" % (imu_topic, cloud_topic, odom_topic))
 
     t = threading.Thread(target=accept_loop, args=(sock, hub), daemon=True)
     t.start()
 
     def on_imu(msg):
-        hub.enqueue(pack_frame(TYPE_IMU, encode_imu(msg)))
+        hub.enqueue_light(pack_frame(TYPE_IMU, encode_imu(msg)))
 
     def on_cloud(msg):
-        hub.enqueue(pack_frame(TYPE_CLOUD, encode_cloud(msg)))
+        hub.enqueue_cloud(pack_frame(TYPE_CLOUD, encode_cloud(msg)))
 
     def on_odom(msg):
-        hub.enqueue(pack_frame(TYPE_ODOM, encode_odom(msg)))
+        hub.enqueue_light(pack_frame(TYPE_ODOM, encode_odom(msg)))
 
-    rospy.Subscriber(imu_topic, Imu, on_imu, queue_size=200)
-    rospy.Subscriber(cloud_topic, PointCloud2, on_cloud, queue_size=2)
-    rospy.Subscriber(odom_topic, Odometry, on_odom, queue_size=50)
+    # queue_size=1 on cloud: ROS also drop-old at subscribe side
+    rospy.Subscriber(imu_topic, Imu, on_imu, queue_size=50)
+    rospy.Subscriber(cloud_topic, PointCloud2, on_cloud, queue_size=1)
+    rospy.Subscriber(odom_topic, Odometry, on_odom, queue_size=20)
     rospy.spin()
     sock.close()
 

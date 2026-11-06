@@ -130,6 +130,9 @@ class MidOdinFrameFuse(Node):
         # Skip Odin voxel accum while Mid yaw rate (from /Odometry pose delta) is high.
         self.declare_parameter('mid_odom_topic', '/Odometry')
         self.declare_parameter('accum_gyr_gate', 0.35)
+        # Do not voxel-add Odin scans older than this (host_now - stamp).
+        # Prevents delayed turn catch-up from staining /viz/accum_odin.
+        self.declare_parameter('max_scan_age_sec', 0.35)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
 
@@ -140,6 +143,7 @@ class MidOdinFrameFuse(Node):
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
         self.accum_gyr_gate = float(self.get_parameter('accum_gyr_gate').value)
+        self.max_scan_age_sec = float(self.get_parameter('max_scan_age_sec').value)
         self._mid_gyr_norm = 0.0
         self._prev_mid_yaw: Optional[float] = None
         self._prev_mid_t: Optional[float] = None
@@ -202,7 +206,7 @@ class MidOdinFrameFuse(Node):
         self.get_logger().info(
             f'Frame fuse Mid360+Odin1: Mid(map) + Odin via {mode}; '
             f'odin_scan_accum={self.accumulate_odin} voxel={voxel} '
-            f'accum_gyr_gate={self.accum_gyr_gate}'
+            f'accum_gyr_gate={self.accum_gyr_gate} max_scan_age={self.max_scan_age_sec:.2f}s'
         )
 
     def _accum_ready(self) -> bool:
@@ -253,12 +257,26 @@ class MidOdinFrameFuse(Node):
 
     def on_odin_scan(self, msg: PointCloud2) -> None:
         pts = xyz_from_msg(msg, self.stride)
-        self._odin_scan = pts
-        if self._stamp_scan is None:
+        stamp_age = (
+            self.get_clock().now().nanoseconds * 1e-9
+            - (float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9)
+        )
+        # Live fuse display: only keep fresh Odin scans (stale = delayed turn replay).
+        if self.max_scan_age_sec <= 0.0 or stamp_age <= self.max_scan_age_sec:
+            self._odin_scan = pts
+            if self._stamp_scan is None:
+                self._stamp_scan = msg.header.stamp
+            self._publish_scan()
+        elif self._odin_scan is None:
+            # First frames may race clocks; still publish once.
+            self._odin_scan = pts
             self._stamp_scan = msg.header.stamp
-        self._publish_scan()
+            self._publish_scan()
 
         if not self.accumulate_odin or not self._accum_ready():
+            return
+        # Stale stamp: Mid may already be still while this cloud is mid-turn → skip.
+        if self.max_scan_age_sec > 0.0 and stamp_age > self.max_scan_age_sec:
             return
         # Turning: Mid pose / Odin association is least reliable — skip voxel add.
         if self._mid_gyr_norm >= self.accum_gyr_gate:

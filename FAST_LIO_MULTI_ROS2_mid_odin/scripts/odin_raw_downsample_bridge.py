@@ -6,10 +6,12 @@ Pipeline:
      unproject to lidar frame with /odin1/odometry * T_imu_L.
   2) Confidence filter when field exists.
   3) Voxel downsample; keep offset_time (s) when present (else 0).
-  4) Prefer Mid /Odometry stamp when available; else keep cloud stamp.
+  4) Restamp only to a Mid /Odometry stamp within mid_restamp_max_dt of the
+     *cloud* stamp (never latest Mid while geometry is seconds old).
      Always enforce monotonic stamps to avoid L2 "loop back".
   5) Rate-limit ~one cloud per Mid odom tick when Mid odom is flowing;
      otherwise publish every Nth input (~10 Hz).
+  6) Drop clouds older than max_cloud_age_sec vs newest Mid (stale TCP backlog).
 """
 from __future__ import annotations
 
@@ -140,6 +142,9 @@ class OdinRawDownsampleBridge(Node):
         self.declare_parameter('odom_topic', '/Odometry')
         self.declare_parameter('odin_odom_topic', '/odin1/odometry')
         self.declare_parameter('odin_odom_max_dt', 1.0)
+        # Only restamp when |t_cloud - t_mid| <= this (matched historical Mid).
+        self.declare_parameter('mid_restamp_max_dt', 0.05)
+        self.declare_parameter('max_cloud_age_sec', 0.35)
         self.declare_parameter('fallback_period', 0.1)
         # Official Odin IMU→lidar (wiki), R≈I.
         self.declare_parameter('extrinsic_T_imu_L', [-0.02663, 0.03447, 0.02174])
@@ -150,6 +155,8 @@ class OdinRawDownsampleBridge(Node):
         self.restamp_from_odom = bool(self.get_parameter('restamp_from_odom').value)
         self.one_cloud_per_odom = bool(self.get_parameter('one_cloud_per_odom').value)
         self.odin_odom_max_dt = float(self.get_parameter('odin_odom_max_dt').value)
+        self.mid_restamp_max_dt = float(self.get_parameter('mid_restamp_max_dt').value)
+        self.max_cloud_age_sec = float(self.get_parameter('max_cloud_age_sec').value)
         self.fallback_period = float(self.get_parameter('fallback_period').value)
         t_il = list(self.get_parameter('extrinsic_T_imu_L').value)
         self.T_imu_L = np.eye(4, dtype=np.float64)
@@ -163,6 +170,8 @@ class OdinRawDownsampleBridge(Node):
         self._last_pub_sec = -1.0
         self._pending: Optional[PointCloud2] = None
         self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
+        # (t_sec, stamp_msg)
+        self._mid_stamps: Deque[Tuple[float, object]] = deque(maxlen=500)
         self._warned_odom_cloud = False
         self._n_cloud = 0
         self._n_mid = 0
@@ -170,6 +179,7 @@ class OdinRawDownsampleBridge(Node):
         self._n_pub = 0
         self._n_skip_unproj = 0
         self._n_skip_empty = 0
+        self._n_skip_age = 0
 
         reliable = QoSProfile(
             depth=20,
@@ -190,15 +200,16 @@ class OdinRawDownsampleBridge(Node):
         self.get_logger().info(
             f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
             f'conf>={self.min_confidence} restamp={self.restamp_from_odom} '
+            f'mid_dt<={self.mid_restamp_max_dt:.3f}s max_age={self.max_cloud_age_sec:.2f}s '
             f'one_per_odom={self.one_cloud_per_odom} qos=RELIABLE '
-            f'(unproject odom-frame if needed; Mid-odom optional)'
+            f'(unproject odom-frame if needed; match Mid by cloud stamp)'
         )
 
     def _status(self) -> None:
         self.get_logger().info(
             f'stats cloud={self._n_cloud} odin_odom={self._n_odin} mid_odom={self._n_mid} '
             f'pub={self._n_pub} skip_unproj={self._n_skip_unproj} skip_empty={self._n_skip_empty} '
-            f'pending={"Y" if self._pending is not None else "N"}'
+            f'skip_age={self._n_skip_age} pending={"Y" if self._pending is not None else "N"}'
         )
 
     def on_odin_odom(self, msg: Odometry) -> None:
@@ -206,13 +217,26 @@ class OdinRawDownsampleBridge(Node):
         t = _stamp_sec(msg.header.stamp)
         self._odin_odom.append((t, _mat_from_odom(msg)))
 
+    def _nearest_mid_stamp(self, t_cloud: float):
+        best = None
+        best_dt = 1e9
+        for t, st in self._mid_stamps:
+            dt = abs(t - t_cloud)
+            if dt < best_dt:
+                best_dt = dt
+                best = (t, st, dt)
+        return best
+
     def on_mid_odom(self, msg: Odometry) -> None:
         self._n_mid += 1
         key = _stamp_key(msg.header.stamp)
+        t = _stamp_sec(msg.header.stamp)
         self._mid_odom_stamp = msg.header.stamp
         self._mid_odom_key = key
+        self._mid_stamps.append((t, msg.header.stamp))
         if self.one_cloud_per_odom and self._pending is not None and self._last_pub_key != key:
-            if self._publish_from_msg(self._pending, msg.header.stamp):
+            # Match Mid stamp to *pending cloud* time — not blindly latest Mid.
+            if self._publish_from_msg(self._pending, None):
                 self._last_pub_key = key
             self._pending = None
 
@@ -237,12 +261,18 @@ class OdinRawDownsampleBridge(Node):
 
     def cb(self, msg: PointCloud2) -> None:
         self._n_cloud += 1
+        t_cloud = _stamp_sec(msg.header.stamp)
+        if self._mid_stamps and self.max_cloud_age_sec > 0.0:
+            newest_mid = self._mid_stamps[-1][0]
+            if (newest_mid - t_cloud) > self.max_cloud_age_sec:
+                self._n_skip_age += 1
+                return
         # Prefer Mid-odom gated publish when Mid is alive; otherwise publish on a
         # fallback period so LIO can bootstrap without chicken-egg deadlock.
         if self.one_cloud_per_odom and self._mid_odom_stamp is not None:
             self._pending = msg
             if self._mid_odom_key is not None and self._last_pub_key != self._mid_odom_key:
-                if self._publish_from_msg(msg, self._mid_odom_stamp):
+                if self._publish_from_msg(msg, None):
                     self._last_pub_key = self._mid_odom_key
                 self._pending = None
             return
@@ -251,7 +281,6 @@ class OdinRawDownsampleBridge(Node):
         stamp = msg.header.stamp
         pub_sec = _stamp_sec(stamp)
         if self._last_pub_sec >= 0.0 and (pub_sec - self._last_pub_sec) < self.fallback_period:
-            # Also allow host-time spacing if cloud stamps are bursty.
             now_sec = self.get_clock().now().nanoseconds * 1e-9
             if (now_sec - self._last_pub_sec) < self.fallback_period:
                 self._pending = msg
@@ -260,6 +289,13 @@ class OdinRawDownsampleBridge(Node):
         self._publish_from_msg(msg, stamp)
 
     def _publish_from_msg(self, msg: PointCloud2, stamp) -> bool:
+        t_cloud = _stamp_sec(msg.header.stamp)
+        if self._mid_stamps and self.max_cloud_age_sec > 0.0:
+            newest_mid = self._mid_stamps[-1][0]
+            if (newest_mid - t_cloud) > self.max_cloud_age_sec:
+                self._n_skip_age += 1
+                return False
+
         arr = _unpack_points(msg, self.min_confidence)
         if arr.size == 0:
             self._n_skip_empty += 1
@@ -294,10 +330,15 @@ class OdinRawDownsampleBridge(Node):
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
 
+        # Match Mid by cloud stamp; never force latest Mid onto old geometry.
+        if stamp is None:
+            stamp = msg.header.stamp
+        if self.restamp_from_odom and self._mid_stamps:
+            mid = self._nearest_mid_stamp(t_cloud)
+            if mid is not None and mid[2] <= self.mid_restamp_max_dt:
+                stamp = mid[1]
+            # else keep cloud stamp (better than lying with latest Mid)
         pub_sec = _stamp_sec(stamp)
-        if self.restamp_from_odom and self._mid_odom_stamp is not None:
-            stamp = self._mid_odom_stamp
-            pub_sec = _stamp_sec(stamp)
         # Enforce monotonic stamps for L2 buffer.
         if pub_sec + 1e-6 < self._last_pub_sec:
             stamp = self.get_clock().now().to_msg()

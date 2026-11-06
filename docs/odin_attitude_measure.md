@@ -299,6 +299,11 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 - `min_confidence2: 30`
 - L2 外参：CAD 平移 + `Ry(-13°)`
 
+**传输/延迟（2026-11-06）**：坞桥默认传 `/odin1/cloud_raw`（mode0）且 TCP **cloud drop-old**；
+本机 client 对云用 `cloud_stamp_policy:=host_receive`（接收时刻打戳，消掉设备戳系统性落后）；
+`timed_project` / `frame_fuse` 对 stamp **age>0.35s** 不显示/不累积；
+L2 只允许与 cloud 戳 |dt|≤150ms 的 Mid 重打戳（禁止用最新 Mid 盖旧几何）。
+
 **紧耦合输入**：dock 常把 `cloud_slam`（odom 系）当作 `/odin1/cloud_raw`。必须经
 `odin_raw_downsample_bridge`：反投影→雷达系、体素、按 Mid `/Odometry` 重打戳 →
 `/odin1/cloud_raw_ds`。`laserMapping_adaptive` 已允许 Mid 先建图发 odom（不因等首帧
