@@ -187,15 +187,15 @@ def generate_launch_description():
                         'min_confidence': 30.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        # Full body attitude: L2 carries Ry(-13°) vs official Mid mount.
-                        'use_yaw_only_body': False,
-                        # CAD T_base_odinIMU + official Mid@Go2IMU + URDF + wiki T_imu_L
+                        # Odin cloud_raw ≈ gravity-level: strip Mid body pitch/roll so walls
+                        # do not co-rotate/tip when the dog yaws. L2 R stays Identity.
+                        'use_yaw_only_body': True,
+                        # CAD translation MidL→OdinL; R=I with yaw-only body
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
-                        # Live ICP+gravity attitude (rpy≈[-0.28,-10.15,-0.13] deg)
                         'extrinsic_R_L2_wrt_L1': [
-                            0.98434257, 0.00309114, -0.17623892,
-                            -0.00219007, 0.99998352, 0.00530702,
-                            0.17625242, -0.00483795, 0.98433311,
+                            1.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0,
+                            0.0, 0.0, 1.0,
                         ],
                     }],
                 )
@@ -222,9 +222,9 @@ def generate_launch_description():
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            0.98434257, 0.00309114, -0.17623892,
-                            -0.00219007, 0.99998352, 0.00530702,
-                            0.17625242, -0.00483795, 0.98433311,
+                            1.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0,
+                            0.0, 0.0, 1.0,
                         ],
                         'stride': 2,
                         'blind': 0.3,

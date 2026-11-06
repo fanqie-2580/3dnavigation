@@ -23,15 +23,15 @@
 | Odin L2 / Odin IMU | `/odin1/cloud_raw`；官方 `T_imu_L` 的 R=I |
 | `map` | Mid LIO 地图系 |
 
-投影链（timed project）：
+投影链（timed project，改 Go2-base 前一版）：
 
 ```text
-p_map = T_map_body * T_body_L1 * T_L1_L2 * p_odin
+p_map = yaw_only(T_map_body) * T_body_L1 * T_L1_L2 * p_odin
 ```
 
-其中 `T_L1_L2` 的旋转即要测的 `extrinsic_R_L2_wrt_L1`。
+`use_yaw_only_body=true`，`T_L1_L2` 平移用 CAD、**R=I**（不把 Mid 安装俯仰打进 L2，避免狗转身时墙跟着转）。
 
-官方 Mid 相对 Go2 机身 IMU 约有 **Ry(+13°)** 安装角；Odin 近水平时，L2 旋转大致接近 **Ry(-13°)**。实机再用重力 / ICP 精修。
+`--ref mid` 测的 `extrinsic_R_L2_wrt_L1` 仍可用于 full-body / ICP 实验路径。
 
 ---
 

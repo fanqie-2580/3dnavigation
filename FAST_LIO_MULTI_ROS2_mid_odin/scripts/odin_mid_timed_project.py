@@ -90,11 +90,11 @@ class OdinMidTimedProject(Node):
         self.declare_parameter(
             'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
-        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.055])
-        # Near-identity: do not bake Mid mount pitch into L2 when yaw-only body is on.
+        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.12157888, 0.00549610, 0.03169932])
+        # Identity with yaw-only body: do not bake Mid mount pitch into L2.
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
-            [0.97499445, -0.22222923, 0.0, 0.22222923, 0.97499445, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
 
         self.map_frame = str(self.get_parameter('map_frame').value)

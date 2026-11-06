@@ -68,11 +68,11 @@
       #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
-      # Live attitude 2026-11-06: gravity ~Ry(-13°) + ICP residual on /odin1/cloud_in_map
-      # vs /cloud_registered → rpy≈[-0.28°, -10.15°, -0.13°] (keep CAD translation)
-      extrinsic_R_L2_wrt_L1: [0.98434257, 0.00309114, -0.17623892,
-                             -0.00219007, 0.99998352, 0.00530702,
-                             0.17625242, -0.00483795, 0.98433311]
+      # With timed-project use_yaw_only_body=true, keep L2 R = I (Odin ≈ gravity-level).
+      # Do NOT bake Mid mount pitch into L2 or walls co-rotate when the dog yaws.
+      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0,
+                             0.0, 0.0, 1.0]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
