@@ -48,8 +48,10 @@
       det_range: 100.0
       extrinsic_est_en: false
       # true: Odin residuals update IEKF + ikdtree (tight coupling).
-      # Requires /odin1/cloud_raw_ds on host time + L2 extrinsic.
-      lidar2_update_en: true
+      # KEEP false while /odin1/cloud_raw is odom-frame cloud_slam (no offset_time):
+      # Odin L2 residuals pull Mid yaw on turns → Mid /cloud_registered smears.
+      # Re-enable only with mode0 lidar-frame raw + offset_time.
+      lidar2_update_en: false
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

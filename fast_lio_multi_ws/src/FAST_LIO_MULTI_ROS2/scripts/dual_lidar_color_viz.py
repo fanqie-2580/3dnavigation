@@ -303,10 +303,17 @@ class DualLidarColorViz(Node):
                 return T
         return None
 
-    def _xyz_stride(self, msg: PointCloud2, stride: int, blind2: float = 0.0) -> np.ndarray:
+    def _xyz_stride(
+        self,
+        msg: PointCloud2,
+        stride: int,
+        blind2: float = 0.0,
+        intensity_max: Optional[float] = None,
+    ) -> np.ndarray:
         offs = {f.name: f.offset for f in msg.fields}
         if not all(k in offs for k in ('x', 'y', 'z')):
             return np.zeros((0, 3), dtype=np.float64)
+        has_i = 'intensity' in offs
         pts: list[list[float]] = []
         n = msg.width * msg.height
         k = 0
@@ -315,6 +322,10 @@ class DualLidarColorViz(Node):
             x, y, z = struct.unpack_from('fff', msg.data, b + offs['x'])
             if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
                 continue
+            if intensity_max is not None and has_i:
+                inten = struct.unpack_from('f', msg.data, b + offs['intensity'])[0]
+                if inten >= intensity_max:
+                    continue
             if blind2 > 0.0 and (x * x + y * y + z * z) < blind2:
                 continue
             if (k % stride) == 0:
@@ -323,7 +334,8 @@ class DualLidarColorViz(Node):
         return np.asarray(pts, dtype=np.float64)
 
     def on_mid(self, msg: PointCloud2) -> None:
-        arr = self._xyz_stride(msg, self.mid_stride)
+        # Bundle/tight-coupling tags Odin as intensity>=100; keep Mid-only for accum.
+        arr = self._xyz_stride(msg, self.mid_stride, intensity_max=100.0)
         self._latest_mid = arr
         self.pub_mid.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)

@@ -287,7 +287,33 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 - 与 Mid 累积合并 → `/viz/accum_fused`
 - 当前帧合并 → `/cloud_fused`
 
-`/Laser_map` 仍只有 Mid（`multi_lidar: false`），这是 IEKF 开关，不是可视化融合。
+## 5.2 Mid360+Odin1 紧耦合（IEKF，2026-11-06）
+
+`mid360_odin1.yaml`：
+
+- `multi_lidar: true`
+- `lidar2_update_en: false`（**当前默认**；见下）
+- `lid_topic2: /odin1/cloud_raw_ds`
+- `min_confidence2: 30`
+- L2 外参：CAD 平移 + `Ry(-13°)`
+
+**2026-11-06 验证**：dock 仍把 `cloud_slam`（odom 系、无 `offset_time`）当作 `/odin1/cloud_raw`。
+此时若 `lidar2_update_en: true`，转身时 Odin 残差会拉偏 Mid yaw，`/viz/accum_mid360` 拖影。
+故默认关掉 L2→IEKF；Odin 仍走 `odin_mid_timed_project` + `mid_odin_frame_fuse` 可视化融合。
+`dual_lidar_color_viz` 对 Mid 累积额外过滤 `intensity < 100`，避免融合帧污染。
+
+链路（仅当 mode0 真 raw 时可开 `lidar2_update_en: true`）：
+
+```text
+/odin1/cloud_raw (雷达系 + offset_time)
+  → odin_raw_downsample_bridge（confidence 滤波、体素、按 Mid /Odometry 重打戳）
+  → /odin1/cloud_raw_ds
+  → laserMapping_adaptive L2 → IEKF + /Laser_map
+```
+
+预处理：`XYZ_ONLY` 读 Odin `offset_time`(s)→`curvature`(ms)，供 IMU 去畸变。
+
+要求：Odin 为 **mode0 雷达系 raw**（不要把 `cloud_slam`/odom 点云当 L2）；驱动建议 `use_host_ros_time=2`。
 
 ## 6. 注意
 
