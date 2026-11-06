@@ -292,32 +292,28 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 `mid360_odin1.yaml`：
 
 - `multi_lidar: true`
-- `lidar2_update_en: false`（**当前默认**；见下）
+- `lidar2_update_en: true`（**紧耦合**：Odin L2 残差更新 IEKF + ikdtree）
 - `lid_topic2: /odin1/cloud_raw_ds`
 - `min_confidence2: 30`
 - L2 外参：CAD 平移 + `Ry(-13°)`
 
-**2026-11-06 验证**：dock 仍把 `cloud_slam`（odom 系、无 `offset_time`）当作 `/odin1/cloud_raw`。
-此时若 `lidar2_update_en: true`，转身时 Odin 残差会拉偏 Mid yaw，`/viz/accum_mid360` 拖影。
-故默认关掉 L2→IEKF；Odin 仍走 `odin_mid_timed_project` + `mid_odin_frame_fuse` 可视化融合。
-`dual_lidar_color_viz` 对 Mid 累积额外过滤 `intensity < 100`，避免融合帧污染。
+**紧耦合输入**：dock 常把 `cloud_slam`（odom 系）当作 `/odin1/cloud_raw`。必须经
+`odin_raw_downsample_bridge`：反投影→雷达系、体素、按 Mid `/Odometry` 重打戳 →
+`/odin1/cloud_raw_ds`。`laserMapping_adaptive` 已允许 Mid 先建图发 odom（不因等首帧
+Odin 死锁）。可视化 Odin 另走 `odin_mid_timed_project`（EXACT Mid 戳）+
+`mid_odin_frame_fuse`；Mid 累积过滤 `intensity < 100`。
 
-**Odin 投影时间戳（2026-11-06）**：`odin_mid_timed_project` 不再用 Odin 戳插值 Mid TF。
-改为与 Mid `/Odometry` 严格配对（`|t_cloud−t_mid|≤50ms`），反投影/`T_map_body`/输出
-`header.stamp` **三者同用该 Mid odom 戳**；对不齐则丢弃，避免转身涂错位置。
-
-链路（仅当 mode0 真 raw 时可开 `lidar2_update_en: true`）：
+链路：
 
 ```text
-/odin1/cloud_raw (雷达系 + offset_time)
-  → odin_raw_downsample_bridge（confidence 滤波、体素、按 Mid /Odometry 重打戳）
+/odin1/cloud_raw (常为 cloud_slam/odom)
+  → odin_raw_downsample_bridge（unproject + voxel + Mid restamp）
   → /odin1/cloud_raw_ds
   → laserMapping_adaptive L2 → IEKF + /Laser_map
 ```
 
-预处理：`XYZ_ONLY` 读 Odin `offset_time`(s)→`curvature`(ms)，供 IMU 去畸变。
-
-要求：Odin 为 **mode0 雷达系 raw**（不要把 `cloud_slam`/odom 点云当 L2）；驱动建议 `use_host_ros_time=2`。
+预处理：`XYZ_ONLY` 读 `offset_time`(s)→`curvature`(ms)（真 raw 时）；cloud_slam 无逐点时间。
+更稳的紧耦合仍建议 Odin **mode0 雷达系 raw + offset_time**。
 
 ## 6. 注意
 
