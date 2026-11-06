@@ -1,27 +1,130 @@
 #!/usr/bin/env python3
-"""Voxel-downsample Odin1 /odin1/cloud_raw for FAST_LIO_MULTI second lidar input.
+"""Prepare Odin1 cloud for FAST_LIO_MULTI L2 (Mid360+Odin1 tight coupling).
 
-Preserves intensity (or fills 0) so PCL XYZI conversion does not warn.
-
-Odin TCP stamps are device uptime (~1e4), not ROS time. Restamp to the latest
-Mid /Odometry stamp (same clock as FAST-LIO) so fusion can time-align.
-
-Publish at most one downsampled cloud per Mid odom stamp. Odin is ~30 Hz while
-Mid odom is ~10 Hz; reusing the same stamp for several scans makes LIO/viz apply
-one pose to multiple body orientations → orange fan on yaw.
+Pipeline:
+  1) If frame_id is odom/map (dock often forwards cloud_slam as cloud_raw),
+     unproject to lidar frame with /odin1/odometry * T_imu_L.
+  2) Confidence filter when field exists.
+  3) Voxel downsample; keep offset_time (s) when present (else 0).
+  4) Prefer Mid /Odometry stamp when available; else keep cloud stamp.
+     Always enforce monotonic stamps to avoid L2 "loop back".
+  5) Rate-limit ~one cloud per Mid odom tick when Mid odom is flowing;
+     otherwise publish every Nth input (~10 Hz).
 """
 from __future__ import annotations
 
+import math
 import struct
-from typing import Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
-from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+
+
+def _field_map(msg: PointCloud2) -> Dict[str, PointField]:
+    return {f.name: f for f in msg.fields}
+
+
+def _stamp_key(stamp) -> Tuple[int, int]:
+    return (int(stamp.sec), int(stamp.nanosec))
+
+
+def _stamp_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def _mat_from_odom(msg: Odometry) -> np.ndarray:
+    p = msg.pose.pose.position
+    q = msg.pose.pose.orientation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    R = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = [p.x, p.y, p.z]
+    return T
+
+
+def _unpack_points(msg: PointCloud2, min_conf: float) -> np.ndarray:
+    """Nx5: x,y,z,intensity,offset_time_sec (vectorized)."""
+    fm = _field_map(msg)
+    if not all(k in fm for k in ('x', 'y', 'z')):
+        return np.zeros((0, 5), dtype=np.float32)
+
+    n = int(msg.width) * int(msg.height)
+    if n <= 0:
+        return np.zeros((0, 5), dtype=np.float32)
+    step = int(msg.point_step)
+    raw = np.frombuffer(msg.data, dtype=np.uint8)
+    if raw.size < n * step:
+        n = raw.size // step
+    if n <= 0:
+        return np.zeros((0, 5), dtype=np.float32)
+    arr = raw[: n * step].reshape(n, step)
+
+    def col_f32(name: str) -> np.ndarray:
+        o = fm[name].offset
+        return arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+
+    xyz = np.column_stack([col_f32('x'), col_f32('y'), col_f32('z')])
+    finite = np.isfinite(xyz).all(axis=1)
+
+    intensity = np.zeros(n, dtype=np.float32)
+    if 'intensity' in fm:
+        f = fm['intensity']
+        o = f.offset
+        if f.datatype == PointField.FLOAT32:
+            intensity = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+        elif f.datatype == PointField.UINT8:
+            intensity = arr[:, o].astype(np.float32)
+        elif f.datatype == PointField.UINT16:
+            intensity = arr[:, o : o + 2].copy().view(np.uint16).reshape(-1).astype(np.float32)
+
+    if 'confidence' in fm and min_conf > 0.0:
+        f = fm['confidence']
+        o = f.offset
+        if f.datatype == PointField.FLOAT32:
+            conf = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+        elif f.datatype == PointField.UINT16:
+            conf = arr[:, o : o + 2].copy().view(np.uint16).reshape(-1).astype(np.float32)
+        elif f.datatype == PointField.UINT8:
+            conf = arr[:, o].astype(np.float32)
+        else:
+            conf = np.full(n, 1e9, dtype=np.float32)
+        finite &= conf >= min_conf
+
+    offset_time = np.zeros(n, dtype=np.float32)
+    tname = next((k for k in ('offset_time', 'time', 't') if k in fm), None)
+    if tname is not None:
+        f = fm[tname]
+        o = f.offset
+        if f.datatype == PointField.FLOAT32:
+            offset_time = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+        elif f.datatype == PointField.UINT32:
+            offset_time = (
+                arr[:, o : o + 4].copy().view(np.uint32).reshape(-1).astype(np.float32) * 1e-9
+            )
+
+    xyz = xyz[finite]
+    intensity = intensity[finite]
+    offset_time = offset_time[finite]
+    if xyz.size == 0:
+        return np.zeros((0, 5), dtype=np.float32)
+    return np.column_stack([xyz, intensity, offset_time]).astype(np.float32)
 
 
 class OdinRawDownsampleBridge(Node):
@@ -31,76 +134,157 @@ class OdinRawDownsampleBridge(Node):
         self.declare_parameter('output_topic', '/odin1/cloud_raw_ds')
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_points', 20000)
+        self.declare_parameter('min_confidence', 30.0)
         self.declare_parameter('restamp_from_odom', True)
         self.declare_parameter('one_cloud_per_odom', True)
         self.declare_parameter('odom_topic', '/Odometry')
+        self.declare_parameter('odin_odom_topic', '/odin1/odometry')
+        self.declare_parameter('odin_odom_max_dt', 1.0)
+        self.declare_parameter('fallback_period', 0.1)
+        # Official Odin IMU→lidar (wiki), R≈I.
+        self.declare_parameter('extrinsic_T_imu_L', [-0.02663, 0.03447, 0.02174])
 
         self.voxel = float(self.get_parameter('voxel_size').value)
         self.max_points = int(self.get_parameter('max_points').value)
+        self.min_confidence = float(self.get_parameter('min_confidence').value)
         self.restamp_from_odom = bool(self.get_parameter('restamp_from_odom').value)
         self.one_cloud_per_odom = bool(self.get_parameter('one_cloud_per_odom').value)
+        self.odin_odom_max_dt = float(self.get_parameter('odin_odom_max_dt').value)
+        self.fallback_period = float(self.get_parameter('fallback_period').value)
+        t_il = list(self.get_parameter('extrinsic_T_imu_L').value)
+        self.T_imu_L = np.eye(4, dtype=np.float64)
+        self.T_imu_L[:3, 3] = np.asarray(t_il, dtype=np.float64).reshape(3)
+
         inn = self.get_parameter('input_topic').value
         out = self.get_parameter('output_topic').value
-        self._odom_stamp: Optional[object] = None
-        self._odom_stamp_key: Optional[Tuple[int, int]] = None
+        self._mid_odom_stamp = None
+        self._mid_odom_key: Optional[Tuple[int, int]] = None
         self._last_pub_key: Optional[Tuple[int, int]] = None
+        self._last_pub_sec = -1.0
         self._pending: Optional[PointCloud2] = None
+        self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
+        self._warned_odom_cloud = False
+        self._n_cloud = 0
+        self._n_mid = 0
+        self._n_odin = 0
+        self._n_pub = 0
+        self._n_skip_unproj = 0
+        self._n_skip_empty = 0
 
-        # Match FAST_LIO SensorDataQoS (BEST_EFFORT) so laserMapping always receives.
-        from rclpy.qos import qos_profile_sensor_data
-        self.pub = self.create_publisher(PointCloud2, out, qos_profile_sensor_data)
-        self.sub = self.create_subscription(PointCloud2, inn, self.cb, qos_profile_sensor_data)
-        if self.restamp_from_odom:
-            self.create_subscription(
-                Odometry, self.get_parameter('odom_topic').value, self.on_odom, 50
-            )
-        self.get_logger().info(
-            f'downsample {inn} -> {out} voxel={self.voxel}m max_points={self.max_points} '
-            f'restamp_from_odom={self.restamp_from_odom} '
-            f'one_cloud_per_odom={self.one_cloud_per_odom}'
+        reliable = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
         )
 
-    def on_odom(self, msg: Odometry) -> None:
-        key = (int(msg.header.stamp.sec), int(msg.header.stamp.nanosec))
-        self._odom_stamp = msg.header.stamp
-        self._odom_stamp_key = key
-        # Flush newest pending Odin scan exactly once per Mid odom tick.
+        self.pub = self.create_publisher(PointCloud2, out, reliable)
+        self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
+        self.create_subscription(
+            Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
+        )
+        if self.restamp_from_odom or self.one_cloud_per_odom:
+            self.create_subscription(
+                Odometry, self.get_parameter('odom_topic').value, self.on_mid_odom, reliable
+            )
+        self.create_timer(2.0, self._status)
+        self.get_logger().info(
+            f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
+            f'conf>={self.min_confidence} restamp={self.restamp_from_odom} '
+            f'one_per_odom={self.one_cloud_per_odom} qos=RELIABLE '
+            f'(unproject odom-frame if needed; Mid-odom optional)'
+        )
+
+    def _status(self) -> None:
+        self.get_logger().info(
+            f'stats cloud={self._n_cloud} odin_odom={self._n_odin} mid_odom={self._n_mid} '
+            f'pub={self._n_pub} skip_unproj={self._n_skip_unproj} skip_empty={self._n_skip_empty} '
+            f'pending={"Y" if self._pending is not None else "N"}'
+        )
+
+    def on_odin_odom(self, msg: Odometry) -> None:
+        self._n_odin += 1
+        t = _stamp_sec(msg.header.stamp)
+        self._odin_odom.append((t, _mat_from_odom(msg)))
+
+    def on_mid_odom(self, msg: Odometry) -> None:
+        self._n_mid += 1
+        key = _stamp_key(msg.header.stamp)
+        self._mid_odom_stamp = msg.header.stamp
+        self._mid_odom_key = key
         if self.one_cloud_per_odom and self._pending is not None and self._last_pub_key != key:
-            self._publish_arr_from_msg(self._pending, msg.header.stamp)
-            self._last_pub_key = key
+            if self._publish_from_msg(self._pending, msg.header.stamp):
+                self._last_pub_key = key
             self._pending = None
 
-    def cb(self, msg: PointCloud2) -> None:
-        # Before Mid odom exists, still publish (restamp=now). Bundle sync needs
-        # lidar2; gating on odom here deadlocks LIO (no ds → no odom → no ds).
-        if self.restamp_from_odom and self._odom_stamp is None:
-            self._publish_arr_from_msg(msg, self.get_clock().now().to_msg())
-            return
+    def _lookup_odin_odom(self, stamp) -> Optional[np.ndarray]:
+        if not self._odin_odom:
+            return None
+        t = _stamp_sec(stamp)
+        best = None
+        best_dt = 1e9
+        for ot, T in self._odin_odom:
+            dt = abs(ot - t)
+            if dt < best_dt:
+                best_dt = dt
+                best = T
+        if best is None or best_dt > self.odin_odom_max_dt:
+            return None
+        return best
 
-        if self.restamp_from_odom and self.one_cloud_per_odom:
-            # Keep latest scan; publish once per fresh Mid odom stamp.
+    def _cloud_in_odom(self, msg: PointCloud2) -> bool:
+        fid = (msg.header.frame_id or '').strip().lower()
+        return fid in ('odom', 'map', 'odin_odom', 'odin_map')
+
+    def cb(self, msg: PointCloud2) -> None:
+        self._n_cloud += 1
+        # Prefer Mid-odom gated publish when Mid is alive; otherwise publish on a
+        # fallback period so LIO can bootstrap without chicken-egg deadlock.
+        if self.one_cloud_per_odom and self._mid_odom_stamp is not None:
             self._pending = msg
-            if (
-                self._odom_stamp_key is not None
-                and self._last_pub_key != self._odom_stamp_key
-            ):
-                self._publish_arr_from_msg(msg, self._odom_stamp)
-                self._last_pub_key = self._odom_stamp_key
+            if self._mid_odom_key is not None and self._last_pub_key != self._mid_odom_key:
+                if self._publish_from_msg(msg, self._mid_odom_stamp):
+                    self._last_pub_key = self._mid_odom_key
                 self._pending = None
             return
-        stamp = self._odom_stamp if (self.restamp_from_odom and self._odom_stamp is not None) else self.get_clock().now().to_msg()
-        self._publish_arr_from_msg(msg, stamp)
 
-    def _publish_arr_from_msg(self, msg: PointCloud2, stamp) -> None:
-        names = [f.name for f in msg.fields]
-        want = ('x', 'y', 'z', 'intensity') if 'intensity' in names else ('x', 'y', 'z')
-        pts = list(point_cloud2.read_points(msg, field_names=want, skip_nans=True))
-        if not pts:
-            return
-        if len(want) == 4:
-            arr = np.asarray([[p[0], p[1], p[2], p[3]] for p in pts], dtype=np.float32)
-        else:
-            arr = np.asarray([[p[0], p[1], p[2], 0.0] for p in pts], dtype=np.float32)
+        # No Mid odom yet: rate-limit by wall time / cloud stamp.
+        stamp = msg.header.stamp
+        pub_sec = _stamp_sec(stamp)
+        if self._last_pub_sec >= 0.0 and (pub_sec - self._last_pub_sec) < self.fallback_period:
+            # Also allow host-time spacing if cloud stamps are bursty.
+            now_sec = self.get_clock().now().nanoseconds * 1e-9
+            if (now_sec - self._last_pub_sec) < self.fallback_period:
+                self._pending = msg
+                return
+            stamp = self.get_clock().now().to_msg()
+        self._publish_from_msg(msg, stamp)
+
+    def _publish_from_msg(self, msg: PointCloud2, stamp) -> bool:
+        arr = _unpack_points(msg, self.min_confidence)
+        if arr.size == 0:
+            self._n_skip_empty += 1
+            return False
+
+        if self._cloud_in_odom(msg):
+            if not self._warned_odom_cloud:
+                self.get_logger().warn(
+                    'Input looks like odom-frame cloud_slam (frame_id=%s, fields=%s). '
+                    'Unprojecting with /odin1/odometry for L2; prefer mode0 true raw '
+                    'with offset_time for better undistortion.'
+                    % (msg.header.frame_id, [f.name for f in msg.fields])
+                )
+                self._warned_odom_cloud = True
+            T_oi = self._lookup_odin_odom(msg.header.stamp)
+            if T_oi is None:
+                self._n_skip_unproj += 1
+                return False
+            T_oL = T_oi @ self.T_imu_L
+            R = T_oL[:3, :3]
+            t = T_oL[:3, 3]
+            xyz = arr[:, :3].astype(np.float64)
+            # p_L = R^T (p_o - t); row vectors => (p - t) @ R
+            xyz = (xyz - t) @ R
+            arr = np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
 
         if self.voxel > 0:
             keys = np.floor(arr[:, :3] / self.voxel).astype(np.int32)
@@ -110,27 +294,50 @@ class OdinRawDownsampleBridge(Node):
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
 
+        pub_sec = _stamp_sec(stamp)
+        if self.restamp_from_odom and self._mid_odom_stamp is not None:
+            stamp = self._mid_odom_stamp
+            pub_sec = _stamp_sec(stamp)
+        # Enforce monotonic stamps for L2 buffer.
+        if pub_sec + 1e-6 < self._last_pub_sec:
+            stamp = self.get_clock().now().to_msg()
+            pub_sec = _stamp_sec(stamp)
+        if pub_sec < self._last_pub_sec + 1e-4:
+            # Nudge forward by 1ms to keep strictly increasing.
+            pub_sec = self._last_pub_sec + 1e-3
+            sec = int(pub_sec)
+            nsec = int((pub_sec - sec) * 1e9)
+            stamp = type(stamp)(sec=sec, nanosec=nsec)
+        self._last_pub_sec = pub_sec
+
         header = Header()
         header.stamp = stamp
-        header.frame_id = msg.header.frame_id
+        header.frame_id = 'odin_lidar'
+
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
             PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='offset_time', offset=16, datatype=PointField.FLOAT32, count=1),
         ]
-        data = b''.join(struct.pack('<ffff', float(x), float(y), float(z), float(i)) for x, y, z, i in arr)
+        packed = b''.join(
+            struct.pack('<fffff', float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+            for r in arr
+        )
         out = PointCloud2()
         out.header = header
         out.height = 1
         out.width = len(arr)
         out.fields = fields
         out.is_bigendian = False
-        out.point_step = 16
-        out.row_step = 16 * len(arr)
+        out.point_step = 20
+        out.row_step = 20 * len(arr)
         out.is_dense = True
-        out.data = data
+        out.data = packed
         self.pub.publish(out)
+        self._n_pub += 1
+        return True
 
 
 def main() -> None:

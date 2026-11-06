@@ -10,7 +10,7 @@ using namespace std;
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
-enum LID_TYPE{AVIA = 1, VELO16, OUST64, XYZ_ONLY}; //{1, 2, 3, 4=generic/Odin PointCloud2}
+enum LID_TYPE{AVIA = 1, VELO16, OUST64, XYZ_ONLY}; //{1, 2, 3, 4} 4=generic PointCloud2 xyz(+intensity)
 enum TIME_UNIT{SEC = 0, MS = 1, US = 2, NS = 3};
 enum Surround{Prev, Next};
 enum E_jump{Nr_nor, Nr_zero, Nr_180, Nr_inf, Nr_blind};
@@ -94,8 +94,8 @@ class Preprocess
   float time_unit_scale[2];
   int lidar_type[2], point_filter_num[2], N_SCANS[2], SCAN_RATE[2], time_unit[2];
   double blind[2];
-  // Odin dToF confidence filter; <=0 disables. Typical keep threshold ~30-35.
-  double conf_min[2];
+  // Odin1 / generic XYZ: drop points with confidence below this (0 = disable).
+  float min_confidence[2];
   bool given_offset_time;
     
 
@@ -103,6 +103,5 @@ class Preprocess
   void avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, const int &lidar_num);
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, const int &lidar_num);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, const int &lidar_num);
-  // Generic / Odin1 PointCloud2: xyz + optional intensity/confidence/offset_time(s)
   void xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, const int &lidar_num);
 };

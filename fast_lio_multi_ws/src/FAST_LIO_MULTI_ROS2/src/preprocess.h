@@ -94,6 +94,8 @@ class Preprocess
   float time_unit_scale[2];
   int lidar_type[2], point_filter_num[2], N_SCANS[2], SCAN_RATE[2], time_unit[2];
   double blind[2];
+  // Odin1 / generic XYZ: drop points with confidence below this (0 = disable).
+  float min_confidence[2];
   bool given_offset_time;
     
 

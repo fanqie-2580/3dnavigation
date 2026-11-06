@@ -2,7 +2,7 @@
 
 #include <cmath>
 #include <cstring>
-#include <limits>
+#include <cstdint>
 
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
@@ -21,8 +21,8 @@ Preprocess::Preprocess()
   time_unit[1] = 2;
   blind[0] = 0.1;
   blind[1] = 0.1;
-  conf_min[0] = -1.0;
-  conf_min[1] = -1.0;
+  min_confidence[0] = 0.f;
+  min_confidence[1] = 30.f;  // Odin1 wiki typical threshold
   given_offset_time = false;
 }
 
@@ -274,7 +274,9 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
 void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, const int &lidar_num)
 {
-  // Odin1 / generic PointCloud2: keep per-point offset_time (seconds) as curvature (ms).
+  // Generic / Odin1 PointCloud2.
+  // Odin1 fields (wiki): x,y,z, intensity(u8|f32), confidence(u16|f32), offset_time(s).
+  // FAST-LIO stores per-point time in curvature as milliseconds.
   pl_surf.clear();
   pl_full.clear();
 
@@ -287,91 +289,89 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
     else if (f.name == "z") off_z = static_cast<int>(f.offset);
     else if (f.name == "intensity") { off_i = static_cast<int>(f.offset); type_i = f.datatype; }
     else if (f.name == "confidence") { off_c = static_cast<int>(f.offset); type_c = f.datatype; }
-    else if (f.name == "offset_time") { off_t = static_cast<int>(f.offset); type_t = f.datatype; }
+    else if (f.name == "offset_time" || f.name == "time" || f.name == "t")
+    {
+      off_t = static_cast<int>(f.offset);
+      type_t = f.datatype;
+    }
   }
-  if (off_x < 0 || off_y < 0 || off_z < 0 || msg->point_step == 0) return;
+  if (off_x < 0 || off_y < 0 || off_z < 0) return;
 
-  const int npts = static_cast<int>(msg->width) * static_cast<int>(msg->height);
-  if (npts <= 0) return;
-  pl_surf.reserve(npts / std::max(1, point_filter_num[lidar_num]) + 1);
+  const int plsize = static_cast<int>(msg->width * msg->height);
+  if (plsize <= 0) return;
+  pl_surf.reserve(plsize / std::max(1, point_filter_num[lidar_num]) + 1);
 
   given_offset_time = (off_t >= 0);
   const float blind2 = static_cast<float>(blind[lidar_num] * blind[lidar_num]);
-  const bool use_conf = (off_c >= 0 && conf_min[lidar_num] > 0.0);
-  const float conf_thr = static_cast<float>(conf_min[lidar_num]);
+  const float conf_min = min_confidence[lidar_num];
+  const int step = static_cast<int>(msg->point_step);
+  const uint8_t *base = msg->data.data();
 
   auto read_f32 = [](const uint8_t *p) {
     float v;
     std::memcpy(&v, p, sizeof(float));
     return v;
   };
-  auto read_u16 = [](const uint8_t *p) {
-    uint16_t v;
-    std::memcpy(&v, p, sizeof(uint16_t));
-    return v;
+  auto read_intensity = [&](const uint8_t *p) -> float {
+    if (off_i < 0) return 0.f;
+    if (type_i == sensor_msgs::msg::PointField::FLOAT32) return read_f32(p + off_i);
+    if (type_i == sensor_msgs::msg::PointField::UINT8) return static_cast<float>(*(p + off_i));
+    if (type_i == sensor_msgs::msg::PointField::UINT16)
+    {
+      uint16_t v;
+      std::memcpy(&v, p + off_i, sizeof(uint16_t));
+      return static_cast<float>(v);
+    }
+    return 0.f;
   };
-  auto read_u8 = [](const uint8_t *p) { return static_cast<float>(*p); };
+  auto read_confidence = [&](const uint8_t *p) -> float {
+    if (off_c < 0) return 1.e9f;  // no field → keep
+    if (type_c == sensor_msgs::msg::PointField::FLOAT32) return read_f32(p + off_c);
+    if (type_c == sensor_msgs::msg::PointField::UINT16)
+    {
+      uint16_t v;
+      std::memcpy(&v, p + off_c, sizeof(uint16_t));
+      return static_cast<float>(v);
+    }
+    if (type_c == sensor_msgs::msg::PointField::UINT8) return static_cast<float>(*(p + off_c));
+    return 1.e9f;
+  };
+  auto read_offset_ms = [&](const uint8_t *p) -> float {
+    if (off_t < 0) return 0.f;
+    // Odin wiki: offset_time in seconds → curvature needs ms.
+    if (type_t == sensor_msgs::msg::PointField::FLOAT32)
+      return read_f32(p + off_t) * 1000.f;
+    if (type_t == sensor_msgs::msg::PointField::UINT32)
+    {
+      uint32_t v;
+      std::memcpy(&v, p + off_t, sizeof(uint32_t));
+      // Ouster-style nanoseconds → ms via time_unit_scale if set; default ns→ms.
+      return static_cast<float>(v) * time_unit_scale[lidar_num];
+    }
+    return 0.f;
+  };
 
-  for (int i = 0; i < npts; i++)
+  for (int i = 0; i < plsize; i++)
   {
     if (point_filter_num[lidar_num] > 1 && (i % point_filter_num[lidar_num]) != 0) continue;
-    const uint8_t *base = &msg->data[static_cast<size_t>(i) * msg->point_step];
-    const float x = read_f32(base + off_x);
-    const float y = read_f32(base + off_y);
-    const float z = read_f32(base + off_z);
+    const uint8_t *p = base + static_cast<size_t>(i) * static_cast<size_t>(step);
+    const float x = read_f32(p + off_x);
+    const float y = read_f32(p + off_y);
+    const float z = read_f32(p + off_z);
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+    if (conf_min > 0.f && read_confidence(p) < conf_min) continue;
     const float r2 = x * x + y * y + z * z;
     if (r2 <= blind2) continue;
-
-    if (use_conf)
-    {
-      float conf = 0.f;
-      if (type_c == sensor_msgs::msg::PointField::UINT16)
-        conf = static_cast<float>(read_u16(base + off_c));
-      else if (type_c == sensor_msgs::msg::PointField::FLOAT32)
-        conf = read_f32(base + off_c);
-      else if (type_c == sensor_msgs::msg::PointField::UINT8)
-        conf = read_u8(base + off_c);
-      if (conf < conf_thr) continue;
-    }
-
-    float intensity = 0.f;
-    if (off_i >= 0)
-    {
-      if (type_i == sensor_msgs::msg::PointField::FLOAT32)
-        intensity = read_f32(base + off_i);
-      else if (type_i == sensor_msgs::msg::PointField::UINT8)
-        intensity = read_u8(base + off_i);
-      else if (type_i == sensor_msgs::msg::PointField::UINT16)
-        intensity = static_cast<float>(read_u16(base + off_i));
-    }
-
-    // Odin offset_time is in seconds relative to header.stamp → curvature in ms.
-    float curvature_ms = 0.f;
-    if (off_t >= 0)
-    {
-      float t_s = 0.f;
-      if (type_t == sensor_msgs::msg::PointField::FLOAT32)
-        t_s = read_f32(base + off_t);
-      else if (type_t == sensor_msgs::msg::PointField::FLOAT64)
-      {
-        double td;
-        std::memcpy(&td, base + off_t, sizeof(double));
-        t_s = static_cast<float>(td);
-      }
-      if (std::isfinite(t_s) && t_s >= 0.f)
-        curvature_ms = t_s * 1000.f;
-    }
 
     PointType added_pt;
     added_pt.x = x;
     added_pt.y = y;
     added_pt.z = z;
-    added_pt.intensity = intensity;
+    added_pt.intensity = read_intensity(p);
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.curvature = curvature_ms;
+    added_pt.curvature = read_offset_ms(p);
     pl_surf.points.push_back(added_pt);
   }
 }

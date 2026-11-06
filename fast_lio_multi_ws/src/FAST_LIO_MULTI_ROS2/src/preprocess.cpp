@@ -1,6 +1,8 @@
 #include "preprocess.h"
 
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
@@ -19,6 +21,8 @@ Preprocess::Preprocess()
   time_unit[1] = 2;
   blind[0] = 0.1;
   blind[1] = 0.1;
+  min_confidence[0] = 0.f;
+  min_confidence[1] = 30.f;  // Odin1 wiki typical threshold
   given_offset_time = false;
 }
 
@@ -270,48 +274,92 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
 void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, const int &lidar_num)
 {
-  // Generic XYZ/XYZI PointCloud2 (e.g. Odin1 dToF raw cloud): frame-based, no per-point time.
+  // Generic / Odin1 PointCloud2.
+  // Odin1 fields (wiki): x,y,z, intensity(u8|f32), confidence(u16|f32), offset_time(s).
+  // FAST-LIO stores per-point time in curvature as milliseconds.
   pl_surf.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZ> pl_xyz;
-  pcl::PointCloud<pcl::PointXYZI> pl_xyzi;
-  bool has_i = false;
+  int off_x = -1, off_y = -1, off_z = -1, off_i = -1, off_c = -1, off_t = -1;
+  int type_i = -1, type_c = -1, type_t = -1;
   for (const auto &f : msg->fields)
   {
-    if (f.name == "intensity")
+    if (f.name == "x") off_x = static_cast<int>(f.offset);
+    else if (f.name == "y") off_y = static_cast<int>(f.offset);
+    else if (f.name == "z") off_z = static_cast<int>(f.offset);
+    else if (f.name == "intensity") { off_i = static_cast<int>(f.offset); type_i = f.datatype; }
+    else if (f.name == "confidence") { off_c = static_cast<int>(f.offset); type_c = f.datatype; }
+    else if (f.name == "offset_time" || f.name == "time" || f.name == "t")
     {
-      has_i = true;
-      break;
+      off_t = static_cast<int>(f.offset);
+      type_t = f.datatype;
     }
   }
-  if (has_i)
-    pcl::fromROSMsg(*msg, pl_xyzi);
-  else
-    pcl::fromROSMsg(*msg, pl_xyz);
+  if (off_x < 0 || off_y < 0 || off_z < 0) return;
 
-  const int plsize = has_i ? static_cast<int>(pl_xyzi.points.size())
-                           : static_cast<int>(pl_xyz.points.size());
-  if (plsize == 0) return;
+  const int plsize = static_cast<int>(msg->width * msg->height);
+  if (plsize <= 0) return;
   pl_surf.reserve(plsize / std::max(1, point_filter_num[lidar_num]) + 1);
 
-  given_offset_time = false;
+  given_offset_time = (off_t >= 0);
   const float blind2 = static_cast<float>(blind[lidar_num] * blind[lidar_num]);
+  const float conf_min = min_confidence[lidar_num];
+  const int step = static_cast<int>(msg->point_step);
+  const uint8_t *base = msg->data.data();
+
+  auto read_f32 = [](const uint8_t *p) {
+    float v;
+    std::memcpy(&v, p, sizeof(float));
+    return v;
+  };
+  auto read_intensity = [&](const uint8_t *p) -> float {
+    if (off_i < 0) return 0.f;
+    if (type_i == sensor_msgs::msg::PointField::FLOAT32) return read_f32(p + off_i);
+    if (type_i == sensor_msgs::msg::PointField::UINT8) return static_cast<float>(*(p + off_i));
+    if (type_i == sensor_msgs::msg::PointField::UINT16)
+    {
+      uint16_t v;
+      std::memcpy(&v, p + off_i, sizeof(uint16_t));
+      return static_cast<float>(v);
+    }
+    return 0.f;
+  };
+  auto read_confidence = [&](const uint8_t *p) -> float {
+    if (off_c < 0) return 1.e9f;  // no field → keep
+    if (type_c == sensor_msgs::msg::PointField::FLOAT32) return read_f32(p + off_c);
+    if (type_c == sensor_msgs::msg::PointField::UINT16)
+    {
+      uint16_t v;
+      std::memcpy(&v, p + off_c, sizeof(uint16_t));
+      return static_cast<float>(v);
+    }
+    if (type_c == sensor_msgs::msg::PointField::UINT8) return static_cast<float>(*(p + off_c));
+    return 1.e9f;
+  };
+  auto read_offset_ms = [&](const uint8_t *p) -> float {
+    if (off_t < 0) return 0.f;
+    // Odin wiki: offset_time in seconds → curvature needs ms.
+    if (type_t == sensor_msgs::msg::PointField::FLOAT32)
+      return read_f32(p + off_t) * 1000.f;
+    if (type_t == sensor_msgs::msg::PointField::UINT32)
+    {
+      uint32_t v;
+      std::memcpy(&v, p + off_t, sizeof(uint32_t));
+      // Ouster-style nanoseconds → ms via time_unit_scale if set; default ns→ms.
+      return static_cast<float>(v) * time_unit_scale[lidar_num];
+    }
+    return 0.f;
+  };
+
   for (int i = 0; i < plsize; i++)
   {
     if (point_filter_num[lidar_num] > 1 && (i % point_filter_num[lidar_num]) != 0) continue;
-    float x, y, z, intensity = 0.f;
-    if (has_i)
-    {
-      const auto &pt = pl_xyzi.points[i];
-      x = pt.x; y = pt.y; z = pt.z; intensity = pt.intensity;
-    }
-    else
-    {
-      const auto &pt = pl_xyz.points[i];
-      x = pt.x; y = pt.y; z = pt.z;
-    }
+    const uint8_t *p = base + static_cast<size_t>(i) * static_cast<size_t>(step);
+    const float x = read_f32(p + off_x);
+    const float y = read_f32(p + off_y);
+    const float z = read_f32(p + off_z);
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+    if (conf_min > 0.f && read_confidence(p) < conf_min) continue;
     const float r2 = x * x + y * y + z * z;
     if (r2 <= blind2) continue;
 
@@ -319,11 +367,11 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
     added_pt.x = x;
     added_pt.y = y;
     added_pt.z = z;
-    added_pt.intensity = intensity;
+    added_pt.intensity = read_intensity(p);
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.curvature = 0.0f;  // whole-frame timestamp used by IMU undistortion
+    added_pt.curvature = read_offset_ms(p);
     pl_surf.points.push_back(added_pt);
   }
 }

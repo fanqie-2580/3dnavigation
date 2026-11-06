@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Mid360 FAST-LIO mapping + Odin densify into Mid map (no CT-LIO).
+"""Mid360 + Odin1 FAST_LIO_MULTI (tight coupling) + optional timed viz densify.
 
-Default: project delayed Odin raw into map using Mid TF at Odin stamp + extrinsic.
+Default: Mid Livox + Mid IMU IEKF; Odin /cloud_raw → downsample bridge → L2 update
+with CAD/Go2 extrinsic. Optional odin_mid_timed_project for RViz overlay.
 """
 import os
 
@@ -33,7 +34,7 @@ def generate_launch_description():
     enable_color_viz_arg = DeclareLaunchArgument(
         'enable_color_viz',
         default_value='true',
-        description='Mid360 independent accum (/viz/accum_mid360)',
+        description='Mid360-only accum (/viz/accum_mid360); Odin accum is in frame_fuse',
     )
     enable_ct_lio_arg = DeclareLaunchArgument(
         'enable_ct_lio',
@@ -53,12 +54,12 @@ def generate_launch_description():
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
         default_value='true',
-        description='Fuse Mid + Odin-in-map into /cloud_fused',
+        description='Fuse Mid + Odin-in-map into /cloud_fused and /viz/accum_fused',
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
         default_value='0.08',
-        description='Unused when CT-LIO owns Laser_map; kept for compatibility',
+        description='Voxel size for Odin accum inside mid_odin_frame_fuse',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -86,6 +87,31 @@ def generate_launch_description():
                 parameters=[config_file],
             )
         ]
+
+        # Odin1 → /odin1/cloud_raw_ds for FAST_LIO_MULTI L2 (host-restamp + voxel).
+        nodes.append(
+            Node(
+                package='fast_lio_multi',
+                executable='odin_raw_downsample_bridge.py',
+                name='odin_raw_downsample_bridge',
+                output='screen',
+                parameters=[{
+                    'input_topic': '/odin1/cloud_raw',
+                    'output_topic': '/odin1/cloud_raw_ds',
+                    'voxel_size': float(
+                        context.launch_configurations.get('odin_voxel', '0.08')
+                    ),
+                    'max_points': 20000,
+                    'min_confidence': 30.0,
+                    'restamp_from_odom': True,
+                    'one_cloud_per_odom': True,
+                    'odom_topic': '/Odometry',
+                    'odin_odom_topic': '/odin1/odometry',
+                    'odin_odom_max_dt': 1.0,
+                    'fallback_period': 0.1,
+                }],
+            )
+        )
 
         if context.launch_configurations.get('enable_nav_bridge', 'true') == 'true':
             nodes.append(
@@ -187,15 +213,14 @@ def generate_launch_description():
                         'min_confidence': 30.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        # Full body attitude: L2 carries Ry(-13°) vs official Mid mount.
+                        # Full body + odom unproject; L2 = Ry(-13°) from Go2-relative CAD.
                         'use_yaw_only_body': False,
-                        # CAD T_base_odinIMU + official Mid@Go2IMU + URDF + wiki T_imu_L
+                        # CAD T MidL→OdinL; R = Ry(-13°) (Odin≈I vs Go2, Mid Ry(+13°))
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
-                        # Live ICP+gravity attitude (rpy≈[-0.28,-10.15,-0.13] deg)
                         'extrinsic_R_L2_wrt_L1': [
-                            0.98434257, 0.00309114, -0.17623892,
-                            -0.00219007, 0.99998352, 0.00530702,
-                            0.17625242, -0.00483795, 0.98433311,
+                            0.97437006, 0.0, -0.22495105,
+                            0.0, 1.0, 0.0,
+                            0.22495105, 0.0, 0.97437006,
                         ],
                     }],
                 )
@@ -222,9 +247,9 @@ def generate_launch_description():
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            0.98434257, 0.00309114, -0.17623892,
-                            -0.00219007, 0.99998352, 0.00530702,
-                            0.17625242, -0.00483795, 0.98433311,
+                            0.97437006, 0.0, -0.22495105,
+                            0.0, 1.0, 0.0,
+                            0.22495105, 0.0, 0.97437006,
                         ],
                         'stride': 2,
                         'blind': 0.3,
@@ -239,6 +264,8 @@ def generate_launch_description():
             )
 
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
+            # Mid360+Odin1: timed project → /odin1/cloud_in_map; color_viz is Mid-only
+            # (odin_mode=off), so frame_fuse must voxel-accum Odin itself.
             odin_scan = '/odin1/cloud_in_map' if use_timed else '/odin1/cloud_in_odom'
             nodes.append(
                 Node(
@@ -254,6 +281,12 @@ def generate_launch_description():
                         'map_frame': 'map',
                         'odin_frame': 'odin_map',
                         'odin_already_in_map': use_timed,
+                        'accumulate_odin_from_scan': True,
+                        'voxel_size': float(
+                            context.launch_configurations.get('odin_voxel', '0.08')
+                        ),
+                        'max_accum_points': 400000,
+                        'accum_skip_sec': 2.0,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],

@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 /// c++ headers
+#include <algorithm>
 #include <mutex>
 #include <cmath>
 #include <csignal>
@@ -338,6 +339,10 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
+    // Odin points are not guaranteed time-ordered; sync uses points.back().curvature.
+    if (!ptr->empty())
+        std::sort(ptr->points.begin(), ptr->points.end(),
+                  [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
     ptr->header.seq = 1; //trick
     lidar_buffer2.push_back(ptr);
     time_buffer2.push_back(rclcpp::Time(msg->header.stamp).seconds());
@@ -1252,6 +1257,8 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit2", (int)US);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<double>("preprocess.blind2", 0.01);
+        this->declare_parameter<double>("preprocess.min_confidence", 0.0);
+        this->declare_parameter<double>("preprocess.min_confidence2", 30.0);
 
         this->declare_parameter<double>("mapping.cube_side_length", 200.0);
         this->declare_parameter<float>("mapping.det_range", 300.0f);
@@ -1312,6 +1319,13 @@ public:
         this->get_parameter_or("preprocess.timestamp_unit2", p_pre->time_unit[1], (int)US);
         this->get_parameter_or("preprocess.blind", p_pre->blind[0], 0.01);
         this->get_parameter_or("preprocess.blind2", p_pre->blind[1], 0.01);
+        {
+            double c0 = 0.0, c1 = 30.0;
+            this->get_parameter_or("preprocess.min_confidence", c0, 0.0);
+            this->get_parameter_or("preprocess.min_confidence2", c1, 30.0);
+            p_pre->min_confidence[0] = static_cast<float>(c0);
+            p_pre->min_confidence[1] = static_cast<float>(c1);
+        }
         p_pre->set();
 
         this->get_parameter_or("mapping.cube_side_length", cube_len, 200.0);
@@ -1558,7 +1572,10 @@ private:
             /*** initialize the map kdtree ***/
             if (multi_lidar)
             {
-                if (ikdtree.Root_Node == nullptr || !lidar1_ikd_init || !lidar2_ikd_init)
+                // Tight-coupling bootstrap: do NOT block Mid IEKF/odom on first Odin frame.
+                // Waiting for lidar2_ikd_init while lid_topic2 is produced by a bridge that
+                // itself waits on /Odometry deadlocks (no Odom → no L2 → no Odom).
+                if (ikdtree.Root_Node == nullptr || !lidar1_ikd_init)
                 {
                     // RCLCPP_WARN(this->get_logger(),
                     //             "IKD-tree not initialized yet: root=%p L1=%d L2=%d feats_down_size=%d",
@@ -1588,6 +1605,8 @@ private:
                     }
                     return;
                 }
+                if (lidar2_update_en && !lidar2_ikd_init && current_lidar_num == 2)
+                    lidar2_ikd_init = true;
             }
             else if (ikdtree.Root_Node == nullptr)
             {

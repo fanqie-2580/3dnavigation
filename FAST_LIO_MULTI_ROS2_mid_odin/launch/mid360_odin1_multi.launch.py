@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Mid360 FAST-LIO mapping + Odin densify into Mid map (no CT-LIO).
+"""Mid360 + Odin1 FAST_LIO_MULTI (tight coupling) + optional timed viz densify.
 
-Default: project delayed Odin raw into map using Mid TF at Odin stamp + extrinsic.
+Default: Mid Livox + Mid IMU IEKF; Odin /cloud_raw → downsample bridge → L2 update
+with CAD/Go2 extrinsic. Optional odin_mid_timed_project for RViz overlay.
 """
 import os
 
@@ -86,6 +87,31 @@ def generate_launch_description():
                 parameters=[config_file],
             )
         ]
+
+        # Odin1 → /odin1/cloud_raw_ds for FAST_LIO_MULTI L2 (host-restamp + voxel).
+        nodes.append(
+            Node(
+                package='fast_lio_multi',
+                executable='odin_raw_downsample_bridge.py',
+                name='odin_raw_downsample_bridge',
+                output='screen',
+                parameters=[{
+                    'input_topic': '/odin1/cloud_raw',
+                    'output_topic': '/odin1/cloud_raw_ds',
+                    'voxel_size': float(
+                        context.launch_configurations.get('odin_voxel', '0.08')
+                    ),
+                    'max_points': 20000,
+                    'min_confidence': 30.0,
+                    'restamp_from_odom': True,
+                    'one_cloud_per_odom': True,
+                    'odom_topic': '/Odometry',
+                    'odin_odom_topic': '/odin1/odometry',
+                    'odin_odom_max_dt': 1.0,
+                    'fallback_period': 0.1,
+                }],
+            )
+        )
 
         if context.launch_configurations.get('enable_nav_bridge', 'true') == 'true':
             nodes.append(

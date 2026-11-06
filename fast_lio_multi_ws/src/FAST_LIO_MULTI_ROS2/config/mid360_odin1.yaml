@@ -3,12 +3,12 @@
 
     common:
       async_debug: false
-      # false: Mid360-only LIO. Odin accumulates independently (no association).
-      multi_lidar: false
+      # true: Mid360 + Odin1 into FAST_LIO_MULTI (tight / densify path).
+      multi_lidar: true
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
-      # Mid360 Livox CustomMsg + Odin1 dToF raw PointCloud2
+      # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
       lid_topic: "/livox/lidar"
       lid_topic2: "/odin1/cloud_raw_ds"
       imu_topic: "/livox/imu"
@@ -24,15 +24,18 @@
       # Odin is dense (~240x180); stride aggressively before IEKF
       point_filter_num2: 8
       lidar_type: 1                   # Livox CustomMsg (Mid360)
-      lidar_type2: 4                  # XYZ_ONLY generic PointCloud2 (Odin1)
+      lidar_type2: 4                  # XYZ_ONLY / Odin1 PointCloud2 (+offset_time)
       scan_line: 4
       scan_line2: 1
       scan_rate: 10
       scan_rate2: 10
       timestamp_unit: 3
-      timestamp_unit2: 3
+      # Odin offset_time is already in seconds; preprocess converts to ms.
+      timestamp_unit2: 0
       blind: 0.5
       blind2: 0.3
+      min_confidence: 0.0
+      min_confidence2: 30.0           # Odin1 wiki typical confidence gate
 
     mapping:
       zero_start_pose: true
@@ -44,9 +47,9 @@
       b_gyr_cov: 0.0001
       det_range: 100.0
       extrinsic_est_en: false
-      # false: Mid IEKF only; Odin posed via L2 extrinsic for viz (official async).
-      # motion immediately smears CloudMap. Odin still tagged in /cloud_registered.
-      lidar2_update_en: false
+      # true: Odin residuals update IEKF + ikdtree (tight coupling).
+      # Requires /odin1/cloud_raw_ds on host time + L2 extrinsic.
+      lidar2_update_en: true
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
@@ -68,11 +71,11 @@
       #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
       extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
-      # Live attitude 2026-11-06: gravity ~Ry(-13°) + ICP residual on /odin1/cloud_in_map
-      # vs /cloud_registered → rpy≈[-0.28°, -10.15°, -0.13°] (keep CAD translation)
-      extrinsic_R_L2_wrt_L1: [0.98434257, 0.00309114, -0.17623892,
-                             -0.00219007, 0.99998352, 0.00530702,
-                             0.17625242, -0.00483795, 0.98433311]
+      # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
+      # Keep CAD translation. (ICP -10.15° was pre-unproject; under-pitched ~3.6°.)
+      extrinsic_R_L2_wrt_L1: [0.97437006, 0.0, -0.22495105,
+                             0.0, 1.0, 0.0,
+                             0.22495105, 0.0, 0.97437006]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,

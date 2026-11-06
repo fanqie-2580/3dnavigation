@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 /// c++ headers
+#include <algorithm>
 #include <mutex>
 #include <cmath>
 #include <csignal>
@@ -82,6 +83,8 @@ bool multi_lidar = false, async_debug = false, publish_tf_results = false, bundl
 bool extrinsic_imu_to_lidars = false;
 
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
+size_t bundle_pair_index_ = 0;
+double bundle_pair_dt_ = 0.0;
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -113,6 +116,7 @@ deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer2;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 mutex mtx_buffer;
+mutex mtx_state; // Mid pose snapshot for Odin callback (timer vs sub threads)
 condition_variable sig_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
@@ -130,6 +134,8 @@ shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 Eigen::Matrix4d LiDAR2_wrt_LiDAR1 = Eigen::Matrix4d::Identity();
+// Yaml level-frame R (Odin // gravity). Mid mount pitch is cancelled per-frame, not baked.
+M3D LiDAR2_R_yaml = Eye3d;
 Eigen::Matrix4d LiDAR1_wrt_drone = Eigen::Matrix4d::Identity();
 
 /*** EKF inputs and output ***/
@@ -147,6 +153,19 @@ BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 bool first_lidar_scan_check = false;
 bool lidar1_ikd_init = false, lidar2_ikd_init = false;
+bool odin_gravity_ext_comp = false; // log once when level-Odin publish path is active
+bool extrinsic_L2_gravity_frame = false; // true: pose Odin with Mid yaw+pos only (level cloud)
+// false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
+// Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
+bool lidar2_update_en = false;
+// Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
+// state_point right after IEKF. Stamp-based lookup failed in practice:
+// /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
+// walls → orange accum rotated while Mid stayed fixed.
+PointCloudXYZI::Ptr odin_pending_body;
+bool odin_pending_ready = false;
+bool odin_mid_pose_ready = false;
+constexpr float kOdinIntensityTag = 100.0f;
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
 double lidar_mean_scantime2 = 0.0;
@@ -160,6 +179,31 @@ void SigHandle(int sig)
     std::cout << "catch sig " << sig << std::endl;
     sig_buffer.notify_all();
     rclcpp::shutdown();
+}
+
+// Forward decl: used by Mid-only Odin callback before definition.
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr g_pub_odin_registered;
+void publish_odin_body_to_world(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_body_mid,
+    double stamp_sec);
+void publish_odin_level_to_map(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_lidar,
+    double stamp_sec,
+    const M3D &R_mid,
+    const V3D &t_mid);
+void flush_pending_odin_to_map(double stamp_sec);
+
+// Mid yaw-only rotation from a body->world matrix (stable; no Euler pitch/roll).
+static M3D mid_yaw_rotation(const M3D &R_wi)
+{
+    // yaw from first column projected to XY (same as atan2(R10, R00) for ZYX).
+    const double yaw = std::atan2(R_wi(1, 0), R_wi(0, 0));
+    const double c = std::cos(yaw), s = std::sin(yaw);
+    M3D R_yaw = Eye3d;
+    R_yaw << c, -s, 0, s, c, 0, 0, 0, 1;
+    return R_yaw;
 }
 
 void pointBodyToWorld(PointType const * const pi, PointType * const po)
@@ -269,19 +313,25 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    const double t2 = rclcpp::Time(msg->header.stamp).seconds();
-    // Soft guard: drop only if still in wrong clock domain (hours+), not TCP/align jitter.
-    if (last_timestamp_lidar > 1.0 && std::fabs(t2 - last_timestamp_lidar) > 30.0)
+    // Mid-only IEKF: only buffer latest Odin body cloud; pose in Mid timer with
+    // the same state_point as /cloud_registered (avoids stale stamp × new body).
+    if (!lidar2_update_en)
     {
-        static int drop_n = 0;
-        if ((++drop_n % 50) == 1)
-            std::cerr << "[L2] stamp far from Mid (" << (t2 - last_timestamp_lidar)
-                      << " s); check Odin host-time align. drop#" << drop_n << std::endl;
+        PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        p_pre->process(msg, ptr, 1);
+        if (!ptr->empty())
+        {
+            for (auto &pt : ptr->points)
+                pt.intensity = 200.0f;
+            std::lock_guard<std::mutex> lk(mtx_state);
+            odin_pending_body = ptr;
+            odin_pending_ready = true;
+        }
         return;
     }
 
     mtx_buffer.lock();
-    if (t2 < last_timestamp_lidar2)
+    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar2)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer2.clear();
@@ -289,15 +339,14 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
-    if (ptr->empty())
-    {
-        mtx_buffer.unlock();
-        return;
-    }
+    // Odin points are not guaranteed time-ordered; sync uses points.back().curvature.
+    if (!ptr->empty())
+        std::sort(ptr->points.begin(), ptr->points.end(),
+                  [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
     ptr->header.seq = 1; //trick
     lidar_buffer2.push_back(ptr);
-    time_buffer2.push_back(t2);
-    last_timestamp_lidar2 = t2;
+    time_buffer2.push_back(rclcpp::Time(msg->header.stamp).seconds());
+    last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
@@ -368,6 +417,13 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
 bool sync_packages_async(MeasureGroup &meas)
 {
+    // Mid-only: never pull Odin into IEKF (Odin is published from cbk2 via L2 TF).
+    if (!lidar2_update_en)
+    {
+        lidar_buffer2.clear();
+        time_buffer2.clear();
+    }
+
     if ( (lidar_buffer.empty() && lidar_buffer2.empty()) || imu_buffer.empty()) {
         return false;
     }
@@ -518,11 +574,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
         /*** push a lidar scan ***/
         if(!lidar_pushed)
         {
+            // Pair Mid front with nearest Odin by stamp (do NOT merge whole buffers —
+            // that mixed scans from different poses and ghosted orange accum).
+            constexpr double kMaxBundleDt = 0.08; // 80 ms
             meas.lidar = lidar_buffer.front();
-            for (size_t i = 1; i < lidar_buffer.size(); i++) // merge all lidar scans
-            {
-                *meas.lidar += *lidar_buffer[i];
-            }
             meas.lidar_beg_time = time_buffer.front();
             if (meas.lidar->points.size() <= 1) // time too little
             {
@@ -541,13 +596,36 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
             meas.lidar_end_time = lidar_end_time;
 
-            meas.lidar2 = lidar_buffer2.front();
-            for (size_t i = 1; i < lidar_buffer2.size(); i++) // merge all lidar scans
+            size_t best_i = 0;
+            double best_dt = std::fabs(time_buffer2.front() - meas.lidar_beg_time);
+            for (size_t i = 1; i < time_buffer2.size(); i++)
             {
-                *meas.lidar2 += *lidar_buffer2[i];
+                const double dt = std::fabs(time_buffer2[i] - meas.lidar_beg_time);
+                if (dt < best_dt)
+                {
+                    best_dt = dt;
+                    best_i = i;
+                }
             }
+            if (best_dt > kMaxBundleDt)
+            {
+                // Drop the older stream head so the next tick can re-pair.
+                if (time_buffer.front() < time_buffer2.front())
+                {
+                    lidar_buffer.pop_front();
+                    time_buffer.pop_front();
+                }
+                else
+                {
+                    lidar_buffer2.pop_front();
+                    time_buffer2.pop_front();
+                }
+                return false;
+            }
+
+            meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1); //lidar2 data to lidar1 frame, not use lidar2-imu tf as state
-            meas.lidar_beg_time2 = time_buffer2.front();
+            meas.lidar_beg_time2 = time_buffer2[best_i];
             if (meas.lidar2->points.size() <= 1) // time too little
             {
                 lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
@@ -567,6 +645,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
 
             publish_lidar_time = max(lidar_end_time, lidar_end_time2);
             lidar_pushed = true;
+            bundle_pair_index_ = best_i; // remember which L2 to pop after IMU sync
+            bundle_pair_dt_ = best_dt;
         }
 
         if (last_timestamp_imu < lidar_end_time || last_timestamp_imu < lidar_end_time2)
@@ -585,13 +665,17 @@ bool sync_packages_bundle(MeasureGroup &meas)
             imu_buffer.pop_front();
         }
 
-        lidar_buffer.clear();
-        time_buffer.clear();
-        lidar_buffer2.clear();
-        time_buffer2.clear();
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        // Drop Odin frames up to and including the paired one.
+        for (size_t i = 0; i <= bundle_pair_index_ && !lidar_buffer2.empty(); i++)
+        {
+            lidar_buffer2.pop_front();
+            time_buffer2.pop_front();
+        }
 
         lidar_pushed = false;
-        cout << "\033[36;1mBundle update!\033[0m" << endl;
+        cout << "\033[36;1mBundle update! dt=" << bundle_pair_dt_ * 1000.0 << "ms\033[0m" << endl;
         return true;
     }
     else
@@ -657,6 +741,10 @@ void map_incremental()
     PointNoNeedDownsample.reserve(feats_down_size);
     for (int i = 0; i < feats_down_size; i++)
     {
+        if (!lidar2_update_en &&
+            (feats_down_body->points[i].intensity >= kOdinIntensityTag ||
+             (!bundle_enabled && current_lidar_num == 2)))
+            continue;
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
         /* decide if need add to map */
@@ -693,6 +781,146 @@ void map_incremental()
     ikdtree.Add_Points(PointToAdd, true);
     ikdtree.Add_Points(PointNoNeedDownsample, false); 
     return;
+}
+
+
+void publish_odin_body_to_world(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_body_mid,
+    double stamp_sec)
+{
+    if (!pubOdin || !odin_body_mid || odin_body_mid->empty() || !scan_pub_en)
+        return;
+    if (!p_imu->IMU_inited())
+        return;
+    const int size = static_cast<int>(odin_body_mid->size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+        RGBpointBodyToWorld(&odin_body_mid->points[i], &laserCloudWorld->points[i]);
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(stamp_sec);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
+// Level Odin cloud -> map using Mid yaw + position only (no Mid pitch/roll).
+// R_mid/t_mid must be the Mid state used for this publish (same as Mid scan).
+// p_map = R_yaw * (R_yaml * p + t_L2) + t_mid
+void publish_odin_level_to_map(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &odin_lidar,
+    double stamp_sec,
+    const M3D &R_mid,
+    const V3D &t_mid)
+{
+    if (!pubOdin || !odin_lidar || odin_lidar->empty() || !scan_pub_en)
+        return;
+    if (!p_imu || !p_imu->IMU_inited())
+        return;
+
+    const M3D R_yaw = mid_yaw_rotation(R_mid);
+    const M3D R_yaml = LiDAR2_R_yaml;
+    const V3D t_L2 = LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3);
+
+    const int size = static_cast<int>(odin_lidar->size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+    {
+        const auto &pi = odin_lidar->points[i];
+        V3D p_l(pi.x, pi.y, pi.z);
+        V3D p_m = R_yaw * (R_yaml * p_l + t_L2) + t_mid;
+        auto &po = laserCloudWorld->points[i];
+        po.x = p_m(0);
+        po.y = p_m(1);
+        po.z = p_m(2);
+        po.intensity = pi.intensity;
+    }
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(stamp_sec);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+}
+
+void flush_pending_odin_to_map(double stamp_sec)
+{
+    if (!multi_lidar || lidar2_update_en || !scan_pub_en)
+        return;
+    if (!p_imu || !p_imu->IMU_inited())
+        return;
+
+    PointCloudXYZI::Ptr ptr;
+    {
+        std::lock_guard<std::mutex> lk(mtx_state);
+        if (!odin_pending_ready || !odin_pending_body || odin_pending_body->empty())
+            return;
+        ptr = odin_pending_body;
+        odin_pending_ready = false;
+        odin_pending_body.reset();
+    }
+
+    const M3D R_mid = state_point.rot.toRotationMatrix();
+    const V3D t_mid = state_point.pos;
+    odin_mid_pose_ready = true;
+
+    if (extrinsic_L2_gravity_frame)
+        publish_odin_level_to_map(g_pub_odin_registered, ptr, stamp_sec, R_mid, t_mid);
+    else
+    {
+        PointCloudXYZI::Ptr body(new PointCloudXYZI());
+        pcl::transformPointCloud(*ptr, *body, LiDAR2_wrt_LiDAR1);
+        // Temporarily set state already is current Mid state for RGBpointBodyToWorld.
+        publish_odin_body_to_world(g_pub_odin_registered, body, stamp_sec);
+    }
+}
+
+void publish_odin_from_undistorted(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
+    const PointCloudXYZI::Ptr &undistorted)
+{
+    // Publish Odin points already undistorted into Mid body, using current state_point.
+    if (!pubOdin || !undistorted || undistorted->empty() || !scan_pub_en)
+        return;
+    PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
+    odin_body->reserve(undistorted->size());
+    for (const auto &pt : undistorted->points)
+    {
+        if (pt.intensity >= kOdinIntensityTag)
+            odin_body->push_back(pt);
+    }
+    // Async lidar2 whole-frame: intensity may already be tagged; if not, take all.
+    if (odin_body->empty() && current_lidar_num == 2)
+        *odin_body = *undistorted;
+    if (odin_body->empty())
+        return;
+    publish_odin_body_to_world(pubOdin, odin_body, publish_lidar_time);
+}
+
+void publish_mid_from_undistorted(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubMid,
+    const PointCloudXYZI::Ptr &undistorted)
+{
+    if (!pubMid || !undistorted || undistorted->empty() || !scan_pub_en)
+        return;
+    PointCloudXYZI::Ptr mid_body(new PointCloudXYZI());
+    mid_body->reserve(undistorted->size());
+    for (const auto &pt : undistorted->points)
+    {
+        if (pt.intensity < kOdinIntensityTag)
+            mid_body->push_back(pt);
+    }
+    if (mid_body->empty())
+        return;
+    const int size = static_cast<int>(mid_body->size());
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+        RGBpointBodyToWorld(&mid_body->points[i], &laserCloudWorld->points[i]);
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubMid->publish(laserCloudmsg);
 }
 
 void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFull, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFullTransFormed)
@@ -885,6 +1113,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
+        // Bundle: Odin tagged intensity>=100. Async lidar2 scan: whole frame is L2.
+        if (!lidar2_update_en &&
+            (point_body.intensity >= kOdinIntensityTag ||
+             (!bundle_enabled && current_lidar_num == 2)))
+        {
+            point_selected_surf[i] = false;
+            continue;
+        }
+
         /* transform to world frame */
         V3D p_body(point_body.x, point_body.y, point_body.z);
         V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
@@ -1020,8 +1257,8 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit2", (int)US);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<double>("preprocess.blind2", 0.01);
-        this->declare_parameter<double>("preprocess.conf_min", -1.0);
-        this->declare_parameter<double>("preprocess.conf_min2", 30.0);
+        this->declare_parameter<double>("preprocess.min_confidence", 0.0);
+        this->declare_parameter<double>("preprocess.min_confidence2", 30.0);
 
         this->declare_parameter<double>("mapping.cube_side_length", 200.0);
         this->declare_parameter<float>("mapping.det_range", 300.0f);
@@ -1031,6 +1268,8 @@ public:
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
 
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<bool>("mapping.lidar2_update_en", false);
+        this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_T", {});
@@ -1080,8 +1319,13 @@ public:
         this->get_parameter_or("preprocess.timestamp_unit2", p_pre->time_unit[1], (int)US);
         this->get_parameter_or("preprocess.blind", p_pre->blind[0], 0.01);
         this->get_parameter_or("preprocess.blind2", p_pre->blind[1], 0.01);
-        this->get_parameter_or("preprocess.conf_min", p_pre->conf_min[0], -1.0);
-        this->get_parameter_or("preprocess.conf_min2", p_pre->conf_min[1], 30.0);
+        {
+            double c0 = 0.0, c1 = 30.0;
+            this->get_parameter_or("preprocess.min_confidence", c0, 0.0);
+            this->get_parameter_or("preprocess.min_confidence2", c1, 30.0);
+            p_pre->min_confidence[0] = static_cast<float>(c0);
+            p_pre->min_confidence[1] = static_cast<float>(c1);
+        }
         p_pre->set();
 
         this->get_parameter_or("mapping.cube_side_length", cube_len, 200.0);
@@ -1091,6 +1335,8 @@ public:
         this->get_parameter_or("mapping.b_gyr_cov", b_gyr_cov, 0.0001);
         this->get_parameter_or("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
+        this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
         this->get_parameter_or("mapping.extrinsic_T", extrinT, std::vector<double>());
@@ -1132,6 +1378,8 @@ public:
         // 4. Create Publishers
         //---------------------------
         pubLaserCloudFull_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
+        pubLaserCloudOdin_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered", 20);
+        g_pub_odin_registered = pubLaserCloudOdin_;
         pubLaserCloudFullTransformed_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_tf", 20);
         pubLaserCloudFull_body_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
@@ -1210,9 +1458,14 @@ public:
                 Lidar2_R_wrt_LiDAR1 << MAT_FROM_ARRAY(extrinR3);
                 LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = Lidar2_R_wrt_LiDAR1;
                 LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = LiDAR2_T_wrt_LiDAR1;
+                LiDAR2_R_yaml = Lidar2_R_wrt_LiDAR1;
             }
+            if (extrinsic_imu_to_lidars)
+                LiDAR2_R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
+                 << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
+                 << " (false => Mid360-only IEKF/map)" << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
                  << LiDAR2_wrt_LiDAR1 << "\033[0m" << endl
@@ -1265,6 +1518,7 @@ private:
     {
         if (flg_exit)
             return;
+        // Stock FAST_LIO_MULTI adaptive: bundle when enabled, else async.
         bool synced = false;
         if (bundle_enabled)
             synced = sync_packages_bundle(Measures); // bundle
@@ -1274,22 +1528,29 @@ private:
         {
             // RCLCPP_INFO(this->get_logger(), "Timer tick: synced=%d, bundle=%d", synced, bundle_enabled);
             high_resolution_clock::time_point t1 = high_resolution_clock::now();
+
             if (bundle_enabled)
             {
-                p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
-                // RCLCPP_INFO(this->get_logger(),
-                //             "feats_undistort size (bundle) = %zu",
-                //             feats_undistort->size());
+                p_imu->Process(Measures, kf, feats_undistort, true);
             }
             else
             {
                 p_imu->Process(Measures, kf, feats_undistort, false, current_lidar_num);
-                // RCLCPP_INFO(this->get_logger(),
-                //             "feats_undistort size (async/single) = %zu",
-                //             feats_undistort->size());
             }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            // Level Odin: flush pending body cloud with this Mid state (same tick).
+            if (multi_lidar && !odin_gravity_ext_comp && p_imu->IMU_inited())
+            {
+                odin_gravity_ext_comp = true;
+                if (extrinsic_L2_gravity_frame)
+                    std::cout << "\033[32;1mOdin L2: Mid yaw+pos with Mid IEKF state "
+                                 "(pending flush; no Mid pitch/roll)\033[0m"
+                              << std::endl;
+                else
+                    std::cout << "\033[32;1mOdin L2 extrinsic used as body-fixed:\n"
+                              << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+            }
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
@@ -1311,7 +1572,10 @@ private:
             /*** initialize the map kdtree ***/
             if (multi_lidar)
             {
-                if (ikdtree.Root_Node == nullptr || !lidar1_ikd_init || !lidar2_ikd_init)
+                // Tight-coupling bootstrap: do NOT block Mid IEKF/odom on first Odin frame.
+                // Waiting for lidar2_ikd_init while lid_topic2 is produced by a bridge that
+                // itself waits on /Odometry deadlocks (no Odom → no L2 → no Odom).
+                if (ikdtree.Root_Node == nullptr || !lidar1_ikd_init)
                 {
                     // RCLCPP_WARN(this->get_logger(),
                     //             "IKD-tree not initialized yet: root=%p L1=%d L2=%d feats_down_size=%d",
@@ -1322,22 +1586,27 @@ private:
                     if (feats_down_size > 5)
                     {
                         feats_down_world->resize(feats_down_size);
+                        PointVector init_pts;
+                        init_pts.reserve(feats_down_size);
                         for (int i = 0; i < feats_down_size; i++)
                         {
+                            if (!lidar2_update_en &&
+                                feats_down_body->points[i].intensity >= kOdinIntensityTag)
+                                continue;
                             pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                            init_pts.push_back(feats_down_world->points[i]);
                         }
-                        ikdtree.Add_Points(feats_down_world->points, true);
-                        if (current_lidar_num == 1)
-                        {
+                        if (!init_pts.empty())
+                            ikdtree.Add_Points(init_pts, true);
+                        if (current_lidar_num == 1 || bundle_enabled)
                             lidar1_ikd_init = true;
-                        }
-                        else if (current_lidar_num == 2)
-                        {
+                        if (current_lidar_num == 2 || bundle_enabled || !lidar2_update_en)
                             lidar2_ikd_init = true;
-                        }
                     }
                     return;
                 }
+                if (lidar2_update_en && !lidar2_ikd_init && current_lidar_num == 2)
+                    lidar2_ikd_init = true;
             }
             else if (ikdtree.Root_Node == nullptr)
             {
@@ -1361,47 +1630,68 @@ private:
                 return;
             }
 
-            normvec->resize(feats_down_size);
-            feats_down_world->resize(feats_down_size);
-            Nearest_Points.resize(feats_down_size);
-            /*** iterated state estimation ***/
-            double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-            geoQuat.x = state_point.rot.coeffs()[0];
-            geoQuat.y = state_point.rot.coeffs()[1];
-            geoQuat.z = state_point.rot.coeffs()[2];
-            geoQuat.w = state_point.rot.coeffs()[3];
-            // RCLCPP_INFO(this->get_logger(), "KF done. Pose: %.3f %.3f %.3f",
-            //             pos_lid.x(), pos_lid.y(), pos_lid.z());
+            const bool skip_l2_update =
+                !lidar2_update_en && !bundle_enabled && current_lidar_num == 2;
 
-            /******* Publish odometry *******/
-            if (publish_tf_results)
-                publish_visionpose(pubMavrosVisionPose_);
-            // RCLCPP_INFO(this->get_logger(), "Publishing...");
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-
-            /*** add the feature points to map kdtree ***/
-            map_incremental();
-
-            if (0) // If you need to see map point, change to "if(1)"
+            if (!skip_l2_update)
             {
-                PointVector().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
+                normvec->resize(feats_down_size);
+                feats_down_world->resize(feats_down_size);
+                Nearest_Points.resize(feats_down_size);
+                /*** iterated state estimation ***/
+                double solve_H_time = 0;
+                kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                geoQuat.x = state_point.rot.coeffs()[0];
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+
+                /******* Publish odometry *******/
+                if (publish_tf_results)
+                    publish_visionpose(pubMavrosVisionPose_);
+                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+
+                /*** add the feature points to map kdtree ***/
+                map_incremental();
+
+                // Publish accumulated ikdtree map (stock code left this under if(0)).
+                {
+                    static int map_pub_tic = 0;
+                    if (ikdtree.Root_Node != nullptr && (++map_pub_tic % 2 == 0))
+                    {
+                        PointVector().swap(ikdtree.PCL_Storage);
+                        ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                        featsFromMap->clear();
+                        featsFromMap->points = ikdtree.PCL_Storage;
+                        publish_map(pubLaserCloudMap_);
+                    }
+                }
+                if (path_en)
+                    publish_path(pubPath_);
             }
+            else
+            {
+                // Safety net if an Odin frame reached IEKF path.
+                publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                return;
+            }
+
             /******* Publish points *******/
-            if (path_en)
-                publish_path(pubPath_);
-            if (scan_pub_en || pcd_save_en)
+            if (multi_lidar && !lidar2_update_en)
+            {
+                // Mid from IEKF undistort; Odin from pending buffer × same Mid state.
+                publish_mid_from_undistorted(pubLaserCloudFull_, feats_undistort);
+                flush_pending_odin_to_map(publish_lidar_time);
+            }
+            else if (scan_pub_en || pcd_save_en)
                 publish_frame_world(pubLaserCloudFull_, pubLaserCloudFullTransformed_);
             if (scan_pub_en && scan_body_pub_en)
                 publish_frame_body(pubLaserCloudFull_body_);
 
             /*** Bundle update or async update ***/
-            if (multi_lidar)
+            if (multi_lidar && lidar2_update_en)
             {
                 if (feats_down_size < voxelized_pt_num_thres && (double)effect_feat_num / feats_down_size < effect_pt_num_ratio_thres)
                 {
@@ -1413,6 +1703,11 @@ private:
                     bundle_enabled = false;
                 }
                 bundle_enabled_tic++;
+            }
+            else if (multi_lidar && !lidar2_update_en)
+            {
+                // Odin viz-only: do not force bundle (keeps Mid realtime under async).
+                bundle_enabled = false;
             }
             high_resolution_clock::time_point t2 = high_resolution_clock::now();
             auto duration = duration_cast<microseconds>(t2 - t1).count() / 1000.0;
@@ -1444,6 +1739,7 @@ private:
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdin_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullTransformed_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;

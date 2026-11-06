@@ -3,12 +3,12 @@
 
     common:
       async_debug: false
-      # false: Mid360-only LIO. Odin accumulates independently (no association).
-      multi_lidar: false
+      # true: Mid360 + Odin1 into FAST_LIO_MULTI (tight / densify path).
+      multi_lidar: true
       publish_tf_results: false
       max_iteration: 3
       map_frame: "map"
-      # Mid360 Livox CustomMsg + Odin1 dToF raw PointCloud2
+      # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
       lid_topic: "/livox/lidar"
       lid_topic2: "/odin1/cloud_raw_ds"
       imu_topic: "/livox/imu"
@@ -24,15 +24,18 @@
       # Odin is dense (~240x180); stride aggressively before IEKF
       point_filter_num2: 8
       lidar_type: 1                   # Livox CustomMsg (Mid360)
-      lidar_type2: 4                  # XYZ_ONLY generic PointCloud2 (Odin1)
+      lidar_type2: 4                  # XYZ_ONLY / Odin1 PointCloud2 (+offset_time)
       scan_line: 4
       scan_line2: 1
       scan_rate: 10
       scan_rate2: 10
       timestamp_unit: 3
-      timestamp_unit2: 3
+      # Odin offset_time is already in seconds; preprocess converts to ms.
+      timestamp_unit2: 0
       blind: 0.5
       blind2: 0.3
+      min_confidence: 0.0
+      min_confidence2: 30.0           # Odin1 wiki typical confidence gate
 
     mapping:
       zero_start_pose: true
@@ -44,9 +47,9 @@
       b_gyr_cov: 0.0001
       det_range: 100.0
       extrinsic_est_en: false
-      # false: Mid IEKF only; Odin posed via L2 extrinsic for viz (official async).
-      # motion immediately smears CloudMap. Odin still tagged in /cloud_registered.
-      lidar2_update_en: false
+      # true: Odin residuals update IEKF + ikdtree (tight coupling).
+      # Requires /odin1/cloud_raw_ds on host time + L2 extrinsic.
+      lidar2_update_en: true
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
