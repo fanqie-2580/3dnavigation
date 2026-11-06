@@ -755,11 +755,17 @@ void map_incremental()
     PointVector PointNoNeedDownsample;
     PointToAdd.reserve(feats_down_size);
     PointNoNeedDownsample.reserve(feats_down_size);
+    const float det_r2 = DET_RANGE * DET_RANGE;
     for (int i = 0; i < feats_down_size; i++)
     {
         if (!odin_pose_update_allowed() &&
             (feats_down_body->points[i].intensity >= kOdinIntensityTag ||
              (!bundle_enabled && current_lidar_num == 2)))
+            continue;
+        const float bx = feats_down_body->points[i].x;
+        const float by = feats_down_body->points[i].y;
+        const float bz = feats_down_body->points[i].z;
+        if ((bx * bx + by * by + bz * bz) > det_r2)
             continue;
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
@@ -1274,6 +1280,8 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit2", (int)US);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<double>("preprocess.blind2", 0.01);
+        this->declare_parameter<double>("preprocess.max_range", 0.0);
+        this->declare_parameter<double>("preprocess.max_range2", 0.0);
         this->declare_parameter<double>("preprocess.min_confidence", 0.0);
         this->declare_parameter<double>("preprocess.min_confidence2", 30.0);
 
@@ -1337,6 +1345,8 @@ public:
         this->get_parameter_or("preprocess.timestamp_unit2", p_pre->time_unit[1], (int)US);
         this->get_parameter_or("preprocess.blind", p_pre->blind[0], 0.01);
         this->get_parameter_or("preprocess.blind2", p_pre->blind[1], 0.01);
+        this->get_parameter_or("preprocess.max_range", p_pre->max_range[0], 0.0);
+        this->get_parameter_or("preprocess.max_range2", p_pre->max_range[1], 0.0);
         {
             double c0 = 0.0, c1 = 30.0;
             this->get_parameter_or("preprocess.min_confidence", c0, 0.0);
@@ -1539,9 +1549,15 @@ private:
         if (flg_exit)
             return;
         // Stock FAST_LIO_MULTI adaptive: bundle when enabled, else async.
+        // If bundle is on but L2 dried up (downsample waiting on Mid odom), fall
+        // back to async Mid-only so /Odometry keeps flowing and breaks the deadlock.
         bool synced = false;
         if (bundle_enabled)
+        {
             synced = sync_packages_bundle(Measures); // bundle
+            if (!synced && !lidar_buffer.empty() && lidar_buffer2.empty() && !imu_buffer.empty())
+                synced = sync_packages_async(Measures);
+        }
         else
             synced = sync_packages_async(Measures); // single or async
         if (synced)

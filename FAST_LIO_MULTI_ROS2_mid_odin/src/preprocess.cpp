@@ -21,6 +21,8 @@ Preprocess::Preprocess()
   time_unit[1] = 2;
   blind[0] = 0.1;
   blind[1] = 0.1;
+  max_range[0] = 0.0;  // 0 = disabled
+  max_range[1] = 0.0;
   min_confidence[0] = 0.f;
   min_confidence[1] = 30.f;  // Odin1 wiki typical threshold
   given_offset_time = false;
@@ -129,8 +131,11 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
         pl_full[i].intensity = msg->points[i].reflectivity;
         pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points, curvature unit: ms
 
+        const double r2 = pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z;
+        const double max_r = max_range[lidar_num];
         if( ((abs(pl_full[i].x - pl_full[i-1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i-1].y) > 1e-7) || (abs(pl_full[i].z - pl_full[i-1].z) > 1e-7))
-            && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind[lidar_num] * blind[lidar_num])))
+            && (r2 > (blind[lidar_num] * blind[lidar_num]))
+            && (max_r <= 0.0 || r2 <= max_r * max_r))
         {
           pl_surf.push_back(pl_full[i]);
         }
@@ -303,6 +308,8 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
 
   given_offset_time = (off_t >= 0);
   const float blind2 = static_cast<float>(blind[lidar_num] * blind[lidar_num]);
+  const float max_r = static_cast<float>(max_range[lidar_num]);
+  const float max_r2 = (max_r > 0.f) ? (max_r * max_r) : 0.f;
   const float conf_min = min_confidence[lidar_num];
   const int step = static_cast<int>(msg->point_step);
   const uint8_t *base = msg->data.data();
@@ -362,6 +369,7 @@ void Preprocess::xyz_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg
     if (conf_min > 0.f && read_confidence(p) < conf_min) continue;
     const float r2 = x * x + y * y + z * z;
     if (r2 <= blind2) continue;
+    if (max_r2 > 0.f && r2 > max_r2) continue;
 
     PointType added_pt;
     added_pt.x = x;
