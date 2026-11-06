@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Project delayed Odin raw cloud into Mid map using Mid TF at Odin stamp.
+"""Project delayed Odin raw cloud into Mid map via Go2 base_link.
 
-After host-time align, Odin stamps are on the same timeline as Mid, but arrive
-~3s late over TCP. Using Odin's own odom builds a second drifting map → ghost/fan
-when fused. Instead:
+Odin /odin1/cloud_raw is treated as lidar-local (≈ gravity-level). Localization
+pose still comes from Mid LIO (map←body←base_link), but Odin's *extrinsic* is
+only relative to Go2 — no Mid L1→L2 chain:
 
-  T_map_odin_lidar(t) = T_map_body_yaw(t) * T_body_L1 * T_L1_L2
+  T_map_odin(t) = yaw_only(T_map_base(t)) * T_base_odin
 
-Odin /odin1/cloud_raw is approximately gravity-level. Applying Mid's full body
-pitch/roll tips Odin walls. Default: keep Mid translation + yaw only at stamp.
-Lookup Mid TF at the cloud's stamp (needs long TF cache). Drop if |dt| too large.
+Lookup Mid-derived TF at the cloud stamp (long TF cache). Drop if |dt| too large.
 """
 from __future__ import annotations
 
@@ -19,7 +17,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 import rclpy
-from builtin_interfaces.msg import Duration as DurationMsg
 from geometry_msgs.msg import TransformStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -77,28 +74,27 @@ class OdinMidTimedProject(Node):
         self.declare_parameter('cloud_topic', '/odin1/cloud_raw')
         self.declare_parameter('out_topic', '/odin1/cloud_in_map')
         self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('body_frame', 'body')
+        # Go2 URDF base — Odin extrinsic is relative to this, not Mid lidar.
+        self.declare_parameter('robot_frame', 'base_link')
         self.declare_parameter('tf_cache_sec', 12.0)
         self.declare_parameter('max_stamp_delay_sec', 6.0)
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
         self.declare_parameter('min_confidence', 30.0)
-        # Odin raw ≈ gravity-level; strip Mid pitch/roll from body TF.
+        # Odin raw ≈ gravity-level; strip Go2 pitch/roll from base TF.
         self.declare_parameter('use_yaw_only_body', True)
-        # Mid IMU(body) → Mid lidar, Odin lidar in Mid lidar (same as mid360_odin1.yaml)
-        self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
+        # T_base_odinL = T_base_odinIMU(CAD) @ T_odinIMU_L(wiki), R≈I
+        # t_IMU=[0.313654,-0.028974,0.104418], t_L=[-0.02663,0.03447,0.02174]
         self.declare_parameter(
-            'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            'extrinsic_T_base_odin', [0.287024, 0.005496, 0.126158]
         )
-        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.055])
-        # Near-identity: do not bake Mid mount pitch into L2 when yaw-only body is on.
         self.declare_parameter(
-            'extrinsic_R_L2_wrt_L1',
-            [0.97499445, -0.22222923, 0.0, 0.22222923, 0.97499445, 0.0, 0.0, 0.0, 1.0],
+            'extrinsic_R_base_odin',
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
 
         self.map_frame = str(self.get_parameter('map_frame').value)
-        self.body_frame = str(self.get_parameter('body_frame').value)
+        self.robot_frame = str(self.get_parameter('robot_frame').value)
         self.max_delay = float(self.get_parameter('max_stamp_delay_sec').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.blind2 = float(self.get_parameter('blind').value) ** 2
@@ -106,15 +102,10 @@ class OdinMidTimedProject(Node):
         self.use_yaw_only = bool(self.get_parameter('use_yaw_only_body').value)
         cache = float(self.get_parameter('tf_cache_sec').value)
 
-        T_body_L1 = se3(
-            self.get_parameter('extrinsic_R').value,
-            self.get_parameter('extrinsic_T').value,
+        self.T_base_odin = se3(
+            self.get_parameter('extrinsic_R_base_odin').value,
+            self.get_parameter('extrinsic_T_base_odin').value,
         )
-        T_L1_L2 = se3(
-            self.get_parameter('extrinsic_R_L2_wrt_L1').value,
-            self.get_parameter('extrinsic_T_L2_wrt_L1').value,
-        )
-        self.T_body_odin = T_body_L1 @ T_L1_L2
 
         self._tf = Buffer(cache_time=Duration(seconds=cache))
         self._tf_listener = TransformListener(self._tf, self)
@@ -128,10 +119,13 @@ class OdinMidTimedProject(Node):
         self.pub = self.create_publisher(PointCloud2, out, qos_profile_sensor_data)
         self.create_subscription(PointCloud2, inn, self.on_cloud, qos_profile_sensor_data)
         self.create_timer(2.0, self._stats)
+        t = self.T_base_odin[:3, 3]
         self.get_logger().info(
-            f'Odin→Mid-map timed project: {inn} → {out}, '
-            f'TF {self.map_frame}←{self.body_frame} '
-            f'yaw_only={self.use_yaw_only} cache={cache}s max_delay={self.max_delay}s'
+            f'Odin→map timed project (Go2-base): {inn} → {out}, '
+            f'TF {self.map_frame}←{self.robot_frame} '
+            f'yaw_only={self.use_yaw_only} '
+            f'T_base_odin t=[{t[0]:.4f},{t[1]:.4f},{t[2]:.4f}] '
+            f'cache={cache}s max_delay={self.max_delay}s'
         )
 
     def _stats(self) -> None:
@@ -182,7 +176,7 @@ class OdinMidTimedProject(Node):
         try:
             tf = self._tf.lookup_transform(
                 self.map_frame,
-                self.body_frame,
+                self.robot_frame,
                 Time.from_msg(stamp),
                 timeout=Duration(seconds=0.05),
             )
@@ -196,7 +190,7 @@ class OdinMidTimedProject(Node):
         T_mb = mat_from_tf(tf)
         if self.use_yaw_only:
             T_mb = yaw_only_pose(T_mb)
-        T = T_mb @ self.T_body_odin
+        T = T_mb @ self.T_base_odin
         world = (arr @ T[:3, :3].T) + T[:3, 3]
         header = Header()
         header.stamp = stamp
