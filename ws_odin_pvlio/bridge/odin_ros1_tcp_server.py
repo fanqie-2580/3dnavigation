@@ -229,8 +229,9 @@ def main():
     # Nav may override to /odin1/cloud_slam.
     cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_raw")
     odom_topic = rospy.get_param("~odom_topic", "/odin1/odometry")
-    # Default stride=2: ~24k pts/frame — denser yellow than stride=4, still ~10 Hz.
-    cloud_stride = int(rospy.get_param("~cloud_stride", 2))
+    # stride=4: ~12k pts. With UINT16 confidence fix, FOV stays continuous; lower
+    # payload keeps Jetson lag ~0.1–0.3s so yellow cloud does not jitter from delay.
+    cloud_stride = int(rospy.get_param("~cloud_stride", 4))
 
     hub = ClientHub(light_queue_max=64)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

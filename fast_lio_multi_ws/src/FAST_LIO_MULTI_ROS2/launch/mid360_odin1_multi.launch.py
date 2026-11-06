@@ -149,6 +149,8 @@ def generate_launch_description():
                         'max_accum_points': 400000,
                         'accum_publish_period': 0.5,
                         'accum_skip_sec': 3.0,
+                        # Kill Mid360 ghost/flyers that otherwise pollute room-scale maps.
+                        'max_range': 25.0,
                     }],
                 )
             )
@@ -300,6 +302,7 @@ def generate_launch_description():
                         'accum_gyr_cooldown_sec': 1.0,
                         # Residual dock lag ~1–2s ⇒ Odin voxel accum stays off until lag drops.
                         'max_scan_age_sec': 0.25,
+                        'max_range': 25.0,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],
