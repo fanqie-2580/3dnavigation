@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Mid360 FAST-LIO mapping + Odin densify into Mid map (no CT-LIO).
 
-Default: project delayed Odin raw into map via Go2 base_link + T_base_odin
-(localization pose from Mid LIO TF chain; Odin extrinsic independent of Mid).
+Default: project delayed Odin raw into map using Mid TF at Odin stamp + extrinsic.
 """
 import os
 
@@ -180,21 +179,23 @@ def generate_launch_description():
                         'cloud_topic': '/odin1/cloud_raw',
                         'out_topic': '/odin1/cloud_in_map',
                         'map_frame': 'map',
-                        # Pose via Go2 base; Odin extrinsic is T_base_odin only (no Mid L1→L2).
-                        'robot_frame': 'base_link',
+                        'body_frame': 'body',
                         'tf_cache_sec': 12.0,
                         'max_stamp_delay_sec': 6.0,
                         'stride': 2,
                         'blind': 0.3,
                         'min_confidence': 30.0,
-                        # Odin ≈ gravity-level: strip base pitch/roll when dog yaws.
-                        'use_yaw_only_body': True,
-                        # T_base_odinL = T_base_odinIMU(CAD R=I) @ T_odinIMU_L(wiki R=I)
-                        'extrinsic_T_base_odin': [0.287024, 0.005496, 0.126158],
-                        'extrinsic_R_base_odin': [
-                            1.0, 0.0, 0.0,
-                            0.0, 1.0, 0.0,
-                            0.0, 0.0, 1.0,
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        # Full body attitude: L2 carries Ry(-13°) vs official Mid mount.
+                        'use_yaw_only_body': False,
+                        # CAD T_base_odinIMU + official Mid@Go2IMU + URDF + wiki T_imu_L
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                        # Live ICP+gravity attitude (rpy≈[-0.28,-10.15,-0.13] deg)
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.98434257, 0.00309114, -0.17623892,
+                            -0.00219007, 0.99998352, 0.00530702,
+                            0.17625242, -0.00483795, 0.98433311,
                         ],
                     }],
                 )
@@ -221,9 +222,9 @@ def generate_launch_description():
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
-                            1.0, 0.0, 0.0,
-                            0.0, 1.0, 0.0,
-                            0.0, 0.0, 1.0,
+                            0.98434257, 0.00309114, -0.17623892,
+                            -0.00219007, 0.99998352, 0.00530702,
+                            0.17625242, -0.00483795, 0.98433311,
                         ],
                         'stride': 2,
                         'blind': 0.3,
