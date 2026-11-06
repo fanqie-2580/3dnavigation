@@ -302,6 +302,10 @@ Odin 由 `odin_mid_timed_project` 投到 `/odin1/cloud_in_map` 后，由 `mid_od
 故默认关掉 L2→IEKF；Odin 仍走 `odin_mid_timed_project` + `mid_odin_frame_fuse` 可视化融合。
 `dual_lidar_color_viz` 对 Mid 累积额外过滤 `intensity < 100`，避免融合帧污染。
 
+**Odin 投影时间戳（2026-11-06）**：`odin_mid_timed_project` 不再用 Odin 戳插值 Mid TF。
+改为与 Mid `/Odometry` 严格配对（`|t_cloud−t_mid|≤50ms`），反投影/`T_map_body`/输出
+`header.stamp` **三者同用该 Mid odom 戳**；对不齐则丢弃，避免转身涂错位置。
+
 链路（仅当 mode0 真 raw 时可开 `lidar2_update_en: true`）：
 
 ```text

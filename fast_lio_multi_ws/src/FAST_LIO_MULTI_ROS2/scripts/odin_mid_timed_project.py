@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Project delayed Odin cloud into Mid map using Mid TF at Odin stamp.
+"""Project delayed Odin cloud into Mid map with *exact* Mid /Odometry stamps.
 
-Dock TCP often forwards /odin1/cloud_slam (already in Odin odom) but the host
-publishes it as /odin1/cloud_raw with frame_id=odom. Treating those points as
-lidar-local makes walls yaw-misalign / co-rotate. When frame_id is odom/map:
+Dock often forwards cloud_slam as /odin1/cloud_raw (frame_id=odom). Pipeline:
 
-  p_L = inv(T_odom_imu(t) * T_imu_L) * p_odom
-  p_map = T_map_body(t) * T_body_L1 * T_L1_L2 * p_L
+  p_L   = inv(T_odin_odom(t*) * T_imu_L) * p_odom     # unproject at t*
+  p_map = T_map_body(t*) * T_body_L1 * T_L1_L2 * p_L  # Mid pose at same t*
 
-If frame_id is lidar (true raw), skip the inv(odom) step.
+t* is the Mid /Odometry stamp paired to the cloud — not TF interpolation at a
+loose Odin stamp. Pairing rule (strict):
+
+  |t_cloud - t_mid|  <= mid_pair_max_dt
+  |t_cloud - t_odin| <= odin_pair_max_dt   (only if cloud is odom-frame)
+
+Output header.stamp is *identical* to the Mid /Odometry stamp used. Clouds that
+cannot be paired within the dt gates are dropped (no wrong-pose paint on yaw).
 """
 from __future__ import annotations
 
@@ -19,35 +24,12 @@ from typing import Deque, Optional, Tuple
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
-from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.time import Time
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
-from tf2_ros import Buffer, TransformListener
-
-
-def mat_from_tf(tf: TransformStamped) -> np.ndarray:
-    t = tf.transform.translation
-    q = tf.transform.rotation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
-    x, y, z, w = x / n, y / n, z / n, w / n
-    R = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = [t.x, t.y, t.z]
-    return T
 
 
 def mat_from_odom(msg: Odometry) -> np.ndarray:
@@ -79,7 +61,6 @@ def se3(Rflat, Txyz) -> np.ndarray:
 
 
 def yaw_only_pose(T: np.ndarray) -> np.ndarray:
-    """Keep map translation and yaw; zero pitch/roll."""
     yaw = math.atan2(T[1, 0], T[0, 0])
     c, s = math.cos(yaw), math.sin(yaw)
     out = np.eye(4, dtype=np.float64)
@@ -91,21 +72,32 @@ def yaw_only_pose(T: np.ndarray) -> np.ndarray:
     return out
 
 
+def stamp_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def stamp_key(stamp) -> Tuple[int, int]:
+    return (int(stamp.sec), int(stamp.nanosec))
+
+
 class OdinMidTimedProject(Node):
     def __init__(self) -> None:
         super().__init__('odin_mid_timed_project')
         self.declare_parameter('cloud_topic', '/odin1/cloud_raw')
         self.declare_parameter('out_topic', '/odin1/cloud_in_map')
         self.declare_parameter('odin_odom_topic', '/odin1/odometry')
+        self.declare_parameter('mid_odom_topic', '/Odometry')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('body_frame', 'body')
-        self.declare_parameter('tf_cache_sec', 12.0)
-        self.declare_parameter('max_stamp_delay_sec', 6.0)
-        self.declare_parameter('odom_max_dt_sec', 0.25)
+        # Strict pairing gates (seconds). Mid is ~10 Hz → half-period ≈ 50 ms.
+        # Pose + Odin-odom + output stamp all use the *same* Mid /Odometry time.
+        self.declare_parameter('mid_pair_max_dt', 0.05)
+        self.declare_parameter('odin_pair_max_dt', 0.05)
+        self.declare_parameter('cloud_buffer_sec', 8.0)
+        self.declare_parameter('odom_buffer_sec', 10.0)
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
         self.declare_parameter('min_confidence', 30.0)
-        # auto: unproject if cloud frame_id is odom/map (dock forwards cloud_slam)
         self.declare_parameter('cloud_in_odom', 'auto')
         self.declare_parameter('use_yaw_only_body', False)
         self.declare_parameter('use_yaw_only_odin_odom', False)
@@ -114,8 +106,6 @@ class OdinMidTimedProject(Node):
             'extrinsic_R', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
         self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.12157888, 0.00549610, 0.03169932])
-        # Go2-relative: Odin≈I, Mid@Go2 Ry(+13°) → Mid←Odin Ry(-13°). CAD T kept.
-        # (Old ICP Ry(-10.15°) was fit before odom-cloud unproject; left ~+3.6° pitch.)
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
             [
@@ -124,24 +114,23 @@ class OdinMidTimedProject(Node):
                 0.22495105, 0.0, 0.97437006,
             ],
         )
-        # Official Odin IMU→lidar (wiki), used when un-projecting odom-frame cloud.
         self.declare_parameter('extrinsic_T_imu_L', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter(
             'extrinsic_R_imu_L', [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         )
 
         self.map_frame = str(self.get_parameter('map_frame').value)
-        self.body_frame = str(self.get_parameter('body_frame').value)
-        self.max_delay = float(self.get_parameter('max_stamp_delay_sec').value)
-        self.odom_max_dt = float(self.get_parameter('odom_max_dt_sec').value)
+        self.mid_pair_max_dt = float(self.get_parameter('mid_pair_max_dt').value)
+        self.odin_pair_max_dt = float(self.get_parameter('odin_pair_max_dt').value)
+        self.cloud_buffer_sec = float(self.get_parameter('cloud_buffer_sec').value)
+        self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.blind2 = float(self.get_parameter('blind').value) ** 2
         self.min_conf = float(self.get_parameter('min_confidence').value)
         self.use_yaw_only = bool(self.get_parameter('use_yaw_only_body').value)
         self.use_yaw_only_odin = bool(self.get_parameter('use_yaw_only_odin_odom').value)
         mode = str(self.get_parameter('cloud_in_odom').value).strip().lower()
-        self.cloud_in_odom_mode = mode  # auto|true|false
-        cache = float(self.get_parameter('tf_cache_sec').value)
+        self.cloud_in_odom_mode = mode
 
         T_body_L1 = se3(
             self.get_parameter('extrinsic_R').value,
@@ -157,59 +146,103 @@ class OdinMidTimedProject(Node):
             self.get_parameter('extrinsic_T_imu_L').value,
         )
 
-        self._tf = Buffer(cache_time=Duration(seconds=cache))
-        self._tf_listener = TransformListener(self._tf, self)
-        self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
-        self._drop = 0
-        self._ok = 0
-        self._drop_odom = 0
+        # (t_sec, stamp_msg, T_map_body)
+        self._mid_odom: Deque[Tuple[float, object, np.ndarray]] = deque()
+        # (t_sec, T_odin_odom)
+        self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque()
+        # (t_sec, stamp_msg, PointCloud2)
+        self._cloud_buf: Deque[Tuple[float, object, PointCloud2]] = deque()
+        self._used_cloud_keys: Deque[Tuple[int, int]] = deque(maxlen=500)
+        self._used_mid_keys: Deque[Tuple[int, int]] = deque(maxlen=500)
 
-        from rclpy.qos import qos_profile_sensor_data
+        self._ok = 0
+        self._drop_mid = 0
+        self._drop_odin = 0
+        self._drop_empty = 0
+        self._sum_dt_mid = 0.0
+        self._sum_dt_odin = 0.0
+
+        reliable = QoSProfile(
+            depth=50,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
         out = str(self.get_parameter('out_topic').value)
         inn = str(self.get_parameter('cloud_topic').value)
-        odom_topic = str(self.get_parameter('odin_odom_topic').value)
-        self.pub = self.create_publisher(PointCloud2, out, qos_profile_sensor_data)
-        self.create_subscription(PointCloud2, inn, self.on_cloud, qos_profile_sensor_data)
-        self.create_subscription(Odometry, odom_topic, self.on_odom, qos_profile_sensor_data)
+        odin_odom_topic = str(self.get_parameter('odin_odom_topic').value)
+        mid_odom_topic = str(self.get_parameter('mid_odom_topic').value)
+        self.pub = self.create_publisher(PointCloud2, out, reliable)
+        self.create_subscription(PointCloud2, inn, self.on_cloud, reliable)
+        self.create_subscription(Odometry, odin_odom_topic, self.on_odin_odom, reliable)
+        self.create_subscription(Odometry, mid_odom_topic, self.on_mid_odom, reliable)
         self.create_timer(2.0, self._stats)
         self.get_logger().info(
-            f'Odin→Mid-map timed project: {inn} → {out}, '
-            f'TF {self.map_frame}←{self.body_frame} '
-            f'yaw_only={self.use_yaw_only} cloud_in_odom={self.cloud_in_odom_mode} '
-            f'cache={cache}s max_delay={self.max_delay}s'
+            f'Odin→Mid-map EXACT-stamp project: {inn} → {out}, '
+            f'mid_odom={mid_odom_topic} odin_odom={odin_odom_topic} '
+            f'mid_dt<={self.mid_pair_max_dt:.3f}s odin_dt<={self.odin_pair_max_dt:.3f}s '
+            f'cloud_in_odom={self.cloud_in_odom_mode} (output stamp == Mid /Odometry stamp)'
         )
+
+    def _trim(self, buf: deque, newest_t: float, horizon: float) -> None:
+        while buf and (newest_t - buf[0][0]) > horizon:
+            buf.popleft()
 
     def _stats(self) -> None:
-        total = self._ok + self._drop
+        total = self._ok + self._drop_mid + self._drop_odin + self._drop_empty
         if total == 0:
             return
+        avg_mid = self._sum_dt_mid / self._ok if self._ok else 0.0
+        avg_odin = self._sum_dt_odin / self._ok if self._ok else 0.0
         self.get_logger().info(
-            f'timed_project ok={self._ok} drop={self._drop} '
-            f'odom_miss={self._drop_odom} '
-            f'({100.0 * self._ok / total:.0f}% hit)'
+            f'timed_project ok={self._ok} drop_mid={self._drop_mid} '
+            f'drop_odin={self._drop_odin} empty={self._drop_empty} '
+            f'avg|dt_mid|={avg_mid * 1000:.1f}ms avg|dt_odin|={avg_odin * 1000:.1f}ms '
+            f'buf_cloud={len(self._cloud_buf)} buf_mid={len(self._mid_odom)}'
         )
         self._ok = 0
-        self._drop = 0
-        self._drop_odom = 0
+        self._drop_mid = 0
+        self._drop_odin = 0
+        self._drop_empty = 0
+        self._sum_dt_mid = 0.0
+        self._sum_dt_odin = 0.0
 
-    def on_odom(self, msg: Odometry) -> None:
-        t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+    def on_odin_odom(self, msg: Odometry) -> None:
+        t = stamp_sec(msg.header.stamp)
         self._odin_odom.append((t, mat_from_odom(msg)))
+        self._trim(self._odin_odom, t, self.odom_buffer_sec)
 
-    def _lookup_odin_odom(self, stamp) -> Optional[np.ndarray]:
-        if not self._odin_odom:
-            return None
-        t = Time.from_msg(stamp).nanoseconds * 1e-9
+    def on_mid_odom(self, msg: Odometry) -> None:
+        t = stamp_sec(msg.header.stamp)
+        self._mid_odom.append((t, msg.header.stamp, mat_from_odom(msg)))
+        self._trim(self._mid_odom, t, self.odom_buffer_sec)
+        # Mid tick drives matching so delayed Odin can catch up to historical Mid.
+        self._try_match()
+
+    def on_cloud(self, msg: PointCloud2) -> None:
+        t = stamp_sec(msg.header.stamp)
+        self._cloud_buf.append((t, msg.header.stamp, msg))
+        self._trim(self._cloud_buf, t, self.cloud_buffer_sec)
+        self._try_match()
+
+    def _nearest_mid(self, t_cloud: float):
         best = None
         best_dt = 1e9
-        for ot, T in self._odin_odom:
-            dt = abs(ot - t)
+        for t, stamp, T in self._mid_odom:
+            dt = abs(t - t_cloud)
             if dt < best_dt:
                 best_dt = dt
-                best = T
-        if best is None or best_dt > self.odom_max_dt:
-            return None
+                best = (t, stamp, T, dt)
+        return best
+
+    def _nearest_odin(self, t_cloud: float):
+        best = None
+        best_dt = 1e9
+        for t, T in self._odin_odom:
+            dt = abs(t - t_cloud)
+            if dt < best_dt:
+                best_dt = dt
+                best = (t, T, dt)
         return best
 
     def _cloud_is_in_odom(self, msg: PointCloud2) -> bool:
@@ -247,52 +280,92 @@ class OdinMidTimedProject(Node):
             k += 1
         return np.asarray(pts, dtype=np.float64) if pts else np.zeros((0, 3), dtype=np.float64)
 
-    def on_cloud(self, msg: PointCloud2) -> None:
-        stamp = msg.header.stamp
-        now = self.get_clock().now()
-        delay = (now - Time.from_msg(stamp)).nanoseconds * 1e-9
-        if delay < -0.5 or delay > self.max_delay:
-            self._drop += 1
+    def _try_match(self) -> None:
+        if not self._cloud_buf or not self._mid_odom:
             return
-        try:
-            tf = self._tf.lookup_transform(
-                self.map_frame,
-                self.body_frame,
-                Time.from_msg(stamp),
-                timeout=Duration(seconds=0.05),
+
+        # Process oldest clouds first so delayed frames still bind to historical Mid.
+        pending = list(self._cloud_buf)
+        self._cloud_buf.clear()
+        for t_cloud, cloud_stamp, msg in pending:
+            ckey = stamp_key(cloud_stamp)
+            if ckey in self._used_cloud_keys:
+                continue
+
+            mid = self._nearest_mid(t_cloud)
+            if mid is None or mid[3] > self.mid_pair_max_dt:
+                newest_mid = self._mid_odom[-1][0]
+                oldest_mid = self._mid_odom[0][0]
+                # Cloud still in the future relative to Mid → wait.
+                if t_cloud > newest_mid + self.mid_pair_max_dt:
+                    self._cloud_buf.append((t_cloud, cloud_stamp, msg))
+                    continue
+                # Mid has already passed this cloud with no tight pair → drop.
+                if t_cloud < oldest_mid - self.mid_pair_max_dt or newest_mid > t_cloud + self.mid_pair_max_dt:
+                    self._drop_mid += 1
+                    continue
+                self._cloud_buf.append((t_cloud, cloud_stamp, msg))
+                continue
+
+            t_mid, mid_stamp, T_mb, dt_mid = mid
+            mkey = stamp_key(mid_stamp)
+            if mkey in self._used_mid_keys:
+                # Already painted one Odin cloud for this Mid tick; drop extras.
+                self._drop_mid += 1
+                continue
+
+            need_unproj = self._cloud_is_in_odom(msg)
+            dt_odin = 0.0
+            T_oi = None
+            if need_unproj:
+                # cloud_slam was generated at t_cloud → unproject with Odin odom @ t_cloud.
+                # Mid pose is the paired Mid odom (@ t_mid≈t_cloud). Both gates ≤50ms.
+                od = self._nearest_odin(t_cloud)
+                if od is None or od[2] > self.odin_pair_max_dt:
+                    if self._odin_odom and t_cloud > self._odin_odom[-1][0] + self.odin_pair_max_dt:
+                        self._cloud_buf.append((t_cloud, cloud_stamp, msg))
+                        continue
+                    if (not self._odin_odom) or t_cloud > self._odin_odom[-1][0] - 0.5:
+                        self._cloud_buf.append((t_cloud, cloud_stamp, msg))
+                        continue
+                    self._drop_odin += 1
+                    continue
+                _t_o, T_oi, dt_odin = od
+                if abs(t_mid - _t_o) > self.mid_pair_max_dt:
+                    self._drop_odin += 1
+                    continue
+
+            arr = self._xyz(msg)
+            if arr.size == 0:
+                self._drop_empty += 1
+                continue
+
+            if need_unproj and T_oi is not None:
+                if self.use_yaw_only_odin:
+                    T_oi = yaw_only_pose(T_oi)
+                T_oL = T_oi @ self.T_imu_L
+                R = T_oL[:3, :3]
+                t = T_oL[:3, 3]
+                # p_L = R^T (p_o - t); row vectors => (p - t) @ R
+                arr = (arr - t) @ R
+
+            if self.use_yaw_only:
+                T_mb = yaw_only_pose(T_mb)
+            T = T_mb @ self.T_body_odin
+            world = (arr @ T[:3, :3].T) + T[:3, 3]
+
+            header = Header()
+            # Identical to Mid /Odometry stamp used for the pose.
+            header.stamp = mid_stamp
+            header.frame_id = self.map_frame
+            self.pub.publish(
+                point_cloud2.create_cloud_xyz32(header, world.astype(np.float32))
             )
-        except Exception:
-            self._drop += 1
-            return
-
-        arr = self._xyz(msg)
-        if arr.size == 0:
-            return
-
-        if self._cloud_is_in_odom(msg):
-            T_oi = self._lookup_odin_odom(stamp)
-            if T_oi is None:
-                self._drop += 1
-                self._drop_odom += 1
-                return
-            if self.use_yaw_only_odin:
-                T_oi = yaw_only_pose(T_oi)
-            T_oL = T_oi @ self.T_imu_L
-            # p_L = inv(T_oL) * p_odom
-            R = T_oL[:3, :3]
-            t = T_oL[:3, 3]
-            arr = (arr - t) @ R
-
-        T_mb = mat_from_tf(tf)
-        if self.use_yaw_only:
-            T_mb = yaw_only_pose(T_mb)
-        T = T_mb @ self.T_body_odin
-        world = (arr @ T[:3, :3].T) + T[:3, 3]
-        header = Header()
-        header.stamp = stamp
-        header.frame_id = self.map_frame
-        self.pub.publish(point_cloud2.create_cloud_xyz32(header, world.astype(np.float32)))
-        self._ok += 1
+            self._used_cloud_keys.append(ckey)
+            self._used_mid_keys.append(mkey)
+            self._ok += 1
+            self._sum_dt_mid += dt_mid
+            self._sum_dt_odin += dt_odin
 
 
 def main() -> None:

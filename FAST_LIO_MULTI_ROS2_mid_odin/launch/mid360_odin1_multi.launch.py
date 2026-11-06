@@ -204,18 +204,21 @@ def generate_launch_description():
                     parameters=[{
                         'cloud_topic': '/odin1/cloud_raw',
                         'out_topic': '/odin1/cloud_in_map',
+                        'mid_odom_topic': '/Odometry',
+                        'odin_odom_topic': '/odin1/odometry',
                         'map_frame': 'map',
                         'body_frame': 'body',
-                        'tf_cache_sec': 12.0,
-                        'max_stamp_delay_sec': 6.0,
+                        # Exact Mid-/Odometry pairing (no TF interp). Output stamp == Mid stamp.
+                        'mid_pair_max_dt': 0.05,
+                        'odin_pair_max_dt': 0.05,
+                        'cloud_buffer_sec': 8.0,
+                        'odom_buffer_sec': 10.0,
                         'stride': 2,
                         'blind': 0.3,
                         'min_confidence': 30.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        # Full body + odom unproject; L2 = Ry(-13°) from Go2-relative CAD.
                         'use_yaw_only_body': False,
-                        # CAD T MidL→OdinL; R = Ry(-13°) (Odin≈I vs Go2, Mid Ry(+13°))
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
                         'extrinsic_R_L2_wrt_L1': [
                             0.97437006, 0.0, -0.22495105,
