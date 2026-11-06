@@ -208,8 +208,10 @@ def generate_launch_description():
                         'odin_odom_topic': '/odin1/odometry',
                         'map_frame': 'map',
                         'body_frame': 'body',
-                        # Live: newest Mid pose × newest Odin cloud (no historical catch-up).
-                        'odin_pair_max_dt': 0.15,
+                        # Exact Mid-/Odometry pairing (no TF interp). Output stamp == Mid stamp.
+                        'mid_pair_max_dt': 0.05,
+                        'odin_pair_max_dt': 0.05,
+                        'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
                         'stride': 2,
                         'blind': 0.3,
