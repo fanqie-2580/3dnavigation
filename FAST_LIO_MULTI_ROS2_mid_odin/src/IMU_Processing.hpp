@@ -1,5 +1,8 @@
 #include <cmath>
 #include <deque>
+#include <numeric>
+#include <vector>
+#include <algorithm>
 #include <csignal>
 #include <Eigen/Eigen>
 #include <pcl/point_cloud.h>
@@ -39,6 +42,7 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_, const bool &multi_lidar, int lidar_num = 1);
+  bool IMU_inited() const { return !imu_need_init_; }
 
   V3D cov_acc;
   V3D cov_gyr;
@@ -166,9 +170,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
-  
-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+  // Gravity-align Mid360/IMU world so CloudMap is level vs RViz Grid.
+  // Odin cloud_raw is already near gravity-level; laserMapping compensates
+  // LiDAR2_wrt_LiDAR1 by R_wi^T once after IMU_inited() so Odin is not re-tilted.
+  {
+    V3D gz_body = (-mean_acc / mean_acc.norm());
+    Eigen::Quaterniond q_align =
+        Eigen::Quaterniond::FromTwoVectors(gz_body, V3D(0.0, 0.0, -1.0));
+    init_state.rot = SO3(q_align.toRotationMatrix());
+    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  }
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
@@ -197,7 +208,16 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   const double &pcl_end_time = lidar_num == 1 ? meas.lidar_end_time : meas.lidar_end_time2;
   
   /*** sort point clouds by offset time ***/
-  pcl_out = *(meas.lidar);
+  if (lidar_num == 2)
+  {
+    assert(meas.lidar2 != nullptr);
+    pcl_out = *(meas.lidar2);
+  }
+  else
+  {
+    assert(meas.lidar != nullptr);
+    pcl_out = *(meas.lidar);
+  }
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
   // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
   //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
@@ -312,20 +332,27 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
   v_imu.push_front(last_imu_);
-  const double &imu_beg_time = get_time_sec(v_imu.front()->header.stamp);
-  const double &imu_end_time = get_time_sec(v_imu.back()->header.stamp);
-  const double &pcl_beg_time = meas.lidar_beg_time < meas.lidar_beg_time2 ? meas.lidar_beg_time : meas.lidar_beg_time2;
-  const double &pcl_end_time = meas.lidar_end_time > meas.lidar_end_time2 ? meas.lidar_end_time : meas.lidar_end_time2;
+  const double imu_end_time = get_time_sec(v_imu.back()->header.stamp);
+  // Keep Mid/Odin on their own scan clocks. Mixing them onto min(beg) via float
+  // curvature shifts + a shared backward pass can yield |dt|≫scan period and
+  // explode Mid points (raw Mid stays ~10m, body Mid becomes 50–200m).
+  constexpr double kMaxBundleSpan = 0.20; // s; Mid+Odin pair should already be ≪ this
+  constexpr double kMaxUndistortDt = 0.12; // s; motion-compensation model limit (~1 Mid scan)
 
-  /*** sort point clouds by offset time ***/
+  double pcl_beg_time = std::min(meas.lidar_beg_time, meas.lidar_beg_time2);
+  double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
+  if (pcl_end_time - pcl_beg_time > kMaxBundleSpan)
+  {
+    // Pathological pair/time base: fall back to Mid-only window for propagation.
+    pcl_beg_time = meas.lidar_beg_time;
+    pcl_end_time = meas.lidar_end_time;
+  }
+
   PointCloudXYZI pcl_1_out = *(meas.lidar);
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
-
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
   sort(pcl_2_out.points.begin(), pcl_2_out.points.end(), time_list);
-  // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
-  //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
-  
+
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
@@ -340,9 +367,9 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   {
     auto &&head = *(it_imu);
     auto &&tail = *(it_imu + 1);
-    
-    if (get_time_sec(tail->header.stamp) < last_lidar_end_time_)    continue;
-    
+
+    if (get_time_sec(tail->header.stamp) < last_lidar_end_time_) continue;
+
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
                 0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
@@ -350,17 +377,13 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
 
-    acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
+    acc_avr = acc_avr * G_m_s2 / mean_acc.norm();
 
-    if(get_time_sec(head->header.stamp) < last_lidar_end_time_)
-    {
+    if (get_time_sec(head->header.stamp) < last_lidar_end_time_)
       dt = get_time_sec(tail->header.stamp) - last_lidar_end_time_;
-    }
     else
-    {
       dt = get_time_sec(tail->header.stamp) - get_time_sec(head->header.stamp);
-    }
-    
+
     in.acc = acc_avr;
     in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
@@ -369,98 +392,80 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
     kf_state.predict(dt, Q, in);
 
-    /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
     angvel_last = angvel_avr - imu_state.bg;
-    acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
-    for(int i=0; i<3; i++)
-    {
+    acc_s_last = imu_state.rot * (acc_avr - imu_state.ba);
+    for (int i = 0; i < 3; i++)
       acc_s_last[i] += imu_state.grav[i];
-    }
     double &&offs_t = get_time_sec(tail->header.stamp) - pcl_beg_time;
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
   }
 
-
-  /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  if (std::fabs(dt) > kMaxBundleSpan)
+    dt = note * kMaxBundleSpan;
   kf_state.predict(dt, Q, in);
-  
+
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
-  /*** undistort each lidar point (backward propagation) ***/
+  // Deskew one cloud: point time = lidar_beg_offset + curvature_ms/1000, relative to pcl_beg.
+  auto deskew_cloud = [&](PointCloudXYZI &cloud, const double lidar_beg_time)
   {
-    if (pcl_1_out.points.begin() == pcl_1_out.points.end()) return;
-    auto it_pcl = pcl_1_out.points.end() - 1;
+    if (cloud.points.empty() || IMUpose.size() <= 1)
+      return;
+    const double beg_off = lidar_beg_time - pcl_beg_time;
+    // Work on indices sorted by absolute point time (do not mutate curvature).
+    std::vector<int> order(cloud.points.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+      return cloud.points[a].curvature < cloud.points[b].curvature;
+    });
+
+    size_t idx = order.size();
     for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
     {
       auto head = it_kp - 1;
       auto tail = it_kp;
-      R_imu<<MAT_FROM_ARRAY(head->rot);
-      // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
-      vel_imu<<VEC_FROM_ARRAY(head->vel);
-      pos_imu<<VEC_FROM_ARRAY(head->pos);
-      acc_imu<<VEC_FROM_ARRAY(tail->acc);
-      angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
+      R_imu << MAT_FROM_ARRAY(head->rot);
+      vel_imu << VEC_FROM_ARRAY(head->vel);
+      pos_imu << VEC_FROM_ARRAY(head->pos);
+      acc_imu << VEC_FROM_ARRAY(tail->acc);
+      angvel_avr << VEC_FROM_ARRAY(tail->gyr);
 
-      for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
+      while (idx > 0)
       {
-        dt = it_pcl->curvature / double(1000) - head->offset_time;
-
-        /* Transform to the 'end' frame, using only the rotation
-         * Note: Compensation direction is INVERSE of Frame's moving direction
-         * So if we want to compensate a point at timestamp-i to the frame-e
-         * P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
+        PointType &pt = cloud.points[order[idx - 1]];
+        const double t = beg_off + static_cast<double>(pt.curvature) / 1000.0;
+        if (t <= head->offset_time)
+          break;
+        --idx;
+        dt = t - head->offset_time;
+        // Invalid relative time → skip compensation (keep raw lidar point).
+        if (std::fabs(dt) > kMaxUndistortDt)
+          continue;
         M3D R_i(R_imu * Exp(angvel_avr, dt));
-        
-        V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
+        V3D P_i(pt.x, pt.y, pt.z);
         V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
-        V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
-        
-        // save Undistorted points and their rotation
-        it_pcl->x = P_compensate(0);
-        it_pcl->y = P_compensate(1);
-        it_pcl->z = P_compensate(2);
-
-        if (it_pcl == pcl_1_out.points.begin()) break;
+        V3D P_compensate =
+            imu_state.offset_R_L_I.conjugate() *
+            (imu_state.rot.conjugate() *
+                 (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) -
+             imu_state.offset_T_L_I);
+        pt.x = P_compensate(0);
+        pt.y = P_compensate(1);
+        pt.z = P_compensate(2);
       }
     }
-  }
-  {
-    if (pcl_2_out.points.begin() == pcl_2_out.points.end()) return;
-    auto it_pcl = pcl_2_out.points.end() - 1;
-    for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
-    {
-      auto head = it_kp - 1;
-      auto tail = it_kp;
-      R_imu<<MAT_FROM_ARRAY(head->rot);
-      vel_imu<<VEC_FROM_ARRAY(head->vel);
-      pos_imu<<VEC_FROM_ARRAY(head->pos);
-      acc_imu<<VEC_FROM_ARRAY(tail->acc);
-      angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
+  };
 
-      for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
-      {
-        dt = it_pcl->curvature / double(1000) - head->offset_time;
-        M3D R_i(R_imu * Exp(angvel_avr, dt));
-        V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
-        V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
-        V3D P_compensate = imu_state.offset_R_L_I.conjugate() * (imu_state.rot.conjugate() * (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);// not accurate!
-        
-        // save Undistorted points and their rotation
-        it_pcl->x = P_compensate(0);
-        it_pcl->y = P_compensate(1);
-        it_pcl->z = P_compensate(2);
-        if (it_pcl == pcl_2_out.points.begin()) break;
-      }
-    }
-  }
-  // Tag source for fused /cloud_registered visualization (Mid=10, Odin=200).
-  for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;
-  for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;
+  deskew_cloud(pcl_1_out, meas.lidar_beg_time);
+  deskew_cloud(pcl_2_out, meas.lidar_beg_time2);
+
+  for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
+  for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1
   pcl_out = pcl_1_out + pcl_2_out;
 }
 
@@ -491,7 +496,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   }
 
   if (multi_lidar) UndistortPclMultiLiDAR(meas, kf_state, *cur_pcl_un_);
-  else UndistortPcl(meas, kf_state, *cur_pcl_un_, lidar_num);
+  else
+  {
+    UndistortPcl(meas, kf_state, *cur_pcl_un_, lidar_num);
+    // Async single-lidar path: still tag source so publish/viz/filters can split.
+    const float tag = (lidar_num == 2) ? 200.0f : 10.0f;
+    for (auto &pt : cur_pcl_un_->points) pt.intensity = tag;
+  }
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
 }
