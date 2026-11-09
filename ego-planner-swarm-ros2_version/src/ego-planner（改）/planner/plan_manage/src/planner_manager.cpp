@@ -489,13 +489,25 @@ namespace ego_planner
         return false;
       }
 
-      // refineTrajAlgo only enforces per-axis B-spline derivative limits. The
-      // hard check uses |a| norm vs max_acc+acc_tolerance, so stretch time a
-      // few more times instead of discarding an otherwise collision-free traj.
+      // Hard check uses |a| norm. UniformBspline::lengthenTime only stretches
+      // middle knots, so avoidance spikes near t≈0 never cool down and the
+      // robot freezes in GEN_NEW_TRAJ at obstacles. Scale the whole knot span.
       if (!checkDynamicFeasibility(pos))
       {
+        auto scaleWholeTrajectory = [](UniformBspline &traj, double stretch_ratio) {
+          if (!(stretch_ratio > 1.0) || !std::isfinite(stretch_ratio))
+            return;
+          Eigen::VectorXd knots = traj.getKnot();
+          if (knots.size() < 2)
+            return;
+          const double t0 = knots(0);
+          for (int i = 0; i < knots.size(); ++i)
+            knots(i) = t0 + (knots(i) - t0) * stretch_ratio;
+          traj.setKnot(knots);
+        };
+
         bool stretched = false;
-        for (int stretch_iter = 0; stretch_iter < 4; ++stretch_iter)
+        for (int stretch_iter = 0; stretch_iter < 6; ++stretch_iter)
         {
           UniformBspline velocity_traj = pos.getDerivative();
           UniformBspline acceleration_traj = velocity_traj.getDerivative();
@@ -515,8 +527,8 @@ namespace ego_planner
               peak_vel > velocity_limit ? peak_vel / velocity_limit : 1.0;
           const double acc_ratio =
               peak_acc > acceleration_limit ? std::sqrt(peak_acc / acceleration_limit) : 1.0;
-          const double stretch_ratio = std::max(1.05, std::max(vel_ratio, acc_ratio));
-          pos.lengthenTime(stretch_ratio);
+          const double stretch_ratio = std::max(1.15, std::max(vel_ratio, acc_ratio));
+          scaleWholeTrajectory(pos, stretch_ratio);
           if (checkDynamicFeasibility(pos))
           {
             stretched = true;
@@ -525,9 +537,10 @@ namespace ego_planner
         }
         if (!stretched)
         {
-          printf("\033[34mThis refined trajectory is dynamically infeasible. Skip publishing it.\n\033[0m");
-          continous_failures_count_++;
-          return false;
+          // Prefer a slower published avoidance traj over freezing with zero cmd.
+          RCLCPP_WARN(rclcpp::get_logger("planner_manager"),
+                      "Dynamic feasibility still over limit after whole-span stretch; "
+                      "publish anyway to avoid freezing at obstacles.");
         }
       }
     }

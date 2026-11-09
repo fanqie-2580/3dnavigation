@@ -201,7 +201,9 @@ def generate_launch_description():
             {'optimization/max_vel': ParameterValue(max_vel, value_type=float)},
             {'optimization/vel_tolerance': 1.0},
             {'optimization/max_acc': ParameterValue(max_acc, value_type=float)},
-            {'optimization/acc_tolerance': 1.0},
+            # Rebound around obstacles often needs |a|~1.6-2.0 briefly; 1.0 made
+            # every avoidance traj fail hard-check and froze the robot at the obstacle.
+            {'optimization/acc_tolerance': 2.5},
             {'optimization/verbose_rebound_log': False},
             {'bspline/limit_vel': ParameterValue(max_vel, value_type=float)},
             {'bspline/limit_acc': ParameterValue(max_acc, value_type=float)},
