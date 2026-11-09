@@ -482,11 +482,53 @@ namespace ego_planner
           pos = UniformBspline(optimal_control_points, 3, ts);
       }
 
-      if (!flag_step_2_success || !checkDynamicFeasibility(pos))
+      if (!flag_step_2_success)
       {
         printf("\033[34mThis refined trajectory is dynamically infeasible. Skip publishing it.\n\033[0m");
         continous_failures_count_++;
         return false;
+      }
+
+      // refineTrajAlgo only enforces per-axis B-spline derivative limits. The
+      // hard check uses |a| norm vs max_acc+acc_tolerance, so stretch time a
+      // few more times instead of discarding an otherwise collision-free traj.
+      if (!checkDynamicFeasibility(pos))
+      {
+        bool stretched = false;
+        for (int stretch_iter = 0; stretch_iter < 4; ++stretch_iter)
+        {
+          UniformBspline velocity_traj = pos.getDerivative();
+          UniformBspline acceleration_traj = velocity_traj.getDerivative();
+          const double duration = pos.getTimeSum();
+          const double sample_dt = std::max(0.01, std::min(0.05, duration / 50.0));
+          const double velocity_limit = pp_.max_vel_ + pp_.vel_tolerance_;
+          const double acceleration_limit = pp_.max_acc_ + pp_.acc_tolerance_;
+          double peak_vel = 0.0;
+          double peak_acc = 0.0;
+          for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
+          {
+            const double sample_time = std::min(t, duration);
+            peak_vel = std::max(peak_vel, velocity_traj.evaluateDeBoorT(sample_time).norm());
+            peak_acc = std::max(peak_acc, acceleration_traj.evaluateDeBoorT(sample_time).norm());
+          }
+          const double vel_ratio =
+              peak_vel > velocity_limit ? peak_vel / velocity_limit : 1.0;
+          const double acc_ratio =
+              peak_acc > acceleration_limit ? std::sqrt(peak_acc / acceleration_limit) : 1.0;
+          const double stretch_ratio = std::max(1.05, std::max(vel_ratio, acc_ratio));
+          pos.lengthenTime(stretch_ratio);
+          if (checkDynamicFeasibility(pos))
+          {
+            stretched = true;
+            break;
+          }
+        }
+        if (!stretched)
+        {
+          printf("\033[34mThis refined trajectory is dynamically infeasible. Skip publishing it.\n\033[0m");
+          continous_failures_count_++;
+          return false;
+        }
       }
     }
     else

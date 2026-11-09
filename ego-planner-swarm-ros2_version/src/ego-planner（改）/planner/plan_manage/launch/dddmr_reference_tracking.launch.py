@@ -80,7 +80,12 @@ def generate_launch_description():
     pointcloud_vertical_inflation = LaunchConfiguration('pointcloud_vertical_inflation')
     pointcloud_vertical_inflation_down = LaunchConfiguration('pointcloud_vertical_inflation_down')
     project_pointcloud_to_ground = LaunchConfiguration('project_pointcloud_to_ground')
+    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
+    pointcloud_self_filter_z_down = LaunchConfiguration('pointcloud_self_filter_z_down')
+    pointcloud_self_filter_z_up = LaunchConfiguration('pointcloud_self_filter_z_up')
     dist0 = LaunchConfiguration('dist0')
+    align_stuck_timeout = LaunchConfiguration('align_stuck_timeout')
+    align_progress_min = LaunchConfiguration('align_progress_min')
 
     ego_planner_node = Node(
         package='ego_planner',
@@ -169,6 +174,9 @@ def generate_launch_description():
             {'grid_map/sensor_origin_offset_y': ParameterValue(sensor_origin_offset_y, value_type=float)},
             {'grid_map/sensor_origin_offset_z': ParameterValue(sensor_origin_offset_z, value_type=float)},
             {'grid_map/project_pointcloud_to_ground': ParameterValue(project_pointcloud_to_ground, value_type=bool)},
+            {'grid_map/pointcloud_body_clearance_radius': ParameterValue(pointcloud_body_clearance_radius, value_type=float)},
+            {'grid_map/pointcloud_self_filter_z_down': ParameterValue(pointcloud_self_filter_z_down, value_type=float)},
+            {'grid_map/pointcloud_self_filter_z_up': ParameterValue(pointcloud_self_filter_z_up, value_type=float)},
             {'grid_map/virtual_ceil_height': ParameterValue(virtual_ceil_height, value_type=float)},
             {'grid_map/vis_height': ParameterValue(vis_height, value_type=float)},
             {'grid_map/show_occ_time': False},
@@ -227,6 +235,8 @@ def generate_launch_description():
             {'traj_server/finish_distance': ParameterValue(finish_distance, value_type=float)},
             {'traj_server/yaw_lookahead_time': ParameterValue(yaw_lookahead_time, value_type=float)},
             {'traj_server/heading_error_threshold': ParameterValue(heading_error_threshold, value_type=float)},
+            {'traj_server/align_stuck_timeout': ParameterValue(align_stuck_timeout, value_type=float)},
+            {'traj_server/align_progress_min': ParameterValue(align_progress_min, value_type=float)},
             {'traj_server/max_vx': ParameterValue(controller_max_vx, value_type=float)},
             {'traj_server/max_vy': ParameterValue(max_vy, value_type=float)},
             {'traj_server/max_wz': ParameterValue(max_wz, value_type=float)},
@@ -365,6 +375,26 @@ def generate_launch_description():
         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='SCAN obstacles_inflation_z_up=0.1'),
         DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.10', description='SCAN obstacles_inflation_z_down=0.1'),
         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
+        DeclareLaunchArgument(
+            'pointcloud_body_clearance_radius',
+            default_value='0.40',
+            description='XY radius around the LiDAR origin used to drop Mid360 self-returns before occupancy inflate'),
+        DeclareLaunchArgument(
+            'pointcloud_self_filter_z_down',
+            default_value='0.35',
+            description='Self-filter extent below the sensor origin; covers legs/ground returns under the body'),
+        DeclareLaunchArgument(
+            'pointcloud_self_filter_z_up',
+            default_value='0.30',
+            description='Self-filter extent above the sensor origin; covers body/self returns near trajectory height'),
+        DeclareLaunchArgument(
+            'align_stuck_timeout',
+            default_value='3.0',
+            description='If heading alignment makes no progress for this many seconds, resume tracking instead of FAULT_STOP'),
+        DeclareLaunchArgument(
+            'align_progress_min',
+            default_value='0.05',
+            description='Minimum |yaw_error| reduction within align_stuck_timeout to count as progress'),
         DeclareLaunchArgument('dist0', default_value='0.2', description='Soft collision clearance; matches SCAN optimization/dist0'),
         DeclareLaunchArgument('virtual_ceil_height', default_value='-1.0', description='Disable the virtual ceiling to match SCAN map behavior'),
         DeclareLaunchArgument('vis_height', default_value='0.3', description='Display occupancy up to this height above the current sensor pose; matches SCAN'),
