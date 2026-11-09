@@ -30,13 +30,21 @@
 */
 //@For graph
 #include <perception_3d/dynamic_graph.h>
+#include <algorithm>
 
 namespace perception_3d
 {
 
 void DynamicGraph::setValue(unsigned int key, double distance){
-  //@ make sure we set minimum value, we have initialize the graph_, so dont worry memory lookup crash
-  graph_[key] = std::min(graph_[key],distance);
+  //@ Keep the minimum clearance. Missing keys must NOT default-construct to 0 via
+  //@ operator[], otherwise the first mark becomes min(0, distance)=0 and unmarked
+  //@ nodes later read as lethal in RViz / planning.
+  auto it = graph_.find(key);
+  if (it == graph_.end()) {
+    graph_.emplace(key, distance);
+  } else {
+    it->second = std::min(it->second, distance);
+  }
 }
 
 void DynamicGraph::clearValue(unsigned int key, double distance){
@@ -45,7 +53,12 @@ void DynamicGraph::clearValue(unsigned int key, double distance){
 }
 
 double DynamicGraph::getValue(const unsigned int index){
-  return graph_[index];
+  auto it = graph_.find(index);
+  if (it == graph_.end()) {
+    //@ Unmarked == free: return max clearance instead of 0 (lethal).
+    return max_obstacle_distance_;
+  }
+  return it->second;
 }
 
 void DynamicGraph::clear(){
@@ -53,8 +66,11 @@ void DynamicGraph::clear(){
 }
 
 void DynamicGraph::initial(std::size_t n, double max_obstacle_distance){
+  max_obstacle_distance_ = max_obstacle_distance;
+  graph_.clear();
+  graph_.reserve(n + 1);
   for(unsigned int i=0;i<=n;i++){
-    graph_[i] = max_obstacle_distance;
+    graph_[i] = max_obstacle_distance_;
   }
 }
 

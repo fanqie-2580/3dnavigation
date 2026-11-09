@@ -600,8 +600,7 @@ void StaticLayer::resetdGraph(){
 
 double StaticLayer::get_dGraphValue(const unsigned int index){
   std::unique_lock<std::recursive_mutex> lock(shared_data_->ground_kdtree_cb_mutex_);
-  if (dGraph_.graph_.find(index) == dGraph_.graph_.end())
-    return 0.0;
+  //@ Missing entry means unmarked/free (max clearance), not lethal 0.
   return dGraph_.getValue(index);
 }
 

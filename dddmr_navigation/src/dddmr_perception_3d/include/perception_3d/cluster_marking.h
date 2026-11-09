@@ -123,10 +123,8 @@ class Marking{
     marking_t::iterator getEnd(){return marking_.end();};
 
     double get_dGraphValue(const unsigned int index){
-      if (dGraph_->graph_.find(index) == dGraph_->graph_.end()){
-        RCLCPP_INFO(rclcpp::get_logger(name_), "dGraph is queried without initialization, make sure your sensor topic is published and TF setup is correct.");
-        return 0.0;
-      }
+      //@ DynamicGraph::getValue returns max clearance for unmarked nodes.
+      //@ Do not treat missing keys as lethal 0 — that blacks out free ground in RViz.
       return dGraph_->getValue(index);
     };
 

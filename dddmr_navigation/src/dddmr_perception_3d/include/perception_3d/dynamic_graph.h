@@ -46,16 +46,19 @@ class DynamicGraph{
 
   public:
 
+    DynamicGraph() : max_obstacle_distance_(9999.0) {}
+
     void setValue(unsigned key, double distance);
     void clearValue(unsigned key, double distance);
     double getValue(const unsigned int index);
     void clear();
     void initial(std::size_t n, double max_obstacle_distance);
     unsigned long getdGraphSize(){return graph_.size();}
+    double getMaxObstacleDistance() const {return max_obstacle_distance_;}
     dgraph_t graph_;
     
   private:
-    
+    double max_obstacle_distance_;
 
 };
 
