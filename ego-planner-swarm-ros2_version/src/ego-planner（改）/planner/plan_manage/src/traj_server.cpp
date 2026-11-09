@@ -429,21 +429,26 @@ void controlCallback()
     return;
   }
 
-  if (controller_state == ExecutionState::HOLD_FINAL)
+  const Eigen::Vector3d final_position =
+      trajectory[0].evaluateDeBoorT(trajectory_duration);
+  const double remaining_to_end =
+      (final_position.head<2>() - odom_position.head<2>()).norm();
+  const bool near_trajectory_end =
+      execution_time >= trajectory_duration - 1e-3 ||
+      remaining_to_end <= std::max(finish_distance, 0.25);
+
+  if (controller_state == ExecutionState::HOLD_FINAL || near_trajectory_end)
   {
-    const Eigen::Vector3d final_position =
-        trajectory[0].evaluateDeBoorT(trajectory_duration);
-    const Eigen::Vector2d final_error =
-        final_position.head<2>() - odom_position.head<2>();
-    if (final_error.norm() <= finish_distance)
+    if (remaining_to_end <= finish_distance ||
+        controller_state == ExecutionState::HOLD_FINAL)
     {
+      setControllerState(ExecutionState::HOLD_FINAL);
       publishZeroCommand();
       publishDesiredState(ros_now, final_position, Eigen::Vector3d::Zero(),
                           Eigen::Vector3d::Zero(), odom_yaw, 0.0);
       publishExecutionState(ros_now);
       return;
     }
-    setControllerState(ExecutionState::TRACK_TRAJECTORY);
   }
 
   double desired_yaw = last_desired_yaw;
@@ -464,8 +469,11 @@ void controlCallback()
   if (force_track_after_align_stuck && abs_yaw_error <= heading_error_threshold)
     force_track_after_align_stuck = false;
 
+  // Near the goal, lookahead yaw becomes noisy / nearly opposite and causes
+  // continuous spinning. Never enter ALIGN on the final approach.
   const bool want_align =
-      abs_yaw_error > heading_error_threshold && !force_track_after_align_stuck;
+      abs_yaw_error > heading_error_threshold && !force_track_after_align_stuck &&
+      !near_trajectory_end;
 
   if (want_align)
     setControllerState(ExecutionState::ALIGN_HEADING);
@@ -544,7 +552,9 @@ void controlCallback()
   geometry_msgs::msg::Twist cmd;
   cmd.linear.x = clamp(c * velocity_world.x() + s * velocity_world.y(), -max_vx, max_vx);
   cmd.linear.y = clamp(-s * velocity_world.x() + c * velocity_world.y(), -max_vy, max_vy);
-  cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
+  cmd.angular.z = near_trajectory_end
+                      ? 0.0
+                      : clamp(kp_yaw * yaw_error, -max_wz, max_wz);
 
   if (execution_time >= trajectory_duration - 1e-6 &&
       position_error.norm() <= finish_distance)
@@ -552,7 +562,7 @@ void controlCallback()
     setControllerState(ExecutionState::HOLD_FINAL);
     publishZeroCommand();
     publishDesiredState(ros_now, desired_position, Eigen::Vector3d::Zero(),
-                        Eigen::Vector3d::Zero(), desired_yaw, 0.0);
+                        Eigen::Vector3d::Zero(), odom_yaw, 0.0);
     publishExecutionState(ros_now);
     return;
   }

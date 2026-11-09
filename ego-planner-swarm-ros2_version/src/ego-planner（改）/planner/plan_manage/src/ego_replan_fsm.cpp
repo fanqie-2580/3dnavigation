@@ -517,6 +517,21 @@ namespace ego_planner
     }
 
     const Eigen::Vector3d requested_end = waypoints.back();
+    // Global planner often latches/re-publishes the same path. Re-arming after
+    // arrival makes traj_server keep ALIGN_HEADING (~π yaw error) and spin.
+    if ((requested_end - odom_pos_).head<2>().norm() <= std::max(0.25, no_replan_thresh_) &&
+        (waypoints.front() - odom_pos_).head<2>().norm() <= std::max(1.0, planning_horizen_))
+    {
+      RCLCPP_INFO_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 2000,
+          "[EGO] Ignore reference path republish: already near goal (%.2f m).",
+          (requested_end - odom_pos_).head<2>().norm());
+      if (exec_state_ == WAIT_TARGET || exec_state_ == INIT)
+        return;
+      if (have_target_ && exec_state_ == EXEC_TRAJ)
+        return;
+    }
+
     end_pt_ = requested_end;
     bool success = planner_manager_->planGlobalTrajWaypoints(
         odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
@@ -1425,6 +1440,21 @@ namespace ego_planner
       }
       else if (local_traj_finished)
       {
+        // Reference-path mode: a finished local segment is normal (planning
+        // horizon). Keep chaining until the global end is reached; clearing the
+        // target here used to freeze the robot far from the goal/obstacle.
+        if (target_type_ == TARGET_TYPE::REFENCE_PATH)
+        {
+          if ((end_pt_ - odom_pos_).norm() > no_replan_thresh_)
+          {
+            changeFSMExecState(REPLAN_TRAJ, "FSM");
+            break;
+          }
+          finishCurrentTarget();
+          changeFSMExecState(WAIT_TARGET, "FSM");
+          goto force_return;
+        }
+
         finishCurrentTarget();
 
         if (target_type_ == TARGET_TYPE::PRESET_TARGET)
