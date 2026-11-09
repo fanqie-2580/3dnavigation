@@ -391,7 +391,102 @@ nohup ros2 run go2_cmd_vel_handler go2_bridge_node > /tmp/go2_bridge.log 2>&1 &
 
 ---
 
-## D. 相关文档索引
+## D. 各部分主要 `.cpp` 源文件（仍在）
+
+> 建图/定位桥接有一部分是 **Python**（`odin_ros2_tcp_client.py`、`odin_odom_mapper.py`、`odin1_loc_topic_adapter.py`、融合侧 `multi_lio_nav_bridge.py` 等），下面只列核心 C++。
+
+### D1. Mid360 驱动
+
+```text
+/home/ll/ws_livox/src/livox_ros_driver2/src/livox_ros_driver2.cpp
+/home/ll/ws_livox/src/livox_ros_driver2/src/driver_node.cpp
+/home/ll/ws_livox/src/livox_ros_driver2/src/lds_lidar.cpp
+/home/ll/ws_livox/src/livox_ros_driver2/src/lddc.cpp
+```
+
+### D2. Mid360 单独：建图 / 前端里程计（FAST-LIO）
+
+```text
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/FAST_LIO/src/laserMapping.cpp      # 建图+里程计主节点
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/FAST_LIO/src/preprocess.cpp
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/FAST_LIO/include/ikd-Tree/ikd_Tree.cpp
+```
+
+### D3. 定位匹配（open3d_loc，Odin1 单独 & Mid360 单独共用库，不同 launch）
+
+```text
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/open3d_loc/src/global_localization.cpp
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/open3d_loc/src/open3d_registration/open3d_registration.cpp
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/open3d_loc/src/open3d_conversions/open3d_conversions.cpp
+```
+
+- Mid360 单独入口 launch：`…/launch/localization_3d_go2.launch.py`（内部还会起 `FAST_LIO/src/laserMapping.cpp`）  
+- Odin1 单独入口 launch：`…/launch/localization_3d_odin1.launch.py`（**不起** Mid FAST-LIO，只跑 `global_localization.cpp`）
+
+### D4. Odin 驱动 / 可选 PV-LIO（Odin 侧 C++；日常 Odin 建图主路径是 Python odom mapper）
+
+```text
+/home/ll/ws_odin_pvlio/src/odin_ros_driver/src/host_sdk_sample.cpp
+/home/ll/ws_odin_pvlio/src/PV-LIO_ROS2/src/voxelMapping.cpp          # 可选旧建图，非默认
+/home/ll/ws_odin_pvlio/src/PV-LIO_ROS2/src/preprocess.cpp
+```
+
+### D5. Mid+Odin 融合（独立树，勿与 D2 的 `laserMapping.cpp` 混改）
+
+```text
+/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/src/laserMapping_adaptive.cpp  # 当前实机用
+/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/src/laserMapping_async.cpp
+/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/src/laserMapping_bundle.cpp
+/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/src/preprocess.cpp
+/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/include/ikd-Tree/ikd_Tree.cpp
+```
+
+### D6. 全局规划（DDDMR，两条单独链路共用同一套 C++，靠不同 launch/地图目录区分）
+
+```text
+/home/ll/dddmr_navigation/src/dddmr_mcl_3dl/src/pcl_publisher.cpp
+/home/ll/dddmr_navigation/src/dddmr_lego_loam/lego_loam_bor/src/mcl_feature_node.cpp
+/home/ll/dddmr_navigation/src/dddmr_lego_loam/lego_loam_bor/src/imageProjection.cpp
+/home/ll/dddmr_navigation/src/dddmr_lego_loam/lego_loam_bor/src/featureAssociation.cpp
+/home/ll/dddmr_navigation/src/dddmr_global_planner/src/global_planner_node.cpp
+/home/ll/dddmr_navigation/src/dddmr_global_planner/src/global_planner.cpp
+/home/ll/dddmr_navigation/src/dddmr_global_planner/src/dynamic_window_aware_global_planner.cpp
+/home/ll/dddmr_navigation/src/dddmr_global_planner/src/ego_reference_path_provider.cpp
+/home/ll/dddmr_navigation/src/dddmr_global_planner/src/a_star_on_pc.cpp
+/home/ll/dddmr_navigation/src/dddmr_perception_3d/src/perception_3d_ros.cpp
+/home/ll/dddmr_navigation/src/dddmr_perception_3d/plugins/static_layer.cpp
+```
+
+### D7. 局部规划（EGO，三条链路共用）
+
+路径含中文目录名 `ego-planner（改）`：
+
+```text
+…/planner/plan_manage/src/ego_planner_node.cpp
+…/planner/plan_manage/src/ego_replan_fsm.cpp
+…/planner/plan_manage/src/planner_manager.cpp
+…/planner/plan_manage/src/traj_server.cpp
+…/planner/plan_env/src/grid_map.cpp
+…/planner/bspline_opt/src/bspline_optimizer.cpp
+…/planner/bspline_opt/src/uniform_bspline.cpp
+…/planner/path_searching/src/dyn_a_star.cpp
+```
+
+根目录：`/home/ll/ego-planner-swarm-ros2_version/src/ego-planner（改）/planner/`
+
+### D8. 和「谁改哪份 cpp」对照
+
+| 你要改的能力 | 改哪份 cpp | 不要动 |
+|--------------|------------|--------|
+| Mid360 单独 LIO/建图 | `FAST_LIO/.../laserMapping.cpp` | `fast_lio_multi_ws/.../laserMapping_*.cpp` |
+| 融合双雷达 LIO | `fast_lio_multi_ws/.../laserMapping_adaptive.cpp` | `FAST_LIO/.../laserMapping.cpp` |
+| 地图匹配定位 | `open3d_loc/.../global_localization.cpp` | — |
+| 全局路径/参考路径 | `dddmr_global_planner/src/*.cpp` | — |
+| 局部避障/跟踪 | EGO `planner_manager.cpp` / `grid_map.cpp` / `bspline_optimizer.cpp` / `traj_server.cpp` | — |
+
+---
+
+## E. 相关文档索引
 
 | 文档 | 内容 |
 |------|------|
