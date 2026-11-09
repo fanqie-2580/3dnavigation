@@ -173,7 +173,12 @@ constexpr float kOdinIntensityTag = 100.0f;
 
 inline bool odin_pose_update_allowed()
 {
-    return lidar2_update_en && (last_imu_gyr_norm < lidar2_pose_gyr_gate);
+    // lidar2_pose_gyr_gate <= 0 disables the turn hold → full-time tight coupling.
+    if (!lidar2_update_en)
+        return false;
+    if (lidar2_pose_gyr_gate <= 0.0)
+        return true;
+    return last_imu_gyr_norm < lidar2_pose_gyr_gate;
 }
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
@@ -1495,7 +1500,10 @@ public:
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
                  << " gyr_gate=" << lidar2_pose_gyr_gate
-                 << " rad/s (hold Odin IEKF above)" << endl
+                 << (lidar2_pose_gyr_gate <= 0.0
+                         ? " (disabled → full-time tight coupling)"
+                         : " rad/s (hold Odin IEKF above)")
+                 << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
                  << LiDAR2_wrt_LiDAR1 << "\033[0m" << endl
@@ -1733,9 +1741,11 @@ private:
             /*** Bundle update or async update ***/
             if (multi_lidar && lidar2_update_en)
             {
-                // Do NOT force bundle on weak Mid features during turns — that is
-                // when cloud_slam L2 most corrupts yaw. Only bundle when gyro is calm.
-                if (last_imu_gyr_norm >= lidar2_pose_gyr_gate)
+                // Official adaptive: weak Mid features → bundle. Optional gyr gate
+                // (lidar2_pose_gyr_gate > 0) can still forbid bundle during fast yaw;
+                // gate <= 0 keeps full-time tight coupling (no Mid-only hold).
+                if (lidar2_pose_gyr_gate > 0.0 &&
+                    last_imu_gyr_norm >= lidar2_pose_gyr_gate)
                 {
                     bundle_enabled = false;
                     bundle_enabled_tic = 0;

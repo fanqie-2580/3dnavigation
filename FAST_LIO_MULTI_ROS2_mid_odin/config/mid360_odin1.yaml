@@ -55,9 +55,9 @@
       # L2 input is /odin1/cloud_raw_ds (bridge: unproject cloud_slam → lidar frame,
       # voxel, restamp to Mid /Odometry). Prefer mode0 raw+offset_time when available.
       lidar2_update_en: true
-      # Hold Odin IEKF/map when |IMU gyro| >= gate (rad/s). Stops turn smear from
-      # cloud_slam L2; Mid-only pose during fast yaw. /cloud_registered stays Mid-only.
-      lidar2_pose_gyr_gate: 0.35
+      # <=0: full-time tight coupling (Odin always in IEKF). >0: hold Odin when
+      # |IMU gyro| >= gate (rad/s) — that Mid-only hold was causing Mid drift.
+      lidar2_pose_gyr_gate: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
