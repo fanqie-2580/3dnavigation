@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Mid360 + Odin1 FAST_LIO_MULTI (tight coupling) + optional timed viz densify.
+"""Mid360 + Odin1 FAST_LIO_MULTI bringup.
 
-Default: Mid Livox + Mid IMU IEKF; Odin /cloud_raw → downsample bridge → L2 update
-with CAD/Go2 extrinsic. Optional odin_mid_timed_project for RViz overlay.
+B2 default:
+  - System /Odometry + map→body TF from /odin1/odometry (odin_system_odom_bridge)
+  - Mid IEKF remapped to /Odometry_mid (L2 restamp / internal only; no odom TF)
+  - Odin ground densify with Odin odom (odin_independent_accum)
 """
 import os
 
@@ -29,7 +31,12 @@ def generate_launch_description():
     enable_nav_bridge_arg = DeclareLaunchArgument(
         'enable_nav_bridge',
         default_value='true',
-        description='Republish Mid /Odometry and /cloud_registered to nav names',
+        description='Republish system /Odometry and /cloud_registered to nav names',
+    )
+    enable_odin_system_odom_arg = DeclareLaunchArgument(
+        'enable_odin_system_odom',
+        default_value='true',
+        description='B2: system pose/TF from /odin1/odometry',
     )
     enable_color_viz_arg = DeclareLaunchArgument(
         'enable_color_viz',
@@ -78,6 +85,9 @@ def generate_launch_description():
             LaunchConfiguration('config'),
         ])
 
+        use_odin_sys = (
+            context.launch_configurations.get('enable_odin_system_odom', 'true') == 'true'
+        )
         nodes = [
             Node(
                 package='fast_lio_multi',
@@ -85,8 +95,47 @@ def generate_launch_description():
                 name='laserMapping_multi',
                 output='screen',
                 parameters=[config_file],
+                # B2: keep Mid IEKF pose off the system /Odometry name.
+                remappings=[
+                    ('/Odometry', '/Odometry_mid'),
+                    ('/path', '/path_mid'),
+                ] if use_odin_sys else [],
             )
         ]
+
+        if use_odin_sys:
+            nodes.append(
+                Node(
+                    package='fast_lio_multi',
+                    executable='odin_system_odom_bridge.py',
+                    name='odin_system_odom_bridge',
+                    output='screen',
+                    parameters=[{
+                        'odin_odom_topic': '/odin1/odometry',
+                        'mid_odom_topic': '/Odometry_mid',
+                        'out_odom_topic': '/Odometry',
+                        'out_path_topic': '/path',
+                        'map_frame': 'map',
+                        'body_frame': 'body',
+                        'publish_tf': True,
+                        'align_delay_sec': 3.0,
+                        'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
+                        'imu_to_lidar_rpy': [0.0, 0.0, 0.0],
+                        'base_to_odin_imu_xyz': [0.313654, -0.028974, 0.104418],
+                        'base_to_odin_imu_rpy': [0.0, 0.0, 0.0],
+                        'body_to_base_xyz': [-0.140709, -0.02329, -0.111671],
+                        'body_to_base_rpy': [0.0, -0.226893, 0.0],
+                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                        'extrinsic_R_L2_wrt_L1': [
+                            0.97437006, 0.0, -0.22495105,
+                            0.0, 1.0, 0.0,
+                            0.22495105, 0.0, 0.97437006,
+                        ],
+                    }],
+                )
+            )
 
         # Odin1 → /odin1/cloud_raw_ds for FAST_LIO_MULTI L2 (host-restamp + voxel).
         nodes.append(
@@ -106,7 +155,8 @@ def generate_launch_description():
                     'min_confidence': 30.0,
                     'restamp_from_odom': True,
                     'one_cloud_per_odom': True,
-                    'odom_topic': '/Odometry',
+                    # Restamp against Mid IEKF timebase (not system Odin /Odometry).
+                    'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'odin_odom_topic': '/odin1/odometry',
                     'odin_odom_max_dt': 1.0,
                     'mid_restamp_max_dt': 0.15,
@@ -134,6 +184,7 @@ def generate_launch_description():
                     name='multi_lio_nav_bridge',
                     output='screen',
                     parameters=[{
+                        # System pose (Odin B2) → dddmr
                         'odom_in': '/Odometry',
                         'odom_out': '/baselink2map',
                         'cloud_in': '/cloud_registered',
@@ -220,7 +271,7 @@ def generate_launch_description():
                         # Plan A step2: project ground-only (already in odin_lidar frame).
                         'cloud_topic': '/odin1/cloud_ground',
                         'out_topic': '/odin1/cloud_in_map',
-                        'mid_odom_topic': '/Odometry',
+                        'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                         'odin_odom_topic': '/odin1/odometry',
                         'map_frame': 'map',
                         'body_frame': 'body',
@@ -266,7 +317,7 @@ def generate_launch_description():
                             '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_ground'
                         ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
-                        'mid_odom_topic': '/Odometry',
+                        'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                         'map_frame': 'odin_map',
                         'parent_frame': 'map',
                         # B1: publish already-aligned clouds into Mid map for RViz/fuse.
@@ -329,6 +380,7 @@ def generate_launch_description():
                         'odin_accum_topic': '/viz/accum_odin',
                         'map_frame': 'map',
                         'odin_frame': 'odin_map',
+                        'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                         'odin_already_in_map': odin_in_map,
                         'accumulate_odin_from_scan': accum_from_scan,
                         'voxel_size': float(
@@ -366,6 +418,7 @@ def generate_launch_description():
         update_method_arg,
         config_arg,
         enable_nav_bridge_arg,
+        enable_odin_system_odom_arg,
         enable_color_viz_arg,
         enable_ct_lio_arg,
         enable_odin_align_arg,

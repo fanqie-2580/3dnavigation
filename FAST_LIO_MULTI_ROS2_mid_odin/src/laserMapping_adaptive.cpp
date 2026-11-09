@@ -79,7 +79,7 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 
 string lid_topic, lid_topic2, imu_topic, map_frame = "map";
-bool multi_lidar = false, async_debug = false, publish_tf_results = false, bundle_enabled = false;
+bool multi_lidar = false, async_debug = false, publish_tf_results = false, publish_odom_tf = true, bundle_enabled = false;
 bool extrinsic_imu_to_lidars = false;
 
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
@@ -1094,18 +1094,22 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = map_frame;
-    trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = "body";
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    // B2: when Odin owns system TF (map→body), Mid must not broadcast the same frame.
+    if (publish_odom_tf)
+    {
+        geometry_msgs::msg::TransformStamped trans;
+        trans.header.frame_id = map_frame;
+        trans.header.stamp = odomAftMapped.header.stamp;
+        trans.child_frame_id = "body";
+        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+        trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+        trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+        trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+        trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+        tf_br->sendTransform(trans);
+    }
 }
 
 void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -1262,6 +1266,7 @@ public:
         this->declare_parameter<bool>("common.async_debug", false);
         this->declare_parameter<bool>("common.multi_lidar", true);
         this->declare_parameter<bool>("common.publish_tf_results", true);
+        this->declare_parameter<bool>("common.publish_odom_tf", true);
 
         this->declare_parameter<std::string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<std::string>("common.lid_topic2", "/livox/lidar");
@@ -1327,6 +1332,7 @@ public:
         this->get_parameter_or("common.async_debug", async_debug, false);
         this->get_parameter_or("common.multi_lidar", multi_lidar, true);
         this->get_parameter_or("common.publish_tf_results", publish_tf_results, true);
+        this->get_parameter_or("common.publish_odom_tf", publish_odom_tf, true);
 
         this->get_parameter_or("common.lid_topic", lid_topic, std::string("/livox/lidar"));
         this->get_parameter_or("common.lid_topic2", lid_topic2, std::string("/livox/lidar"));
