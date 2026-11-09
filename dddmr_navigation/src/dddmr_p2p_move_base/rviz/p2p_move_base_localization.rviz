@@ -408,8 +408,8 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.10000000149011612
-      Style: Tiles
+      Size (m): 0.03999999910593033
+      Style: Points
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -556,23 +556,20 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /clicked_point
-    - Class: dddmr_rviz_default_plugins/3DInitialPose
-      Covariance x: 0.25
-      Covariance y: 0.25
-      Covariance yaw: 0.06853891909122467
+    - Class: rviz_default_plugins/SetGoal
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: initial_3d_pose
-    - Class: dddmr_rviz_default_plugins/3DGoalPose
+        Value: /goal_pose
+    - Class: rviz_default_plugins/SetInitialPose
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: goal_pose_3d
+        Value: /initialpose
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
