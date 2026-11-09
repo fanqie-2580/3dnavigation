@@ -307,8 +307,8 @@ def generate_launch_description():
             description='Maximum accepted age of controller execution-state feedback'),
         DeclareLaunchArgument(
             'odom_z_offset',
-            default_value='0.0',
-            description='Extra offset added to the EGO planning state z. Keep 0.0 when /baselink2map already reports the robot planning frame height'),
+            default_value='0.35',
+            description='Lift EGO planning/collision z above Mid360 floor hits when /baselink2map reports near-ground base height (~0.05-0.10 m)'),
         DeclareLaunchArgument(
             'grid_map_odom_z_offset',
             default_value='0.0',

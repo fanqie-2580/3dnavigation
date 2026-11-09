@@ -61,6 +61,7 @@ double max_wz = 0.6;
 int cmd_interval_ms = 20;
 double align_watch_abs_error = -1.0;
 SteadyClock::time_point align_watch_steady;
+bool force_track_after_align_stuck = false;
 
 std::vector<UniformBspline> trajectory;
 double trajectory_duration = 0.0;
@@ -384,6 +385,7 @@ void bsplineCallback(const traj_utils::msg::Bspline::ConstSharedPtr msg)
 
   have_last_control_time = false;
   align_watch_abs_error = -1.0;
+  force_track_after_align_stuck = false;
   RCLCPP_INFO(node->get_logger(), "Accepted trajectory id=%ld duration=%.3f",
               static_cast<long>(trajectory_id), trajectory_duration);
 }
@@ -456,7 +458,16 @@ void controlCallback()
   const double yaw_error = normalizeAngle(desired_yaw - odom_yaw);
 
   const double abs_yaw_error = std::abs(yaw_error);
-  if (abs_yaw_error > heading_error_threshold)
+  // If odom yaw is frozen (common when LIO/sport yaw stall), ALIGN_HEADING would
+  // otherwise loop forever: 3s spin-only -> brief track -> ALIGN again. Latch
+  // TRACK for the rest of this trajectory once align is proven stuck.
+  if (force_track_after_align_stuck && abs_yaw_error <= heading_error_threshold)
+    force_track_after_align_stuck = false;
+
+  const bool want_align =
+      abs_yaw_error > heading_error_threshold && !force_track_after_align_stuck;
+
+  if (want_align)
     setControllerState(ExecutionState::ALIGN_HEADING);
   else
   {
@@ -464,11 +475,8 @@ void controlCallback()
     setControllerState(ExecutionState::TRACK_TRAJECTORY);
   }
 
-  if (abs_yaw_error > heading_error_threshold)
+  if (want_align)
   {
-    // Running install binary used to FAULT_STOP on align stuck, which caused
-    // stop-go loops. If yaw is not converging, resume TRACK with yaw feedback
-    // instead of freezing forever or emergency-stopping.
     if (align_stuck_timeout > 0.0)
     {
       if (align_watch_abs_error < 0.0)
@@ -490,42 +498,16 @@ void controlCallback()
         {
           RCLCPP_WARN(node->get_logger(),
                       "heading align stuck: odometry yaw not converging while rotating; "
-                      "resume tracking with yaw feedback (err=%.3f)",
+                      "force TRACK for this trajectory (err=%.3f)",
                       abs_yaw_error);
           align_watch_abs_error = -1.0;
+          force_track_after_align_stuck = true;
           setControllerState(ExecutionState::TRACK_TRAJECTORY);
-          // Fall through to normal track command below.
         }
-        else
-        {
-          geometry_msgs::msg::Twist cmd;
-          cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
-          cmd_vel_pub->publish(cmd);
-          last_cmd_vel = cmd;
-
-          const Eigen::Vector3d position = trajectory[0].evaluateDeBoorT(execution_time);
-          publishDesiredState(ros_now, position, Eigen::Vector3d::Zero(),
-                              Eigen::Vector3d::Zero(), desired_yaw, cmd.angular.z);
-          publishExecutionState(ros_now);
-          return;
-        }
-      }
-
-      if (controller_state == ExecutionState::ALIGN_HEADING)
-      {
-        geometry_msgs::msg::Twist cmd;
-        cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
-        cmd_vel_pub->publish(cmd);
-        last_cmd_vel = cmd;
-
-        const Eigen::Vector3d position = trajectory[0].evaluateDeBoorT(execution_time);
-        publishDesiredState(ros_now, position, Eigen::Vector3d::Zero(),
-                            Eigen::Vector3d::Zero(), desired_yaw, cmd.angular.z);
-        publishExecutionState(ros_now);
-        return;
       }
     }
-    else
+
+    if (!force_track_after_align_stuck)
     {
       geometry_msgs::msg::Twist cmd;
       cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
