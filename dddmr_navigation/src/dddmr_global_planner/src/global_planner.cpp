@@ -430,14 +430,21 @@ bool GlobalPlanner::getStartGoalID(const geometry_msgs::msg::PoseStamped& start,
     RCLCPP_WARN(this->get_logger(), "Using vertical search to find a goal on the ground.");
     bool second_search = false;
     if(graph_ready_){
-      for(double z=goal.pose.position.z; z>-10;z-=0.1){
-        pointIdxRadiusSearch_goal.clear();
-        pointRadiusSquaredDistance_goal.clear();
-        pcl_goal.z = z;
-        if(kdtree_ground_->radiusSearch(pcl_goal, 0.3, pointIdxRadiusSearch_goal, pointRadiusSquaredDistance_goal,0)>0)
-        {
-          second_search = true;
-          break;
+      // Sweep both below and above click/robot height: ground Z can sit ~0.5 m
+      // under base_link after map alignment, so a pure downward scan from z=0
+      // is not enough by itself if the first samples miss the lattice.
+      for(double dz = 0.0; dz <= 2.0 && !second_search; dz += 0.1){
+        for(double sign : { -1.0, 1.0 }){
+          if(dz == 0.0 && sign > 0.0){
+            continue;
+          }
+          pointIdxRadiusSearch_goal.clear();
+          pointRadiusSquaredDistance_goal.clear();
+          pcl_goal.z = goal.pose.position.z + sign * dz;
+          if(kdtree_ground_->radiusSearch(pcl_goal, 0.3, pointIdxRadiusSearch_goal, pointRadiusSquaredDistance_goal, 0) > 0){
+            second_search = true;
+            break;
+          }
         }
       }
       if(!second_search)
@@ -446,7 +453,7 @@ bool GlobalPlanner::getStartGoalID(const geometry_msgs::msg::PoseStamped& start,
     else{
       return false;
     }
-    return false;
+    // Keep pointIdxRadiusSearch_goal from the successful vertical hit and continue.
   }
   
   if(enable_detail_log_){
@@ -473,7 +480,27 @@ bool GlobalPlanner::getStartGoalID(const geometry_msgs::msg::PoseStamped& start,
 
   if(kdtree_ground_->radiusSearch (pcl_start, 0.5, pointIdxRadiusSearch_start, pointRadiusSquaredDistance_start)<1){
     RCLCPP_WARN(this->get_logger(), "Start is not found.");
-    return false;
+    RCLCPP_WARN(this->get_logger(), "Using vertical search to find a start on the ground.");
+    bool second_search = false;
+    if(graph_ready_){
+      for(double dz = 0.0; dz <= 2.0 && !second_search; dz += 0.1){
+        for(double sign : { -1.0, 1.0 }){
+          if(dz == 0.0 && sign > 0.0){
+            continue;
+          }
+          pointIdxRadiusSearch_start.clear();
+          pointRadiusSquaredDistance_start.clear();
+          pcl_start.z = start.pose.position.z + sign * dz;
+          if(kdtree_ground_->radiusSearch(pcl_start, 0.5, pointIdxRadiusSearch_start, pointRadiusSquaredDistance_start, 0) > 0){
+            second_search = true;
+            break;
+          }
+        }
+      }
+    }
+    if(!second_search){
+      return false;
+    }
   }
   
   if(enable_detail_log_){
