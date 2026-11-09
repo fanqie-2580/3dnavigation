@@ -43,13 +43,13 @@ def generate_launch_description():
     )
     enable_odin_align_arg = DeclareLaunchArgument(
         'enable_odin_align',
-        default_value='false',
-        description='Legacy independent Odin odom accum + map→odin_map TF',
+        default_value='true',
+        description='B1: densify Odin ground with /odin1/odometry into Mid map',
     )
     enable_odin_timed_arg = DeclareLaunchArgument(
         'enable_odin_timed',
-        default_value='true',
-        description='Project Odin raw into Mid map via Mid TF at Odin stamp',
+        default_value='false',
+        description='Project Odin into Mid map via Mid /Odometry (legacy; off for B1)',
     )
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
@@ -251,7 +251,8 @@ def generate_launch_description():
                 )
             )
 
-        if context.launch_configurations.get('enable_odin_align', 'false') == 'true':
+        use_align = context.launch_configurations.get('enable_odin_align', 'true') == 'true'
+        if use_align:
             nodes.append(
                 Node(
                     package='fast_lio_multi',
@@ -259,15 +260,26 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
+                        # CT-LIO path keeps align_only TF; B1 densifies ground with Odin odom.
                         'align_only': use_ct,
-                        'cloud_topic': '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw',
+                        'cloud_topic': (
+                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_ground'
+                        ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry',
                         'map_frame': 'odin_map',
                         'parent_frame': 'map',
+                        # B1: publish already-aligned clouds into Mid map for RViz/fuse.
+                        'out_scan_topic': '/odin1/cloud_in_map',
+                        'out_accum_topic': '/viz/accum_odin',
                         'cloud_already_in_odom': True if use_ct else False,
+                        'publish_in_parent_frame': (not use_ct),
+                        'wait_align_for_parent': True,
                         'align_mode': 'extrinsic',
-                        'align_delay_sec': 4.0,
+                        'align_delay_sec': 3.0,
+                        'odom_pair_max_dt': 0.25,
+                        'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
+                        'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
@@ -276,8 +288,9 @@ def generate_launch_description():
                             0.0, 1.0, 0.0,
                             0.22495105, 0.0, 0.97437006,
                         ],
-                        'stride': 2,
-                        'blind': 0.3,
+                        'stride': 1,
+                        'blind': 0.2,
+                        'min_confidence': 0,
                         'voxel_size': float(
                             context.launch_configurations.get('odin_voxel', '0.08')
                         ),
@@ -289,9 +302,20 @@ def generate_launch_description():
             )
 
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
-            # Mid360+Odin1: timed project → /odin1/cloud_in_map; color_viz is Mid-only
-            # (odin_mode=off), so frame_fuse must voxel-accum Odin itself.
-            odin_scan = '/odin1/cloud_in_map' if use_timed else '/odin1/cloud_in_odom'
+            # B1: independent_accum owns Odin densify (/odin1/cloud_in_map + /viz/accum_odin).
+            # Timed Mid-pose project is legacy (enable_odin_timed:=true).
+            if use_timed:
+                odin_scan = '/odin1/cloud_in_map'
+                odin_in_map = True
+                accum_from_scan = True
+            elif use_align and not use_ct:
+                odin_scan = '/odin1/cloud_in_map'
+                odin_in_map = True
+                accum_from_scan = False  # independent_accum owns /viz/accum_odin
+            else:
+                odin_scan = '/odin1/cloud_in_odom'
+                odin_in_map = False
+                accum_from_scan = True
             nodes.append(
                 Node(
                     package='fast_lio_multi',
@@ -305,8 +329,8 @@ def generate_launch_description():
                         'odin_accum_topic': '/viz/accum_odin',
                         'map_frame': 'map',
                         'odin_frame': 'odin_map',
-                        'odin_already_in_map': use_timed,
-                        'accumulate_odin_from_scan': True,
+                        'odin_already_in_map': odin_in_map,
+                        'accumulate_odin_from_scan': accum_from_scan,
                         'voxel_size': float(
                             context.launch_configurations.get('odin_voxel', '0.08')
                         ),

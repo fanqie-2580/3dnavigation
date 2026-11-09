@@ -4,16 +4,18 @@
 Preferred (mode 1 SLAM):
   /odin1/cloud_slam  already in odom  → voxel as-is  (do NOT re-multiply odom)
 
-Fallback (mode 0 / raw):
-  /odin1/cloud_raw × (/odin1/odometry as imu pose) × T_imu_lidar
+Fallback (mode 0 / raw / Plan A ground):
+  lidar-frame cloud × (/odin1/odometry as imu pose) × T_imu_lidar
   Uses nearest odom by device stamp (never "latest while cloud is delayed").
 
-Publishes:
-  /odin1/cloud_in_odom   current scan in odin_map
-  /viz/accum_odin       voxel accum in odin_map
+Plan B1 (densify with Odin odom into Mid map):
+  publish_in_parent_frame=true → after one-shot extrinsic align, transform
+  every scan/accum into parent_frame (usually map) and publish as map cloud.
+  Mid /Odometry stays the system pose; this node only paints Odin ground.
 
-Optional one-shot RViz align: lock map→odin_map so Mid body and Odin imu
-coincide at first samples (visual only; maps stay independent after that).
+Publishes (defaults):
+  /odin1/cloud_in_odom   current scan (odin_map or parent if projected)
+  /viz/accum_odin       voxel accum
 """
 from __future__ import annotations
 
@@ -166,10 +168,16 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('mid_odom_topic', '/Odometry')
         self.declare_parameter('map_frame', 'odin_map')
         self.declare_parameter('parent_frame', 'map')
+        self.declare_parameter('out_scan_topic', '/odin1/cloud_in_odom')
+        self.declare_parameter('out_accum_topic', '/viz/accum_odin')
         # true: only publish map→odin_map TF (CT-LIO owns cloud/accum topics)
         self.declare_parameter('align_only', False)
         # true: cloud already in odom (cloud_slam / CT-LIO registered). false: raw × odom.
         self.declare_parameter('cloud_already_in_odom', True)
+        # After extrinsic lock, transform scans into parent_frame (Mid map) for B1 densify.
+        self.declare_parameter('publish_in_parent_frame', False)
+        # Hold publishing until align lock when projecting into parent (avoid smeared start).
+        self.declare_parameter('wait_align_for_parent', True)
         self.declare_parameter('stride', 2)
         self.declare_parameter('blind', 0.3)
         self.declare_parameter('min_confidence', 0)
@@ -178,8 +186,10 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter('accum_skip_sec', 2.0)
         self.declare_parameter('odom_buffer_sec', 3.0)
-        self.declare_parameter('imu_to_lidar_xyz', [-0.004, 0.013, 0.026])
-        self.declare_parameter('imu_to_lidar_rpy_deg', [0.66, -0.11, -0.29])
+        self.declare_parameter('odom_pair_max_dt', 0.20)
+        # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
+        self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
+        self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
         # Visual-only TF lock (does not fuse poses into the cloud).
         #   extrinsic : mode0 Mid↔Odin calib (default) — T_map_odinmap at lock
         #   off / yaw_xy / icp_yaw_xy / full : alternatives
@@ -192,13 +202,13 @@ class OdinIndependentAccum(Node):
             'extrinsic_R',
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         )
-        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.150, 0.0, 0.055])
+        self.declare_parameter('extrinsic_T_L2_wrt_L1', [0.12157888, 0.00549610, 0.03169932])
         self.declare_parameter(
             'extrinsic_R_L2_wrt_L1',
             [
-                0.99232772, -0.07845910, 0.09555029,
-                0.07809789, 0.99691733, 0.00751997,
-                -0.09584575, 0.00000000, 0.99539620,
+                0.97437006, 0.0, -0.22495105,
+                0.0, 1.0, 0.0,
+                0.22495105, 0.0, 0.97437006,
             ],
         )
 
@@ -207,8 +217,12 @@ class OdinIndependentAccum(Node):
         self.mid_odom_topic = str(self.get_parameter('mid_odom_topic').value)
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.parent_frame = str(self.get_parameter('parent_frame').value)
+        self.out_scan_topic = str(self.get_parameter('out_scan_topic').value)
+        self.out_accum_topic = str(self.get_parameter('out_accum_topic').value)
         self.align_only = bool(self.get_parameter('align_only').value)
         self.cloud_already_in_odom = bool(self.get_parameter('cloud_already_in_odom').value)
+        self.publish_in_parent_frame = bool(self.get_parameter('publish_in_parent_frame').value)
+        self.wait_align_for_parent = bool(self.get_parameter('wait_align_for_parent').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
         self.blind2 = float(self.get_parameter('blind').value) ** 2
         self.min_confidence = int(self.get_parameter('min_confidence').value)
@@ -217,6 +231,7 @@ class OdinIndependentAccum(Node):
         period = float(self.get_parameter('accum_publish_period').value)
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
         self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
+        self.odom_pair_max_dt = float(self.get_parameter('odom_pair_max_dt').value)
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
         self.mid_accum_topic = str(self.get_parameter('mid_accum_topic').value)
@@ -225,6 +240,9 @@ class OdinIndependentAccum(Node):
         self._mid_cloud: Optional[np.ndarray] = None
         self._odin_cloud: Optional[np.ndarray] = None
         self._align_timer_started = False
+        self._n_pub = 0
+        self._n_skip_odom = 0
+        self._n_skip_align = 0
 
         xyz = list(self.get_parameter('imu_to_lidar_xyz').value)
         rpy = list(self.get_parameter('imu_to_lidar_rpy_deg').value)
@@ -250,14 +268,21 @@ class OdinIndependentAccum(Node):
         self._mid_T: Optional[np.ndarray] = None
         self._odin_T: Optional[np.ndarray] = None
         self._aligned = False
+        self._T_parent_child = np.eye(4, dtype=np.float64)
 
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+        reliable = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
         self.pub_scan = None
         self.pub_accum = None
         if not self.align_only:
-            self.pub_scan = self.create_publisher(PointCloud2, '/odin1/cloud_in_odom', 5)
-            self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_odin', 1)
+            self.pub_scan = self.create_publisher(PointCloud2, self.out_scan_topic, 5)
+            self.pub_accum = self.create_publisher(PointCloud2, self.out_accum_topic, 1)
         self._static_br = StaticTransformBroadcaster(self)
         self._publish_identity_tf()
 
@@ -269,10 +294,10 @@ class OdinIndependentAccum(Node):
                     PointCloud2, self.mid_accum_topic, self.on_mid_accum, 1
                 )
         if not self.align_only:
-            self.create_subscription(
-                PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data
-            )
+            # Prefer RELIABLE (ground bridge); also OK for most Odin TCP republish.
+            self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, reliable)
             self.create_timer(max(0.2, period), self.publish_accum)
+            self.create_timer(2.0, self._status)
             self.create_service(Trigger, '~/clear_accum', self.on_clear)
         if self.align_to_mid_once:
             self.create_timer(0.5, self._try_align)
@@ -281,8 +306,33 @@ class OdinIndependentAccum(Node):
             f'INDEPENDENT Odin: cloud={self.cloud_topic} odom={self.odom_topic} '
             f'frame={self.map_frame} already_in_odom={self.cloud_already_in_odom} '
             f'align_only={self.align_only} align_mode={self.align_mode} '
-            f'(no Mid pose for points)'
+            f'publish_in_parent={self.publish_in_parent_frame} '
+            f'out_scan={self.out_scan_topic} (no Mid pose for points)'
         )
+
+    def _status(self) -> None:
+        self.get_logger().info(
+            f'odin_odom_accum pub={self._n_pub} skip_odom={self._n_skip_odom} '
+            f'skip_align={self._n_skip_align} aligned={self._aligned} '
+            f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)}'
+        )
+
+    def _output_frame(self) -> str:
+        if self.publish_in_parent_frame and self._aligned:
+            return self.parent_frame
+        return self.map_frame
+
+    def _to_output_frame(self, pts_odin: np.ndarray) -> Optional[np.ndarray]:
+        """pts in odin odom/map_frame → optional parent (Mid map) via locked align."""
+        if not self.publish_in_parent_frame:
+            return pts_odin
+        if not self._aligned:
+            if self.wait_align_for_parent:
+                return None
+            return pts_odin
+        R = self._T_parent_child[:3, :3]
+        t = self._T_parent_child[:3, 3]
+        return (pts_odin @ R.T) + t
 
     def _publish_identity_tf(self) -> None:
         t = TransformStamped()
@@ -448,6 +498,7 @@ class OdinIndependentAccum(Node):
             T_map_odinmap[0, 3] = float(t[0])
             T_map_odinmap[1, 3] = float(t[1])
             T_map_odinmap[2, 3] = 0.0
+        self._T_parent_child = T_map_odinmap
         self._publish_align_tf(T_map_odinmap)
         self._aligned = True
 
@@ -462,7 +513,9 @@ class OdinIndependentAccum(Node):
             if dt < best_dt:
                 best_dt = dt
                 best = T
-        return None if best is None else best.copy()
+        if best is None or best_dt > self.odom_pair_max_dt:
+            return None
+        return best.copy()
 
     def _xyz_stride(self, msg: PointCloud2) -> np.ndarray:
         offs = {f.name: f.offset for f in msg.fields}
@@ -503,20 +556,28 @@ class OdinIndependentAccum(Node):
         else:
             T_odom_imu = self._nearest_odom(stamp_sec(msg.header.stamp))
             if T_odom_imu is None:
+                self._n_skip_odom += 1
                 return
             T_odom_lidar = T_odom_imu @ self.T_imu_lidar
             R, t = T_odom_lidar[:3, :3], T_odom_lidar[:3, 3]
             world = (arr @ R.T) + t
             stamp = msg.header.stamp
 
+        out = self._to_output_frame(world)
+        if out is None:
+            self._n_skip_align += 1
+            return
+
         if self.pub_scan is not None:
             header = Header()
             header.stamp = stamp
-            header.frame_id = self.map_frame
-            self.pub_scan.publish(make_cloud(header, world))
+            header.frame_id = self._output_frame()
+            self.pub_scan.publish(make_cloud(header, out))
+            self._n_pub += 1
 
         if (time.time() - self._t0) >= self.accum_skip_sec:
-            if self._accum.add(world):
+            # Accum always stores output-frame points (parent map when B1).
+            if self._accum.add(out):
                 self._dirty = True
 
     def publish_accum(self) -> None:
@@ -524,9 +585,11 @@ class OdinIndependentAccum(Node):
             return
         if not (self._dirty or len(self._accum)):
             return
+        if self.publish_in_parent_frame and self.wait_align_for_parent and not self._aligned:
+            return
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.map_frame
+        header.frame_id = self._output_frame()
         self.pub_accum.publish(make_cloud(header, self._accum.numpy()))
         self._dirty = False
 

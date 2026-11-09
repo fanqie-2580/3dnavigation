@@ -525,10 +525,15 @@ class OdinRawDownsampleBridge(Node):
         header.stamp = stamp
         header.frame_id = 'odin_lidar'
 
+        # L2 input keeps Mid-restamped time (laserMapping sync).
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:
-            self.pub_ground.publish(self._make_cloud(header, ground))
+            # B1 densify pairs with /odin1/odometry → keep original cloud stamp.
+            g_header = Header()
+            g_header.stamp = msg.header.stamp
+            g_header.frame_id = 'odin_lidar'
+            self.pub_ground.publish(self._make_cloud(g_header, ground))
             self._n_ground_pub += 1
         if self.pub_full is not None and len(arr) > 0:
             self.pub_full.publish(self._make_cloud(header, arr))
