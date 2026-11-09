@@ -99,11 +99,6 @@ struct MappingParameters
   std::string sensor_frame_;
   Eigen::Vector3d sensor_origin_offset_;
   bool project_pointcloud_to_ground_;
-  // Ignore near-body /cloud_registered returns so Mid360 self-hits do not mark
-  // the robot footprint occupied ("drone is in obstacle" / first-3-CPs).
-  double pointcloud_body_clearance_radius_;
-  double pointcloud_self_filter_z_down_;
-  double pointcloud_self_filter_z_up_;
 
   /* local map update and clear */
   int local_map_margin_;

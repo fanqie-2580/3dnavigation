@@ -54,9 +54,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/sensor_origin_offset_y", 0.0);
   node_->declare_parameter("grid_map/sensor_origin_offset_z", 0.0);
   node_->declare_parameter("grid_map/project_pointcloud_to_ground", false);
-  node_->declare_parameter("grid_map/pointcloud_body_clearance_radius", 0.0);
-  node_->declare_parameter("grid_map/pointcloud_self_filter_z_down", 0.0);
-  node_->declare_parameter("grid_map/pointcloud_self_filter_z_up", 0.0);
   node_->declare_parameter("grid_map/vis_height", 0.3);
   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_yp", -0.1);
@@ -112,9 +109,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/sensor_origin_offset_y", mp_.sensor_origin_offset_(1));
   node_->get_parameter("grid_map/sensor_origin_offset_z", mp_.sensor_origin_offset_(2));
   node_->get_parameter("grid_map/project_pointcloud_to_ground", mp_.project_pointcloud_to_ground_);
-  node_->get_parameter("grid_map/pointcloud_body_clearance_radius", mp_.pointcloud_body_clearance_radius_);
-  node_->get_parameter("grid_map/pointcloud_self_filter_z_down", mp_.pointcloud_self_filter_z_down_);
-  node_->get_parameter("grid_map/pointcloud_self_filter_z_up", mp_.pointcloud_self_filter_z_up_);
   node_->get_parameter("grid_map/vis_height", mp_.vis_height_);
   node_->get_parameter("grid_map/virtual_ceil_height", mp_.virtual_ceil_height_);
   node_->get_parameter("grid_map/virtual_ceil_yp", mp_.virtual_ceil_yp_);
@@ -139,10 +133,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
       !std::isfinite(mp_.footprint_z_down_) || mp_.footprint_z_down_ < 0.0 ||
       !std::isfinite(mp_.footprint_z_up_) || mp_.footprint_z_up_ <= 0.0 ||
       !std::isfinite(mp_.min_ray_length_) || mp_.min_ray_length_ < 0.0 ||
-      !std::isfinite(mp_.max_ray_length_) || mp_.max_ray_length_ <= mp_.min_ray_length_ ||
-      !std::isfinite(mp_.pointcloud_body_clearance_radius_) || mp_.pointcloud_body_clearance_radius_ < 0.0 ||
-      !std::isfinite(mp_.pointcloud_self_filter_z_down_) || mp_.pointcloud_self_filter_z_down_ < 0.0 ||
-      !std::isfinite(mp_.pointcloud_self_filter_z_up_) || mp_.pointcloud_self_filter_z_up_ < 0.0)
+      !std::isfinite(mp_.max_ray_length_) || mp_.max_ray_length_ <= mp_.min_ray_length_)
   {
     throw std::runtime_error(
         "grid_map footprint parameters must be finite and explicitly positive "
@@ -309,9 +300,6 @@ GridMap::FootprintCollisionResult GridMap::checkFootprint(
     return result;
   }
 
-  // Match SCAN getInflateOccupancy(): only sample the twin-cylinder centers at the
-  // trajectory height against occupancy_buffer_inflate_ (robot radius already baked
-  // into XY inflation / double_cylinder_radius).
   const Eigen::Vector3d heading(std::cos(body_yaw), std::sin(body_yaw), 0.0);
   const Eigen::Vector3d centers[2] = {
       body_position + mp_.footprint_offset_ * heading,
@@ -1360,15 +1348,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
       continue;
 
     const Eigen::Vector3d deviation = measured_endpoint - md_.ray_pos_;
-    const double range_xy = deviation.head<2>().norm();
-    // Drop Mid360 self-returns that land inside the Go2 body volume; otherwise
-    // inflate marks the start footprint occupied and rebound fails.
-    if (mp_.pointcloud_body_clearance_radius_ > 0.0 &&
-        range_xy < mp_.pointcloud_body_clearance_radius_ &&
-        deviation.z() >= -mp_.pointcloud_self_filter_z_down_ &&
-        deviation.z() <= mp_.pointcloud_self_filter_z_up_)
-      continue;
-
     const bool in_local_range =
         std::abs(deviation.x()) <= mp_.local_update_range_(0) &&
         std::abs(deviation.y()) <= mp_.local_update_range_(1) &&
