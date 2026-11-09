@@ -6,19 +6,20 @@ Pipeline:
      unproject to lidar frame with /odin1/odometry * T_imu_L.
   2) Confidence filter when field exists.
   3) Voxel downsample; keep offset_time (s) when present (else 0).
-  4) Restamp only to a Mid /Odometry stamp within mid_restamp_max_dt of the
+  4) Optional ground-only keep (RANSAC plane in lidar frame) for L2 densify.
+  5) Restamp only to a Mid /Odometry stamp within mid_restamp_max_dt of the
      *cloud* stamp (never latest Mid while geometry is seconds old).
      Always enforce monotonic stamps to avoid L2 "loop back".
-  5) Rate-limit ~one cloud per Mid odom tick when Mid odom is flowing;
+  6) Rate-limit ~one cloud per Mid odom tick when Mid odom is flowing;
      otherwise publish every Nth input (~10 Hz).
-  6) Drop clouds older than max_cloud_age_sec vs newest Mid (stale TCP backlog).
+  7) Drop clouds older than max_cloud_age_sec vs newest Mid (stale TCP backlog).
 """
 from __future__ import annotations
 
 import math
 import struct
 from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -27,6 +28,75 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
+
+
+def _extract_ground(
+    arr: np.ndarray,
+    distance: float,
+    max_angle_deg: float,
+    ransac_iters: int,
+    min_inliers: int,
+    fit_z_span: float,
+    z_band: float,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, str]:
+    """Keep ground points from Nx5 (xyz,intensity,offset_time) in lidar frame.
+
+    Primary: RANSAC plane with normal near +Z. Fallback: low-Z band around the
+    10th percentile (keeps L2 fed when plane fit fails indoors).
+    """
+    if arr.size == 0 or len(arr) < 3:
+        return arr, 'empty'
+
+    xyz = arr[:, :3].astype(np.float64)
+    z = xyz[:, 2]
+    z_lo = float(np.percentile(z, 10))
+    # Fit on near-floor band so walls/ceiling do not dominate.
+    fit_mask = z <= (z_lo + max(0.2, float(fit_z_span)))
+    cand = xyz[fit_mask]
+    if len(cand) < 3:
+        cand = xyz
+        fit_mask = np.ones(len(xyz), dtype=bool)
+
+    cos_max = math.cos(math.radians(float(max_angle_deg)))
+    best_count = 0
+    best_n = None
+    best_d = 0.0
+    n_cand = len(cand)
+    for _ in range(max(1, int(ransac_iters))):
+        idx = rng.choice(n_cand, size=3, replace=False)
+        p0, p1, p2 = cand[idx]
+        n = np.cross(p1 - p0, p2 - p0)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-9:
+            continue
+        n = n / nn
+        if n[2] < 0.0:
+            n = -n
+        if float(n[2]) < cos_max:
+            continue
+        d = -float(n.dot(p0))
+        dist = np.abs(cand @ n + d)
+        count = int(np.count_nonzero(dist < distance))
+        if count > best_count:
+            best_count = count
+            best_n = n
+            best_d = d
+
+    if best_n is not None and best_count >= int(min_inliers):
+        dist_all = np.abs(xyz @ best_n + best_d)
+        keep = dist_all < distance
+        # Prefer the lower side of the slab (reject ceiling parallel misfits).
+        signed = xyz @ best_n + best_d
+        keep &= signed < (distance * 1.5)
+        if int(np.count_nonzero(keep)) >= max(20, int(min_inliers) // 2):
+            return arr[keep], f'ransac:{int(np.count_nonzero(keep))}/{len(arr)}'
+
+    # Fallback: keep a thin band above the low-Z percentile.
+    keep = (z >= (z_lo - 0.05)) & (z <= (z_lo + max(0.05, float(z_band))))
+    if not np.any(keep):
+        keep = z <= (z_lo + max(0.05, float(z_band)))
+    return arr[keep], f'zband:{int(np.count_nonzero(keep))}/{len(arr)}'
 
 
 def _field_map(msg: PointCloud2) -> Dict[str, PointField]:
@@ -148,6 +218,17 @@ class OdinRawDownsampleBridge(Node):
         self.declare_parameter('fallback_period', 0.1)
         # Official Odin IMU→lidar (wiki), R≈I.
         self.declare_parameter('extrinsic_T_imu_L', [-0.02663, 0.03447, 0.02174])
+        # Plan A: keep only Odin ground for L2 / densify.
+        self.declare_parameter('ground_only', False)
+        self.declare_parameter('ground_topic', '/odin1/cloud_ground')
+        self.declare_parameter('publish_ground_topic', True)
+        self.declare_parameter('publish_full_topic', '')  # empty = off; e.g. /odin1/cloud_raw_ds_full
+        self.declare_parameter('ground_distance', 0.08)
+        self.declare_parameter('ground_max_angle_deg', 25.0)
+        self.declare_parameter('ground_ransac_iters', 60)
+        self.declare_parameter('ground_min_inliers', 80)
+        self.declare_parameter('ground_fit_z_span', 1.5)
+        self.declare_parameter('ground_z_band', 0.20)
 
         self.voxel = float(self.get_parameter('voxel_size').value)
         self.max_points = int(self.get_parameter('max_points').value)
@@ -158,12 +239,23 @@ class OdinRawDownsampleBridge(Node):
         self.mid_restamp_max_dt = float(self.get_parameter('mid_restamp_max_dt').value)
         self.max_cloud_age_sec = float(self.get_parameter('max_cloud_age_sec').value)
         self.fallback_period = float(self.get_parameter('fallback_period').value)
+        self.ground_only = bool(self.get_parameter('ground_only').value)
+        self.publish_ground_topic = bool(self.get_parameter('publish_ground_topic').value)
+        self.publish_full_topic = str(self.get_parameter('publish_full_topic').value or '').strip()
+        self.ground_distance = float(self.get_parameter('ground_distance').value)
+        self.ground_max_angle_deg = float(self.get_parameter('ground_max_angle_deg').value)
+        self.ground_ransac_iters = int(self.get_parameter('ground_ransac_iters').value)
+        self.ground_min_inliers = int(self.get_parameter('ground_min_inliers').value)
+        self.ground_fit_z_span = float(self.get_parameter('ground_fit_z_span').value)
+        self.ground_z_band = float(self.get_parameter('ground_z_band').value)
+        self._rng = np.random.default_rng(0)
         t_il = list(self.get_parameter('extrinsic_T_imu_L').value)
         self.T_imu_L = np.eye(4, dtype=np.float64)
         self.T_imu_L[:3, 3] = np.asarray(t_il, dtype=np.float64).reshape(3)
 
         inn = self.get_parameter('input_topic').value
         out = self.get_parameter('output_topic').value
+        ground_topic = str(self.get_parameter('ground_topic').value)
         self._mid_odom_stamp = None
         self._mid_odom_key: Optional[Tuple[int, int]] = None
         self._last_pub_key: Optional[Tuple[int, int]] = None
@@ -177,9 +269,19 @@ class OdinRawDownsampleBridge(Node):
         self._n_mid = 0
         self._n_odin = 0
         self._n_pub = 0
+        self._n_ground_pub = 0
         self._n_skip_unproj = 0
         self._n_skip_empty = 0
         self._n_skip_age = 0
+        self._n_skip_ground = 0
+        self._last_ground_mode = '-'
+        self._last_n_full = 0
+        self._last_n_ground = 0
+        self._last_mid_wall = -1.0
+        # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
+        # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
+        self.declare_parameter('mid_stall_fallback_sec', 0.5)
+        self.mid_stall_fallback_sec = float(self.get_parameter('mid_stall_fallback_sec').value)
 
         reliable = QoSProfile(
             depth=20,
@@ -188,6 +290,12 @@ class OdinRawDownsampleBridge(Node):
         )
 
         self.pub = self.create_publisher(PointCloud2, out, reliable)
+        self.pub_ground = None
+        if self.publish_ground_topic and ground_topic and ground_topic != out:
+            self.pub_ground = self.create_publisher(PointCloud2, ground_topic, reliable)
+        self.pub_full = None
+        if self.publish_full_topic:
+            self.pub_full = self.create_publisher(PointCloud2, self.publish_full_topic, reliable)
         self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
         self.create_subscription(
             Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
@@ -201,16 +309,45 @@ class OdinRawDownsampleBridge(Node):
             f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
             f'conf>={self.min_confidence} restamp={self.restamp_from_odom} '
             f'mid_dt<={self.mid_restamp_max_dt:.3f}s max_age={self.max_cloud_age_sec:.2f}s '
-            f'one_per_odom={self.one_cloud_per_odom} qos=RELIABLE '
+            f'one_per_odom={self.one_cloud_per_odom} ground_only={self.ground_only} '
+            f'ground_topic={ground_topic if self.publish_ground_topic else "off"} '
+            f'full_topic={self.publish_full_topic or "off"} qos=RELIABLE '
             f'(unproject odom-frame if needed; match Mid by cloud stamp)'
         )
 
     def _status(self) -> None:
         self.get_logger().info(
             f'stats cloud={self._n_cloud} odin_odom={self._n_odin} mid_odom={self._n_mid} '
-            f'pub={self._n_pub} skip_unproj={self._n_skip_unproj} skip_empty={self._n_skip_empty} '
+            f'pub={self._n_pub} ground_pub={self._n_ground_pub} '
+            f'last_full={self._last_n_full} last_ground={self._last_n_ground} '
+            f'mode={self._last_ground_mode} skip_ground={self._n_skip_ground} '
+            f'skip_unproj={self._n_skip_unproj} skip_empty={self._n_skip_empty} '
             f'skip_age={self._n_skip_age} pending={"Y" if self._pending is not None else "N"}'
         )
+
+    def _make_cloud(self, header: Header, arr: np.ndarray) -> PointCloud2:
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name='offset_time', offset=16, datatype=PointField.FLOAT32, count=1),
+        ]
+        packed = b''.join(
+            struct.pack('<fffff', float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+            for r in arr
+        )
+        out = PointCloud2()
+        out.header = header
+        out.height = 1
+        out.width = len(arr)
+        out.fields = fields
+        out.is_bigendian = False
+        out.point_step = 20
+        out.row_step = 20 * len(arr)
+        out.is_dense = True
+        out.data = packed
+        return out
 
     def on_odin_odom(self, msg: Odometry) -> None:
         self._n_odin += 1
@@ -229,6 +366,7 @@ class OdinRawDownsampleBridge(Node):
 
     def on_mid_odom(self, msg: Odometry) -> None:
         self._n_mid += 1
+        self._last_mid_wall = self.get_clock().now().nanoseconds * 1e-9
         key = _stamp_key(msg.header.stamp)
         t = _stamp_sec(msg.header.stamp)
         self._mid_odom_stamp = msg.header.stamp
@@ -239,6 +377,12 @@ class OdinRawDownsampleBridge(Node):
             if self._publish_from_msg(self._pending, None):
                 self._last_pub_key = key
             self._pending = None
+
+    def _mid_stalled(self) -> bool:
+        if self._last_mid_wall < 0.0:
+            return True
+        now = self.get_clock().now().nanoseconds * 1e-9
+        return (now - self._last_mid_wall) > self.mid_stall_fallback_sec
 
     def _lookup_odin_odom(self, stamp) -> Optional[np.ndarray]:
         if not self._odin_odom:
@@ -268,8 +412,12 @@ class OdinRawDownsampleBridge(Node):
                 self._n_skip_age += 1
                 return
         # Prefer Mid-odom gated publish when Mid is alive; otherwise publish on a
-        # fallback period so LIO can bootstrap without chicken-egg deadlock.
-        if self.one_cloud_per_odom and self._mid_odom_stamp is not None:
+        # fallback period so LIO can bootstrap / recover from Mid↔L2 deadlock.
+        if (
+            self.one_cloud_per_odom
+            and self._mid_odom_stamp is not None
+            and not self._mid_stalled()
+        ):
             self._pending = msg
             if self._mid_odom_key is not None and self._last_pub_key != self._mid_odom_key:
                 if self._publish_from_msg(msg, None):
@@ -277,7 +425,7 @@ class OdinRawDownsampleBridge(Node):
                 self._pending = None
             return
 
-        # No Mid odom yet: rate-limit by wall time / cloud stamp.
+        # No Mid odom yet, or Mid stalled: rate-limit by wall time / cloud stamp.
         stamp = msg.header.stamp
         pub_sec = _stamp_sec(stamp)
         if self._last_pub_sec >= 0.0 and (pub_sec - self._last_pub_sec) < self.fallback_period:
@@ -330,6 +478,28 @@ class OdinRawDownsampleBridge(Node):
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
 
+        self._last_n_full = int(len(arr))
+        ground = arr
+        ground_mode = 'off'
+        if self.ground_only or self.pub_ground is not None:
+            ground, ground_mode = _extract_ground(
+                arr,
+                distance=self.ground_distance,
+                max_angle_deg=self.ground_max_angle_deg,
+                ransac_iters=self.ground_ransac_iters,
+                min_inliers=self.ground_min_inliers,
+                fit_z_span=self.ground_fit_z_span,
+                z_band=self.ground_z_band,
+                rng=self._rng,
+            )
+        self._last_ground_mode = ground_mode
+        self._last_n_ground = int(len(ground))
+
+        out_arr = ground if self.ground_only else arr
+        if out_arr.size == 0 or len(out_arr) == 0:
+            self._n_skip_ground += 1
+            return False
+
         # Match Mid by cloud stamp; never force latest Mid onto old geometry.
         if stamp is None:
             stamp = msg.header.stamp
@@ -355,29 +525,13 @@ class OdinRawDownsampleBridge(Node):
         header.stamp = stamp
         header.frame_id = 'odin_lidar'
 
-        fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
-            PointField(name='offset_time', offset=16, datatype=PointField.FLOAT32, count=1),
-        ]
-        packed = b''.join(
-            struct.pack('<fffff', float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
-            for r in arr
-        )
-        out = PointCloud2()
-        out.header = header
-        out.height = 1
-        out.width = len(arr)
-        out.fields = fields
-        out.is_bigendian = False
-        out.point_step = 20
-        out.row_step = 20 * len(arr)
-        out.is_dense = True
-        out.data = packed
-        self.pub.publish(out)
+        self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
+        if self.pub_ground is not None and len(ground) > 0:
+            self.pub_ground.publish(self._make_cloud(header, ground))
+            self._n_ground_pub += 1
+        if self.pub_full is not None and len(arr) > 0:
+            self.pub_full.publish(self._make_cloud(header, arr))
         return True
 
 

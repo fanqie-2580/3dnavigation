@@ -97,6 +97,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'input_topic': '/odin1/cloud_raw',
+                    # L2 input: ground-only (Plan A). Full cloud optional on *_full.
                     'output_topic': '/odin1/cloud_raw_ds',
                     'voxel_size': float(
                         context.launch_configurations.get('odin_voxel', '0.08')
@@ -111,6 +112,16 @@ def generate_launch_description():
                     'mid_restamp_max_dt': 0.15,
                     'max_cloud_age_sec': 0.35,
                     'fallback_period': 0.1,
+                    'ground_only': True,
+                    'ground_topic': '/odin1/cloud_ground',
+                    'publish_ground_topic': True,
+                    'publish_full_topic': '/odin1/cloud_raw_ds_full',
+                    'ground_distance': 0.08,
+                    'ground_max_angle_deg': 25.0,
+                    'ground_ransac_iters': 60,
+                    'ground_min_inliers': 80,
+                    'ground_fit_z_span': 1.5,
+                    'ground_z_band': 0.20,
                 }],
             )
         )
@@ -149,6 +160,8 @@ def generate_launch_description():
                         'max_accum_points': 400000,
                         'accum_publish_period': 0.5,
                         'accum_skip_sec': 3.0,
+                        # Kill Mid360 ghost/flyers that otherwise pollute room-scale maps.
+                        'max_range': 25.0,
                     }],
                 )
             )
@@ -217,9 +230,11 @@ def generate_launch_description():
                         'max_cloud_age_sec': 3.0,
                         'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
-                        'stride': 2,
-                        'blind': 0.3,
-                        'min_confidence': 30.0,
+                        # Dock already strides TCP; keep all remaining pts for dense yellow live FOV.
+                        'stride': 1,
+                        'blind': 0.2,
+                        # Lower than driver default 35 so live yellow FOV denser in RViz.
+                        'min_confidence': 15.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'use_yaw_only_body': False,
@@ -298,6 +313,7 @@ def generate_launch_description():
                         'accum_gyr_cooldown_sec': 1.0,
                         # Residual dock lag ~1–2s ⇒ Odin voxel accum stays off until lag drops.
                         'max_scan_age_sec': 0.25,
+                        'max_range': 25.0,
                         'stride': 1,
                         'accum_period': 0.5,
                     }],
