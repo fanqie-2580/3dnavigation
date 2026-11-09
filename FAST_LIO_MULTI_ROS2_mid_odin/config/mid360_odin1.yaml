@@ -6,8 +6,8 @@
       # true: Mid360 + Odin1 into FAST_LIO_MULTI (tight / densify path).
       multi_lidar: true
       publish_tf_results: false
-      # B2: Odin system odom bridge owns map→body TF; Mid keeps /Odometry_mid only.
-      publish_odom_tf: false
+      # Tight coupling: Mid IEKF owns system /Odometry + map→body TF.
+      publish_odom_tf: true
       max_iteration: 3
       map_frame: "map"
       # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
@@ -53,10 +53,10 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # B2: system pose follows Odin odom → keep Mid IEKF Mid-only (no L2 pose update).
-      # Odin ground still densifies via odin_independent_accum with /odin1/odometry.
-      lidar2_update_en: false
-      # <=0 would mean full-time tight coupling when lidar2_update_en=true.
+      # true: Odin ground (L2) residuals update IEKF + ikdtree (tight coupling).
+      # L2 input is /odin1/cloud_raw_ds (ground-only from downsample bridge).
+      lidar2_update_en: true
+      # <=0: full-time tight coupling (Odin always in IEKF).
       lidar2_pose_gyr_gate: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)

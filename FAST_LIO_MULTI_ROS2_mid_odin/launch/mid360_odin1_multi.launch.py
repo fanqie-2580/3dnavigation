@@ -35,8 +35,8 @@ def generate_launch_description():
     )
     enable_odin_system_odom_arg = DeclareLaunchArgument(
         'enable_odin_system_odom',
-        default_value='true',
-        description='B2: system pose/TF from /odin1/odometry',
+        default_value='false',
+        description='B2 optional: system pose/TF from /odin1/odometry (off = Mid tight-coupled /Odometry)',
     )
     enable_color_viz_arg = DeclareLaunchArgument(
         'enable_color_viz',
@@ -86,7 +86,7 @@ def generate_launch_description():
         ])
 
         use_odin_sys = (
-            context.launch_configurations.get('enable_odin_system_odom', 'true') == 'true'
+            context.launch_configurations.get('enable_odin_system_odom', 'false') == 'true'
         )
         nodes = [
             Node(
