@@ -217,12 +217,15 @@ def generate_launch_description():
                     name='odin_mid_timed_project',
                     output='screen',
                     parameters=[{
-                        'cloud_topic': '/odin1/cloud_raw',
+                        # Plan A step2: project ground-only (already in odin_lidar frame).
+                        'cloud_topic': '/odin1/cloud_ground',
                         'out_topic': '/odin1/cloud_in_map',
                         'mid_odom_topic': '/Odometry',
                         'odin_odom_topic': '/odin1/odometry',
                         'map_frame': 'map',
                         'body_frame': 'body',
+                        # Ground cloud is lidar-frame from downsample bridge (not cloud_slam).
+                        'cloud_in_odom': 'false',
                         # Exact Mid pairing. 0.15s: host_receive Odin stamps vs Mid capture lag.
                         'mid_pair_max_dt': 0.15,
                         'odin_pair_max_dt': 0.15,
@@ -230,11 +233,11 @@ def generate_launch_description():
                         'max_cloud_age_sec': 3.0,
                         'cloud_buffer_sec': 8.0,
                         'odom_buffer_sec': 10.0,
-                        # Dock already strides TCP; keep all remaining pts for dense yellow live FOV.
+                        # Ground already voxel-filtered; keep all remaining pts.
                         'stride': 1,
                         'blind': 0.2,
-                        # Lower than driver default 35 so live yellow FOV denser in RViz.
-                        'min_confidence': 15.0,
+                        # Ground cloud has no confidence field; keep gate inert.
+                        'min_confidence': 0.0,
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'use_yaw_only_body': False,
