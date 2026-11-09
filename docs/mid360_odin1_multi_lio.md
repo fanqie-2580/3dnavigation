@@ -1,83 +1,122 @@
-# Mid360 + Odin1（当前：各自独立累积，无关联）
+# Mid360 + Odin1：相对官方 FAST_LIO_MULTI 的全程紧耦合
 
-工作区：`/home/ll/fast_lio_multi_ws`（包名 `fast_lio_multi`，基于 [FAST_LIO_MULTI_ROS2](https://github.com/Draxran/FAST_LIO_MULTI_ROS2)）
+工作区：`/home/ll/fast_lio_multi_ws`（包名 `fast_lio_multi`）  
+配置：[`config/mid360_odin1.yaml`](/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/config/mid360_odin1.yaml)  
+启动：[`launch/mid360_odin1_multi.launch.py`](/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/launch/mid360_odin1_multi.launch.py)
 
-**当前默认**：mode0 + 时钟域隔离融合。
+> **当前默认**：`multi_lidar: true` + `lidar2_update_en: true` + `update_method:=adaptive`，即副雷达全程参与 IEKF 更新与地图写入（紧耦合）。  
+> 旧文档里“Odin 只独立累积、不进滤波器”的说法已过时。
 
-| 传感器 | 建图 | 累积图 |
-|--------|------|--------|
-| Mid360 | FAST-LIO（`multi_lidar: false`） | `/viz/accum_mid360`（`map`） |
-| Odin1 | **mode0** + **CT-LIO**（`/odin1/cloud_raw`+`/odin1/imu`） | `/viz/accum_odin` ← CT `/Laser_map`（`odin_map`） |
+---
 
-导航 bridge 仍只转发 Mid：`/baselink2map`、`/cloud_registered_1`。  
-约 4s 后用 mode0 外参锁 `map→odin_map`；`mid_odin_frame_fuse` 合成 `/cloud_fused`、`/viz/accum_fused`（**从不** Mid-odom×Odin-stamp）。
+## 1. 目标与概念
 
-## 时间戳不一致：推荐解法（本仓库已采用）
+相对官方 FAST_LIO_MULTI，在 Go2 四足上把**主雷达**换成 Livox Mid360，把**副雷达**换成奥比中光 Odin1，目的是让这两台不同厂家、不同数据格式的雷达，仍然跑进官方那一套“多雷达一起算位姿、一起建地图”的流程，并且**全程都是紧耦合**。
 
-Odin TCP 戳常是设备 uptime，Mid/LIO 是 ROS 时间。  
-**禁止**：`Odin 点云 × Mid /Odometry`（跨时钟对姿 → 转弯扇形）。
+| 词 | 含义 |
+|----|------|
+| **位姿** | 机器人在空间里的位置 + 朝向 |
+| **建地图** | 把各时刻点云按估计位姿叠到同一张全局点云图 |
+| **紧耦合** | 两路雷达的点云残差都进入**同一个**滤波器改正位姿，而不是主雷达算完位姿后副雷达只做显示叠加 |
 
-**正确做法（时钟域隔离 + 外参合帧）**：
+官方 FAST_LIO_MULTI 正是这种紧耦合框架：在 FAST-LIO2 单雷达惯性里程计之上扩展第二路雷达。官方演示常见两台 Livox（或 Mid360 + Avia），数据都能较直接订阅进节点；Odin1 发出的是 ROS 标准 `sensor_msgs/PointCloud2`，字段含义和时间戳习惯都与 Livox `CustomMsg` 不同，**不能原样套用官方第二路输入**。
 
-1. Mid：FAST-LIO 在自己的时钟域出 `/cloud_registered`（已在 `map`）  
-2. Odin：只用 Odin 时钟域位姿  
-   - mode1：直接叠 `/odin1/cloud_slam`  
-   - mode0：`/odin1/cloud_raw` × `/odin1/odometry`（两边同钟）  
-3. 用 mode0 标定外参一次性锁 `map→odin_map`  
-4. `mid_odin_frame_fuse`：把 Odin（`odin_map`）经 TF 变到 `map`，与 Mid 合成  
-   - `/cloud_fused`、`/viz/accum_fused`  
-   - **从不**用 Mid odom 去乘 Odin 时间戳  
+---
 
-若将来要做紧耦合 IEKF，再考虑 LI-Init 估恒定 time offset / 连续时间方法；日常导航不必。
+## 2. 传感器角色与开关
 
-| 项目 | 链接 | 做法 |
-|------|------|------|
-| FAST-LIO-MULTI | https://github.com/engcang/FAST_LIO_MULTI | bundle / async / adaptive |
-| MA-LIO | https://github.com/minwoo0611/MA-LIO | ApproximateTime + B 样条 |
-| LI-Init | https://github.com/hku-mars/LiDAR_IMU_Init | 标定 time offset + 外参 |
-
-## 话题约定
-
-| 角色 | 输入 | 说明 |
+| 角色 | 话题 | 说明 |
 |------|------|------|
 | 主雷达 | `/livox/lidar` | Livox CustomMsg |
-| 主 IMU | `/livox/imu` | Mid360 IMU |
-| 副雷达 | `/odin1/cloud_raw` → `/odin1/cloud_raw_ds` | Odin 原始雷达；桥接体素降采样 |
+| 主 IMU | `/livox/imu` | Mid360 板载 IMU：加速度 + 角速度，用于帧间预测与帧内去畸变 |
+| 副雷达（经桥接） | `/odin1/cloud_raw` → `/odin1/cloud_raw_ds` | **不要**把原始 `/odin1/cloud_raw` 直接塞进建图节点 |
 
-| 融合输出 | 导航别名（nav bridge） |
-|----------|------------------------|
-| `/Odometry` | `/baselink2map` |
-| `/cloud_fused`（Mid+Odin 当前帧合在一起） | `/cloud_registered_1` |
-| `/viz/accum_fused` | Mid+Odin 累积融合图（RViz 主看这个） |
-| `/cloud_registered` / `/cloud_odin_registered` | 分色单雷达当前帧 |
-| `/cloud_registered_body` | `/cloud_registered_body_1` |
+配置里两个关键开关（须**都打开**才是全程紧耦合）：
 
-**禁止**把 `/odin1/cloud_slam` 喂进 MULTI（已在 Odin 内置位姿下，会双重里程计）。
+| 参数 | 作用 |
+|------|------|
+| `common.multi_lidar: true` | 启用双雷达架构 |
+| `mapping.lidar2_update_en: true` | 副雷达点云真正参与滤波器更新和地图写入 |
 
-## 1. Odin 必须 mode 0
+滤波器是**迭代扩展卡尔曼滤波（IEKF）**：先用 IMU 预测，再用当前帧点云与已有地图做点到平面匹配，迭代修正位姿。地图在内部用 **ikd-tree**（可增量更新的三维点云索引树）存储；对外常见话题是 `/Laser_map`、`/Odometry`。
 
-```bash
-bash /home/ll/ws_odin_pvlio/scripts/12_set_odin_mode0_for_fusion.sh
-# 坞上 control_command.yaml 也要 custom_map_mode: 0，然后重启 Odin 驱动/桥
-```
+更新策略选官方 **adaptive**：
 
-确认：
+- 平时可“谁来了谁更新”，缩短仅靠 IMU 空推的时间；
+- 有效特征不够时，自动改成 **bundle**：把时间接近的 Mid 一帧和 Odin 一帧绑在一起更新。
 
-```bash
-grep custom_map_mode /home/ll/ws_odin_pvlio/src/odin_ros_driver/config/control_command.yaml
-# -> custom_map_mode: 0
-```
+---
 
-## 2. 编译（已做过一次可跳过）
+## 3. Odin 预处理（`lidar_type2: 4` / XYZ_ONLY）
 
-```bash
-cd /home/ll/fast_lio_multi_ws
-source /opt/ros/humble/setup.bash
-source /home/ll/ws_livox/install/setup.bash
-colcon build --symlink-install --packages-select fast_lio_multi
-```
+预处理把原始消息变成算法内部统一点云格式。针对 Odin 增加了类型代号 **4（XYZ_ONLY）** 解析：
 
-## 3. 启动顺序
+1. 按 PointCloud2 字段字节偏移读 `x,y,z`；
+2. 兼容 `intensity`、`confidence`、点内相对时间 `offset_time`（有的驱动叫 `time` / `t`）；
+3. FAST-LIO 习惯把“相对本帧起始的时间”存在点的 **curvature**，单位是**毫秒**；Odin 文档里 `offset_time` 常以**秒**给出，读取后要 **×1000** 再写入；
+4. 置信度低于阈值（常用 **30**）的点丢掉；过近盲区 / 可选过远点过滤；按抽样步长降点数；
+5. 若帧内时间顺序乱，按时间重排，便于估计本帧扫描结束时刻。
+
+这样副雷达才能进入与 Mid360 相同的流程：
+
+> **IMU 预测 → 去畸变 → 与地图匹配 → 更新位姿**
+
+**去畸变**：扫完一帧期间机器人可能在动，用 IMU 把各点扳回同一时刻坐标系，否则一帧内部会糊成拖影。
+
+---
+
+## 4. 降采样桥：`odin_raw_downsample_bridge`
+
+坞上 Odin 桥常把已经变换到 `odom`/`map` 的点云（如 `cloud_slam`）仍以 `/odin1/cloud_raw` 发出。若把这种“已带位姿的点云”再当作雷达系输入紧耦合，相当于**位姿乘两次**，地图会错位。
+
+桥接节点职责：
+
+1. 看 `frame_id`：若是 `odom`/`map` 等全局系，用时间最近的 `/odin1/odometry`，再结合 Odin 雷达相对其 IMU 的固定安装，把点**反算回雷达本体系**；若本就是雷达系真原始点，则跳过；
+2. 置信度过滤 + **体素降采样**（小立方格留代表点，降低算力，尽量保留逐点时间）；
+3. 按本帧云时间戳，在 Mid `/Odometry` 历史里找接近戳重打时间，**|Δt| 大约 ≤ 50 ms**，避免“几何是几秒前、时间写成当前”；
+4. 过旧缓存丢弃；发出去的副雷达时间戳一路增大，防止建图缓冲误判时间回绕；
+5. 发布节奏尽量跟 Mid 里程计节拍对齐；Mid 还没出里程计或短暂卡住时，**降频直接发布**，避免“桥接等里程计、建图又等副雷达”死锁。
+
+输出：`/odin1/cloud_raw_ds`（配置里 `lid_topic2`）。
+
+---
+
+## 5. 建图节点：`laserMapping_adaptive`
+
+打开副雷达更新后，Odin 帧进入第二路缓冲。做 **bundle** 绑定时：
+
+- 以当前 Mid 帧时间为基准，在 Odin 缓冲找时间最近的一帧；
+- 若最近也超过约 **80 ms**，丢掉更旧那一路队头再重配，避免差太远的两帧硬拧在一起；
+- 配对成功后，用标定好的 **Mid 相对 Odin 外参**，把 Odin 点变到 Mid 雷达系，再与 Mid 点、IMU 一起做 IEKF 更新。
+
+**外参**：两台雷达之间固定的旋转和平移，需事先标定或按安装尺寸写入 `extrinsic_*_L2_wrt_L1` 等。
+
+**启动顺序逻辑**（已改）：
+
+- **不再**要求必须先等到第一帧 Odin 才能建图；
+- Mid 点数够 → 先用 Mid 初始化地图树并持续输出里程计；
+- Odin 随后到达 → 再以全程紧耦合加入更新和地图写入。
+
+从而打破：“没有里程计就不发副雷达、没有副雷达就不出里程计”的死锁。
+
+---
+
+## 6. 与仓库文件对应
+
+| 环节 | 路径 |
+|------|------|
+| 双雷达 YAML | `FAST_LIO_MULTI_ROS2/config/mid360_odin1.yaml` |
+| adaptive 建图 | `src/laserMapping_adaptive.cpp` |
+| Odin PointCloud2 预处理 | preprocess 中 `lidar_type2: 4` |
+| 降采样 / 反投影桥 | `scripts/odin_raw_downsample_bridge.py` |
+| 导航别名 | `scripts/multi_lio_nav_bridge.py` → `/baselink2map`、`/cloud_registered_1`、`/cloud_registered_body_1` |
+| 一键 launch | `launch/mid360_odin1_multi.launch.py` |
+
+相关说明：[`odin_attitude_measure.md`](./odin_attitude_measure.md)、[`odin1_mid360_map_and_fusion.md`](./odin1_mid360_map_and_fusion.md)、[`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md)。
+
+---
+
+## 7. 启动与验收
 
 每个终端先：
 
@@ -87,8 +126,10 @@ unset CYCLONEDDS_URI FASTRTPS_DEFAULT_PROFILES_FILE
 source /opt/ros/humble/setup.bash
 ```
 
-1. Livox Mid360（若未开）  
-2. Odin 桥/驱动（mode 0，有 `/odin1/cloud_raw`）  
+顺序：
+
+1. Livox Mid360（`/livox/lidar`、`/livox/imu`）  
+2. Odin TCP 桥（`/odin1/cloud_raw`、`/odin1/odometry`、`/odin1/imu`）  
 3. 融合：
 
 ```bash
@@ -98,83 +139,36 @@ source /home/ll/fast_lio_multi_ws/install/setup.bash
 ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
   update_method:=adaptive \
   config:=mid360_odin1.yaml \
-  odin_voxel:=0.08
+  enable_odin_timed:=true \
+  enable_frame_fuse:=true \
+  enable_nav_bridge:=true \
+  enable_odin_system_odom:=false
 ```
 
-后台：
+检查：
 
 ```bash
-nohup ros2 launch fast_lio_multi mid360_odin1_multi.launch.py \
-  update_method:=adaptive \
-  > /tmp/mid360_odin1_multi.log 2>&1 &
-```
-
-配置文件：[`config/mid360_odin1.yaml`](/home/ll/fast_lio_multi_ws/src/FAST_LIO_MULTI_ROS2/config/mid360_odin1.yaml)
-
-- `lidar_type: 1`（Mid360 CustomMsg）  
-- **`common.multi_lidar` 默认 `false`**：Mid 单独 LIO；Odin 不进 FAST-LIO  
-- Odin 独立节点 `odin_independent_accum`：`/odin1/cloud_raw` × `/odin1/odometry` → `/viz/accum_odin`  
-- Mid 累积：`dual_lidar_color_viz`（`odin_mode:=off`）→ `/viz/accum_mid360`  
-- 需要重新开关联融合时：改 `multi_lidar: true`，并关掉 `enable_odin_accum` / 改回 `odin_mode:=registered`
-
-清空各自累积：
-
-```bash
-ros2 service call /dual_lidar_color_viz/clear_accum std_srvs/srv/Trigger {}
-ros2 service call /odin_independent_accum/clear_accum std_srvs/srv/Trigger {}
-```
-
-## 4. 检查
-
-```bash
-ros2 node list | rg 'laserMapping_multi|odin_raw|multi_lio_nav'
-ros2 param get /laserMapping_multi common.multi_lidar
+ros2 param get /laserMapping_multi common.multi_lidar      # true
+ros2 param get /laserMapping_multi mapping.lidar2_update_en # true
 ros2 topic hz /Odometry
+ros2 topic hz /odin1/cloud_raw_ds
 ros2 topic hz /baselink2map
 ros2 topic hz /cloud_registered_1
-ros2 topic echo /Odometry --once
 ```
 
-- `multi_lidar=false`：只跑 Mid360，CloudMap 应无双墙  
-- `multi_lidar=true`：日志应含 `Multi LiDAR on!`、`lidar_type[0]: 1, lidar_type[1]: 4`
+日志侧应能看到双雷达开启、`lidar_type` 主=1 / 副=4，以及 adaptive / bundle 更新信息。
 
-无传感器时节点仍可起，但不会出稳定 odom；有主雷达+IMU 后才验收位姿。
-
-## 5. 接到 DDDMR / EGO
-
-导航侧仍订：
+接到 DDDMR / EGO 时仍订：
 
 - odom：`/baselink2map`  
-- cloud：`/cloud_registered_1`  
+- cloud：`/cloud_registered_1`（body 侧常用 `/cloud_registered_body_1`）
 
-与 [`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md) 一致。融合地图可存 PCD 后跑：
+---
 
-```bash
-bash /home/ll/ws_odin_pvlio/scripts/07_segment_map.sh <fused_map.pcd>
-```
+## 8. 风险备忘
 
-## 6. 关闭
-
-```bash
-pkill -f 'mid360_odin1_multi.launch.py' || true
-pkill -9 -f 'laserMapping_adaptive|laserMapping_async|laserMapping_bundle|odin_raw_downsample|multi_lio_nav_bridge' || true
-```
-
-## 7. 风险与待标定
-
-- **一动就杂乱（根因）**：外参不准的 Odin 若进入 IEKF/ikdtree，运动会把位姿和地图拉歪；旧版 `dual_lidar_color_viz` 还用 raw 点云 + 最新 `/Odometry` 做 Decay，未去畸变，走动必糊。  
-- **当前策略**：`mapping.lidar2_update_en: false`（默认）— Mid360 独占位姿与地图；Odin 仍打 `intensity=200` 进 `/cloud_registered` 供分色，但不参与更新。外参标定好后再改 `true`。  
-- **Mid360 / Odin 同时水平**：
-  1. Odin `/odin1/cloud_raw` 已接近重力水平；Mid 本体在重力对齐后的 `map` 里仍有 ~9° 俯仰（安装角）。  
-  2. Mid 点云用完整 `R_wi`（含 pitch）投到 `map`，所以墙是正的。  
-  3. **不必须和 Mid 雷达同一时间戳**；需要的是「点云内容对应时刻的 Mid 位姿」。Odin 缓冲最新 body 云，Mid IEKF 更新后用**当前** `state_point`（与 Mid 云同一姿态）投影。  
-  4. 转弯时用 **完整 Mid 姿态**（`gravity_frame=false`），把 Mid 安装俯仰(~8.8°)与 Odin tip-up(~4.5°) 一并打进 `R_L2=Ry(-13.3°)`，避免 yaw-only 与 Mid 全姿态不一致导致橙色跟着转。  
-  5. RViz：`dual_lidar_frames` 发 `map→mid360_lidar` / `odin1_lidar`。  
-- **点云跟着机器人转（RViz）**：对当前扫描开长 Decay 也会像地图在转；主看 `/viz/accum_*` / `/Laser_map`，Decay=0。  
-- **双色融合累积**：青 `/viz/accum_mid360`←`/cloud_registered`，橙 `/viz/accum_odin`←`/cloud_odin_registered`。Odin 用与 Mid 相同的 LIO `state_point` 进 `map`（不单独用 raw+/Odometry），避免走动后橙图旋转漂移。
-- **累积地图**：`/Laser_map` 为 ikdtree 世界系地图，机器人转时地图应钉在 Grid 上，只有 Odom 箭头转。  
-- 推荐标定：卷尺/CAD 安装量测，或静止下 Mid360↔Odin 多视角手眼/ICP（约束俯仰/滚转），再写回 `extrinsic_*_L2_wrt_L1`  
-- **当前 Go2 安装（目测/卷尺）**：Odin 在前上方、Mid 在后下方；`T_L2_wrt_L1 ≈ [0.150, 0, +0.035]` m（前 150 mm、高 35 mm）。旧值 `z=+0.208` 与实物不符。  
-- Odin 极密：默认 `odin_voxel:=0.08` + `point_filter_num2: 8`  
-- 无硬时间同步时避免急转首测  
-- 与旧 `open3d_loc` 单雷达链路并存；联调时不要同时发两套 `/baselink2map`
+- **全局系误当雷达系**：务必经 `odin_raw_downsample_bridge`；禁止把 `/odin1/cloud_slam`（已带位姿）直接喂 MULTI。  
+- **外参不准**：Odin 进 IEKF/ikdtree 会在运动中把位姿和地图拉歪；先粗标定再开 `lidar2_update_en`。  
+- **时间错配**：桥接重打戳 |Δt| 门限、bundle 配对门限过松都会导致转弯拖影或错层。  
+- **与旧 open3d_loc 并存**：不要同时发两套 `/baselink2map`。  
+- RViz 长 Decay 看当前扫描会像“地图在转”；主看 `/Laser_map` / 累积图，Decay=0。
