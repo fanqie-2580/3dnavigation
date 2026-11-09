@@ -416,7 +416,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /perception_3d_ros/dGraph
+        Value: /map/dGraph
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
