@@ -1,0 +1,3085 @@
+diff --git a/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h b/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
+index 82dab43..0f73115 100644
+--- a/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
++++ b/planner/bspline_opt/include/bspline_opt/bspline_optimizer.h
+@@ -128,6 +128,9 @@ namespace ego_planner
+ 
+   private:
+     GridMap::Ptr grid_map_;
++    double estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
++    double estimateControlPointYaw(const Eigen::MatrixXd &points, int index) const;
++    bool footprintOccupied(const Eigen::Vector3d &position, double yaw) const;
+     fast_planner::ObjPredictor::Ptr moving_objs_;
+     SwarmTrajData *swarm_trajs_{NULL}; // Can not use shared_ptr and no need to free
+     int drone_id_;
+@@ -164,9 +167,6 @@ namespace ego_planner
+     //
+     double dist0_, swarm_clearance_; // safe distance
+     double max_vel_, max_acc_;       // dynamic limits
+-    double lambda_z_penalty_{1.2};
+-    double z_gradient_dominance_threshold_{0.5};
+-    bool suppress_z_collision_gradient_{false};
+     bool verbose_rebound_log_{false};
+ 
+     int variable_num_;              // optimization variables
+diff --git a/planner/bspline_opt/src/bspline_optimizer.cpp b/planner/bspline_opt/src/bspline_optimizer.cpp
+index 5dc38c4..6823fb7 100644
+--- a/planner/bspline_opt/src/bspline_optimizer.cpp
++++ b/planner/bspline_opt/src/bspline_optimizer.cpp
+@@ -1,6 +1,7 @@
+ #include "bspline_opt/bspline_optimizer.h"
+ #include "bspline_opt/gradient_descent_optimizer.h"
+ #include <cmath>
++#include <limits>
+ // using namespace std;
+ 
+ namespace ego_planner
+@@ -18,9 +19,6 @@ namespace ego_planner
+     node->declare_parameter("optimization/swarm_clearance", -1.0);
+     node->declare_parameter("optimization/max_vel", -1.0);
+     node->declare_parameter("optimization/max_acc", -1.0);
+-    node->declare_parameter("optimization/lambda_z_penalty", 1.2);
+-    node->declare_parameter("optimization/z_gradient_dominance_threshold", 0.5);
+-    node->declare_parameter("optimization/suppress_z_collision_gradient", false);
+     node->declare_parameter("optimization/verbose_rebound_log", false);
+ 
+     node->declare_parameter("optimization/order", 3);
+@@ -34,9 +32,6 @@ namespace ego_planner
+     node->get_parameter("optimization/swarm_clearance", swarm_clearance_);
+     node->get_parameter("optimization/max_vel", max_vel_);
+     node->get_parameter("optimization/max_acc", max_acc_);
+-    node->get_parameter("optimization/lambda_z_penalty", lambda_z_penalty_);
+-    node->get_parameter("optimization/z_gradient_dominance_threshold", z_gradient_dominance_threshold_);
+-    node->get_parameter("optimization/suppress_z_collision_gradient", suppress_z_collision_gradient_);
+     node->get_parameter("optimization/verbose_rebound_log", verbose_rebound_log_);
+ 
+     node->get_parameter("optimization/order", order_);
+@@ -53,6 +48,39 @@ namespace ego_planner
+     this->moving_objs_ = mov_obj;
+   }
+ 
++  double BsplineOptimizer::estimateSegmentYaw(const Eigen::Vector3d &from,
++                                               const Eigen::Vector3d &to) const
++  {
++    const Eigen::Vector2d direction = (to - from).head<2>();
++    if (!direction.allFinite() || direction.norm() < 1e-6)
++      return std::numeric_limits<double>::quiet_NaN();
++    return std::atan2(direction.y(), direction.x());
++  }
++
++  double BsplineOptimizer::estimateControlPointYaw(const Eigen::MatrixXd &points, int index) const
++  {
++    if (points.cols() < 2 || index < 0 || index >= points.cols())
++      return std::numeric_limits<double>::quiet_NaN();
++
++    for (int radius = 1; radius < points.cols(); ++radius)
++    {
++      const int previous = std::max(0, index - radius);
++      const int next = std::min(static_cast<int>(points.cols()) - 1, index + radius);
++      const Eigen::Vector2d direction = (points.col(next) - points.col(previous)).head<2>();
++      if (direction.allFinite() && direction.norm() >= 1e-6)
++        return std::atan2(direction.y(), direction.x());
++    }
++
++    return std::numeric_limits<double>::quiet_NaN();
++  }
++
++  bool BsplineOptimizer::footprintOccupied(const Eigen::Vector3d &position, double yaw) const
++  {
++    if (!grid_map_)
++      return true;
++    return !grid_map_->isFootprintFree(position, yaw);
++  }
++
+   void BsplineOptimizer::setControlPoints(const Eigen::MatrixXd &points)
+   {
+     cps_.points = points;
+@@ -124,9 +152,10 @@ namespace ego_planner
+           for (double a = 1; a > 0; a -= step_size)
+           {
+             Eigen::Vector3d pt(a * RichInfoSegs[i].first.points.col(j) + (1 - a) * RichInfoSegs[i].first.points.col(j + 1));
+-            // cout << " " << grid_map_->getInflateOccupancy(pt) << " pt=" << pt.transpose() << endl;
+             //  如果检测到在障碍物内，则存储对应数据
+-            if (grid_map_->getInflateOccupancy(pt))
++            const double yaw = estimateSegmentYaw(RichInfoSegs[i].first.points.col(j),
++                                                   RichInfoSegs[i].first.points.col(j + 1));
++            if (footprintOccupied(pt, yaw))
+             {
+               occ_start_id = j;
+               occ_start_pt = pt;
+@@ -146,9 +175,10 @@ namespace ego_planner
+           for (double a = 1; a > 0; a -= step_size)
+           {
+             Eigen::Vector3d pt(a * RichInfoSegs[i].first.points.col(j) + (1 - a) * RichInfoSegs[i].first.points.col(j - 1));
+-            // cout << " " << grid_map_->getInflateOccupancy(pt) << " pt=" << pt.transpose() << endl;
+             ;
+-            if (grid_map_->getInflateOccupancy(pt))
++            const double yaw = estimateSegmentYaw(RichInfoSegs[i].first.points.col(j - 1),
++                                                   RichInfoSegs[i].first.points.col(j));
++            if (footprintOccupied(pt, yaw))
+             {
+               occ_end_id = j;
+               occ_end_pt = pt;
+@@ -236,7 +266,8 @@ namespace ego_planner
+           }
+ 
+           // 检查base_pt_reverse是否在障碍物中
+-          if (grid_map_->getInflateOccupancy(base_pt_reverse)) // Search outward.
++          const double control_yaw = estimateControlPointYaw(RichInfoSegs[i].first.points, j);
++          if (footprintOccupied(base_pt_reverse, control_yaw)) // Search outward.
+           {
+             // 最大搜索范围
+             double l_upbound = 5 * CTRL_PT_DIST; // "5" is the threshold.
+@@ -246,7 +277,7 @@ namespace ego_planner
+               // 不断将控制点向外移动，寻找不在障碍物中的控制点
+               Eigen::Vector3d base_pt_temp = base_pt_reverse + l * base_vec_reverse;
+               // cout << base_pt_temp.transpose() << endl;
+-              if (!grid_map_->getInflateOccupancy(base_pt_temp))
++              if (!footprintOccupied(base_pt_temp, control_yaw))
+               {
+                 RichInfoSegs[i].second.base_point[j][0] = base_pt_temp;
+                 RichInfoSegs[i].second.direction[j][0] = base_vec_reverse;
+@@ -318,7 +349,8 @@ namespace ego_planner
+         Eigen::Vector3d base_vec_reverse = -RichInfoSegs[i].first.direction[0][0];
+         Eigen::Vector3d base_pt_reverse = RichInfoSegs[i].first.points.col(0) + base_vec_reverse * (RichInfoSegs[i].first.base_point[0][0] - RichInfoSegs[i].first.points.col(0)).norm();
+ 
+-        if (grid_map_->getInflateOccupancy(base_pt_reverse)) // Search outward.
++        const double control_yaw = estimateControlPointYaw(RichInfoSegs[i].first.points, 0);
++        if (footprintOccupied(base_pt_reverse, control_yaw)) // Search outward.
+         {
+           double l_upbound = 5 * CTRL_PT_DIST; // "5" is the threshold.
+           double l = RESOLUTION;
+@@ -326,7 +358,7 @@ namespace ego_planner
+           {
+             Eigen::Vector3d base_pt_temp = base_pt_reverse + l * base_vec_reverse;
+             // cout << base_pt_temp.transpose() << endl;
+-            if (!grid_map_->getInflateOccupancy(base_pt_temp))
++            if (!footprintOccupied(base_pt_temp, control_yaw))
+             {
+               RichInfoSegs[i].second.base_point[0][0] = base_pt_temp;
+               RichInfoSegs[i].second.direction[0][0] = base_vec_reverse;
+@@ -517,7 +549,9 @@ namespace ego_planner
+     {
+       for (double a = 1.0; a >= 0.0; a -= step_size)
+       {
+-        occ = grid_map_->getInflateOccupancy(a * init_points.col(i - 1) + (1 - a) * init_points.col(i));
++        const Eigen::Vector3d sample = a * init_points.col(i - 1) + (1 - a) * init_points.col(i);
++        const double sample_yaw = estimateSegmentYaw(init_points.col(i - 1), init_points.col(i));
++        occ = footprintOccupied(sample, sample_yaw);
+ 
+         if (occ && !last_occ)
+         {
+@@ -740,7 +774,9 @@ namespace ego_planner
+             for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
+             {
+               // 通过线性插值计算采样点位置
+-              occ = grid_map_->getInflateOccupancy((a / length) * intersection_point + (1 - a / length) * init_points.col(j));
++              const Eigen::Vector3d sample =
++                  (a / length) * intersection_point + (1 - a / length) * init_points.col(j);
++              occ = footprintOccupied(sample, estimateControlPointYaw(init_points, j));
+ 
+               if (occ || a < grid_map_->getResolution())
+               {
+@@ -988,26 +1024,7 @@ namespace ego_planner
+         double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
+         double dist_err = cps_.clearance - dist;
+         Eigen::Vector3d dist_grad = cps_.direction[i][j];
+-        double dist_err_final = dist_err;
+-
+-        if (suppress_z_collision_gradient_)
+-        {
+-          if (std::abs(dist_grad.z()) > z_gradient_dominance_threshold_)
+-          {
+-            dist_err_final *= lambda_z_penalty_ + 1e-6;
+-          }
+-
+-          dist_grad.z() = 0.0;
+-          const double xy_norm = dist_grad.head<2>().norm();
+-          if (xy_norm > 1e-6)
+-          {
+-            dist_grad /= xy_norm;
+-          }
+-          else
+-          {
+-            dist_grad.setZero();
+-          }
+-        }
++        const double dist_err_final = dist_err;
+ 
+         if (dist_err_final < 0)
+         {
+@@ -1335,7 +1352,7 @@ namespace ego_planner
+     for (int i = order_ - 1; i <= i_end; ++i)
+     {
+ 
+-      bool occ = grid_map_->getInflateOccupancy(cps_.points.col(i));
++      bool occ = footprintOccupied(cps_.points.col(i), estimateControlPointYaw(cps_.points, i));
+ 
+       /*** check if the new collision will be valid ***/
+       if (occ)
+@@ -1358,7 +1375,7 @@ namespace ego_planner
+         int j;
+         for (j = i - 1; j >= 0; --j)
+         {
+-          occ = grid_map_->getInflateOccupancy(cps_.points.col(j));
++          occ = footprintOccupied(cps_.points.col(j), estimateControlPointYaw(cps_.points, j));
+           if (!occ)
+           {
+             in_id = j;
+@@ -1373,7 +1390,7 @@ namespace ego_planner
+ 
+         for (j = i + 1; j < cps_.size; ++j)
+         {
+-          occ = grid_map_->getInflateOccupancy(cps_.points.col(j));
++          occ = footprintOccupied(cps_.points.col(j), estimateControlPointYaw(cps_.points, j));
+ 
+           if (!occ)
+           {
+@@ -1477,7 +1494,9 @@ namespace ego_planner
+               cps_.flag_temp[j] = true;
+               for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
+               {
+-                bool occ = grid_map_->getInflateOccupancy((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
++                const Eigen::Vector3d sample =
++                    (a / length) * intersection_point + (1 - a / length) * cps_.points.col(j);
++                bool occ = footprintOccupied(sample, estimateControlPointYaw(cps_.points, j));
+ 
+                 if (occ || a < grid_map_->getResolution())
+                 {
+@@ -1649,10 +1668,11 @@ namespace ego_planner
+         traj.getTimeSpan(tm, tmp);
+         // 计算时间步长
+         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
+-        // 遍历轨迹的前2/3部分进行障碍物检测
+-        for (double t = tm; t < tmp * 1 / 4; t += t_step) // Only check the closest 1/4 partition of the whole trajectory.
++        for (double t = tm; t < tmp; t += t_step)
+         {
+-          flag_occ = grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t));
++          const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
++          const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
++          flag_occ = footprintOccupied(position, estimateSegmentYaw(position, next_position));
+           if (flag_occ)
+           {
+             // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+@@ -1809,9 +1829,11 @@ namespace ego_planner
+       double tm, tmp;
+       traj.getTimeSpan(tm, tmp);
+       double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
+-      for (double t = tm; t < tmp * 2 / 3; t += t_step)
++      for (double t = tm; t < tmp; t += t_step)
+       {
+-        if (grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t)))
++        const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
++        const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
++        if (footprintOccupied(position, estimateSegmentYaw(position, next_position)))
+         {
+           // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+ 
+diff --git a/planner/path_searching/include/path_searching/dyn_a_star.h b/planner/path_searching/include/path_searching/dyn_a_star.h
+index 660ac60..1f1cf49 100644
+--- a/planner/path_searching/include/path_searching/dyn_a_star.h
++++ b/planner/path_searching/include/path_searching/dyn_a_star.h
+@@ -52,14 +52,20 @@ private:
+ 	double getEuclHeu(GridNodePtr node1, GridNodePtr node2);
+ 	inline double getHeu(GridNodePtr node1, GridNodePtr node2);
+ 
+-	bool ConvertToIndexAndAdjustStartEndPoints(const Eigen::Vector3d start_pt, const Eigen::Vector3d end_pt, Eigen::Vector3i &start_idx, Eigen::Vector3i &end_idx);
++	bool convertToIndexAndValidateEndpoints(const Eigen::Vector3d &start_pt,
++										 const Eigen::Vector3d &end_pt, double path_yaw,
++										 Eigen::Vector3i &start_idx, Eigen::Vector3i &end_idx);
+ 
+ 	inline Eigen::Vector3d Index2Coord(const Eigen::Vector3i &index) const;
+ 	inline bool Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) const;
+ 
+ 	//bool (*checkOccupancyPtr)( const Eigen::Vector3d &pos );
+ 
+-	inline bool checkOccupancy(const Eigen::Vector3d &pos) { return (bool)grid_map_->getInflateOccupancy(pos); }
++	inline bool checkOccupancy(const Eigen::Vector3d &pos, double yaw)
++	{
++		return !grid_map_->isFootprintFree(pos, yaw);
++	}
++	bool edgeIsFree(const Eigen::Vector3d &from, const Eigen::Vector3d &to, double yaw);
+ 
+ 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
+ 
+diff --git a/planner/path_searching/src/dyn_a_star.cpp b/planner/path_searching/src/dyn_a_star.cpp
+index f1bc303..60aa88a 100644
+--- a/planner/path_searching/src/dyn_a_star.cpp
++++ b/planner/path_searching/src/dyn_a_star.cpp
+@@ -1,4 +1,5 @@
+ #include "path_searching/dyn_a_star.h"
++#include <cmath>
+ 
+ using namespace std;
+ using namespace Eigen;
+@@ -88,36 +89,46 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
+     return path;
+ }
+ 
+-bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx)
++bool AStar::convertToIndexAndValidateEndpoints(const Vector3d &start_pt, const Vector3d &end_pt,
++                                               double path_yaw, Vector3i &start_idx, Vector3i &end_idx)
+ {
+     if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
+         return false;
+ 
+-    if (checkOccupancy(Index2Coord(start_idx)))
++    if (checkOccupancy(Index2Coord(start_idx), path_yaw))
+     {
+-        // RCLCPP_WARN(rclcpp::get_logger("ConvertToIndexAndAdjustStartEndPoints"), "Start point is insdide an obstacle.");
+-        do
+-        {
+-            start_pt = (start_pt - end_pt).normalized() * step_size_ + start_pt;
+-            if (!Coord2Index(start_pt, start_idx))
+-                return false;
+-        } while (checkOccupancy(Index2Coord(start_idx)));
++        RCLCPP_ERROR(rclcpp::get_logger("AstarSearch"),
++                     "A* start footprint is occupied or outside the map.");
++        return false;
+     }
+ 
+-    if (checkOccupancy(Index2Coord(end_idx)))
++    if (checkOccupancy(Index2Coord(end_idx), path_yaw))
+     {
+-        // RCLCPP_WARN(rclcpp::get_logger("ConvertToIndexAndAdjustStartEndPoints"), "End point is insdide an obstacle.");
+-        do
+-        {
+-            end_pt = (end_pt - start_pt).normalized() * step_size_ + end_pt;
+-            if (!Coord2Index(end_pt, end_idx))
+-                return false;
+-        } while (checkOccupancy(Index2Coord(end_idx)));
++        RCLCPP_ERROR(rclcpp::get_logger("AstarSearch"),
++                     "A* end footprint is occupied or outside the map.");
++        return false;
+     }
+ 
+     return true;
+ }
+ 
++bool AStar::edgeIsFree(const Vector3d &from, const Vector3d &to, double yaw)
++{
++    const double length = (to - from).norm();
++    if (!std::isfinite(length) || length <= 1e-9)
++        return false;
++
++    const double sample_step = std::max(0.01, grid_map_->getResolution() * 0.5);
++    const int samples = std::max(1, static_cast<int>(std::ceil(length / sample_step)));
++    for (int i = 1; i <= samples; ++i)
++    {
++        const Vector3d sample = from + (to - from) * (static_cast<double>(i) / samples);
++        if (checkOccupancy(sample, yaw))
++            return false;
++    }
++    return true;
++}
++
+ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
+ {
+     rclcpp::Time time_1 = rclcpp::Clock().now();
+@@ -127,8 +138,17 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
+     inv_step_size_ = 1 / step_size;
+     center_ = (start_pt + end_pt) / 2;
+ 
++    const Vector2d planar_direction = (end_pt - start_pt).head<2>();
++    if (!planar_direction.allFinite() || planar_direction.norm() < 1e-4)
++    {
++        RCLCPP_ERROR(rclcpp::get_logger("AstarSearch"),
++                     "A* requires a non-zero planar start-to-end direction.");
++        return false;
++    }
++    const double path_yaw = std::atan2(planar_direction.y(), planar_direction.x());
++
+     Vector3i start_idx, end_idx;
+-    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
++    if (!convertToIndexAndValidateEndpoints(start_pt, end_pt, path_yaw, start_idx, end_idx))
+     {
+         RCLCPP_ERROR(rclcpp::get_logger("AstarSearch"), "Unable to handle the initial or end point, force return!");
+         return false;
+@@ -185,6 +205,8 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
+                 {
+                     if (dx == 0 && dy == 0 && dz == 0)
+                         continue;
++                    if (dx == 0 && dy == 0)
++                        continue;
+ 
+                     Vector3i neighborIdx;
+                     neighborIdx(0) = (current->index)(0) + dx;
+@@ -208,7 +230,10 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
+ 
+                     neighborPtr->rounds = rounds_;
+ 
+-                    if (checkOccupancy(Index2Coord(neighborPtr->index)))
++                    const Vector3d current_position = Index2Coord(current->index);
++                    const Vector3d neighbor_position = Index2Coord(neighborPtr->index);
++                    const double neighbor_yaw = std::atan2(static_cast<double>(dy), static_cast<double>(dx));
++                    if (!edgeIsFree(current_position, neighbor_position, neighbor_yaw))
+                     {
+                         continue;
+                     }
+diff --git a/planner/plan_env/include/plan_env/grid_map.h b/planner/plan_env/include/plan_env/grid_map.h
+index 2601f72..a10a9f6 100644
+--- a/planner/plan_env/include/plan_env/grid_map.h
++++ b/planner/plan_env/include/plan_env/grid_map.h
+@@ -5,6 +5,7 @@
+ #include <Eigen/Geometry>
+ #include <Eigen/StdVector>
+ #include <cv_bridge/cv_bridge.h>
++#include <cstdint>
+ #include <geometry_msgs/msg/pose_stamped.hpp>
+ #include <geometry_msgs/msg/transform_stamped.hpp>
+ #include <iostream>
+@@ -60,6 +61,10 @@ struct MappingParameters
+   Eigen::Vector3d local_update_range_;
+   double resolution_, resolution_inv_;
+   double obstacles_inflation_;
++  double footprint_radius_;
++  double footprint_offset_;
++  double footprint_z_down_;
++  double footprint_z_up_;
+   string frame_id_;
+   int pose_type_;
+   bool enable_depth_fusion_input_;
+@@ -160,6 +165,21 @@ struct MappingData
+ class GridMap
+ {
+ public:
++  enum class FootprintStatus : uint8_t
++  {
++    FREE = 0,
++    OCCUPIED = 1,
++    OUT_OF_MAP = 2,
++    INVALID_INPUT = 3
++  };
++
++  struct FootprintCollisionResult
++  {
++    FootprintStatus status{FootprintStatus::INVALID_INPUT};
++    Eigen::Vector3d sample_position{Eigen::Vector3d::Zero()};
++    int cylinder_index{-1};
++  };
++
+   GridMap() {}
+   ~GridMap() {}
+ 
+@@ -185,7 +205,9 @@ public:
+   inline void setOccupied(Eigen::Vector3d pos);
+   inline int getOccupancy(Eigen::Vector3d pos);
+   inline int getOccupancy(Eigen::Vector3i id);
+-  inline int getInflateOccupancy(Eigen::Vector3d pos);
++  FootprintCollisionResult checkFootprint(const Eigen::Vector3d &body_position,
++                                          double body_yaw);
++  bool isFootprintFree(const Eigen::Vector3d &body_position, double body_yaw);
+ 
+   inline void boundIndex(Eigen::Vector3i &id);
+   inline bool isUnknown(const Eigen::Vector3i &id);
+@@ -201,6 +223,7 @@ public:
+   void publishDepth();
+ 
+   bool hasDepthObservation();
++  bool hasMapObservation() const { return md_.has_first_depth_ || md_.has_cloud_; }
+   bool odomValid();
+   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
+   inline double getResolution();
+@@ -215,6 +238,7 @@ public:
+ private:
+   MappingParameters mp_;
+   MappingData md_;
++  std::vector<Eigen::Vector3i> footprint_offsets_;
+ 
+   // get depth image and camera pose
+   void depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+@@ -232,6 +256,7 @@ private:
+   void projectDepthImage();
+   void raycastProcess();
+   void clearAndInflateLocalMap();
++  void buildFootprintOffsets();
+ 
+   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
+   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
+@@ -374,17 +399,6 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
+   return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+ }
+ 
+-inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
+-{
+-  if (!isInMap(pos))
+-    return -1;
+-
+-  Eigen::Vector3i id;
+-  posToIndex(pos, id);
+-
+-  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
+-}
+-
+ inline int GridMap::getOccupancy(Eigen::Vector3i id)
+ {
+   if (id(0) < 0 || id(0) >= mp_.map_voxel_num_(0) || id(1) < 0 || id(1) >= mp_.map_voxel_num_(1) ||
+diff --git a/planner/plan_env/src/grid_map.cpp b/planner/plan_env/src/grid_map.cpp
+index 8483491..1f37daa 100644
+--- a/planner/plan_env/src/grid_map.cpp
++++ b/planner/plan_env/src/grid_map.cpp
+@@ -3,6 +3,7 @@
+ #include <pcl/common/transforms.h>
+ #include <tf2/LinearMath/Quaternion.h>
+ #include <tf2/LinearMath/Transform.h>
++#include <stdexcept>
+ 
+ // #define current_img_ md_.depth_image_[image_cnt_ & 1]
+ // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
+@@ -21,6 +22,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->declare_parameter("grid_map/local_update_range_y", -1.0);
+   node_->declare_parameter("grid_map/local_update_range_z", -1.0);
+   node_->declare_parameter("grid_map/obstacles_inflation", -1.0);
++  node_->declare_parameter("grid_map/footprint_radius", -1.0);
++  node_->declare_parameter("grid_map/footprint_offset", -1.0);
++  node_->declare_parameter("grid_map/footprint_z_down", -1.0);
++  node_->declare_parameter("grid_map/footprint_z_up", -1.0);
+   node_->declare_parameter("grid_map/fx", -1.0);
+   node_->declare_parameter("grid_map/fy", -1.0);
+   node_->declare_parameter("grid_map/cx", -1.0);
+@@ -67,6 +72,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->get_parameter("grid_map/local_update_range_y", mp_.local_update_range_(1));
+   node_->get_parameter("grid_map/local_update_range_z", mp_.local_update_range_(2));
+   node_->get_parameter("grid_map/obstacles_inflation", mp_.obstacles_inflation_);
++  node_->get_parameter("grid_map/footprint_radius", mp_.footprint_radius_);
++  node_->get_parameter("grid_map/footprint_offset", mp_.footprint_offset_);
++  node_->get_parameter("grid_map/footprint_z_down", mp_.footprint_z_down_);
++  node_->get_parameter("grid_map/footprint_z_up", mp_.footprint_z_up_);
+   node_->get_parameter("grid_map/fx", mp_.fx_);
+   node_->get_parameter("grid_map/fy", mp_.fy_);
+   node_->get_parameter("grid_map/cx", mp_.cx_);
+@@ -105,6 +114,19 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
+   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
+ 
++  if (!std::isfinite(mp_.resolution_) || mp_.resolution_ <= 0.0 ||
++      !std::isfinite(mp_.obstacles_inflation_) || mp_.obstacles_inflation_ < 0.0 ||
++      !std::isfinite(mp_.footprint_radius_) || mp_.footprint_radius_ <= 0.0 ||
++      !std::isfinite(mp_.footprint_offset_) || mp_.footprint_offset_ < 0.0 ||
++      !std::isfinite(mp_.footprint_z_down_) || mp_.footprint_z_down_ < 0.0 ||
++      !std::isfinite(mp_.footprint_z_up_) || mp_.footprint_z_up_ <= 0.0)
++  {
++    throw std::runtime_error(
++        "grid_map footprint parameters must be finite and explicitly positive "
++        "(offset and obstacle inflation may be zero)");
++  }
++  buildFootprintOffsets();
++
+   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
+   {
+     mp_.virtual_ceil_height_ = mp_.ground_height_ + z_size;
+@@ -239,6 +261,81 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   // eng_ = default_random_engine(rd());
+ }
+ 
++GridMap::FootprintCollisionResult GridMap::checkFootprint(
++    const Eigen::Vector3d &body_position, double body_yaw)
++{
++  FootprintCollisionResult result;
++  result.sample_position = body_position;
++
++  if (!body_position.allFinite() || !std::isfinite(body_yaw))
++  {
++    result.status = FootprintStatus::INVALID_INPUT;
++    return result;
++  }
++
++  const Eigen::Vector3d heading(std::cos(body_yaw), std::sin(body_yaw), 0.0);
++  const Eigen::Vector3d centers[2] = {
++      body_position + mp_.footprint_offset_ * heading,
++      body_position - mp_.footprint_offset_ * heading};
++  for (int cylinder = 0; cylinder < 2; ++cylinder)
++  {
++    for (const Eigen::Vector3i &offset : footprint_offsets_)
++    {
++      const Eigen::Vector3d sample =
++          centers[cylinder] + offset.cast<double>() * mp_.resolution_;
++
++      if (!isInMap(sample))
++      {
++        result.status = FootprintStatus::OUT_OF_MAP;
++        result.sample_position = sample;
++        result.cylinder_index = cylinder;
++        return result;
++      }
++
++      Eigen::Vector3i index;
++      posToIndex(sample, index);
++      if (md_.occupancy_buffer_inflate_[toAddress(index)] != 0)
++      {
++        result.status = FootprintStatus::OCCUPIED;
++        result.sample_position = sample;
++        result.cylinder_index = cylinder;
++        return result;
++      }
++    }
++  }
++
++  result.status = FootprintStatus::FREE;
++  result.cylinder_index = -1;
++  return result;
++}
++
++bool GridMap::isFootprintFree(const Eigen::Vector3d &body_position, double body_yaw)
++{
++  return checkFootprint(body_position, body_yaw).status == FootprintStatus::FREE;
++}
++
++void GridMap::buildFootprintOffsets()
++{
++  footprint_offsets_.clear();
++  const int radius_steps = static_cast<int>(std::ceil(mp_.footprint_radius_ / mp_.resolution_));
++  const int down_steps = static_cast<int>(std::ceil(mp_.footprint_z_down_ / mp_.resolution_));
++  const int up_steps = static_cast<int>(std::ceil(mp_.footprint_z_up_ / mp_.resolution_));
++  const double radius_limit = mp_.footprint_radius_ + 0.5 * mp_.resolution_;
++
++  for (int dx = -radius_steps; dx <= radius_steps; ++dx)
++    for (int dy = -radius_steps; dy <= radius_steps; ++dy)
++    {
++      const Eigen::Vector2d radial_offset(dx * mp_.resolution_, dy * mp_.resolution_);
++      if (radial_offset.norm() > radius_limit)
++        continue;
++      for (int dz = -down_steps; dz <= up_steps; ++dz)
++        footprint_offsets_.emplace_back(dx, dy, dz);
++    }
++
++  if (footprint_offsets_.empty())
++    throw std::runtime_error("Go2 footprint sampling produced no collision-check offsets");
++}
++
+ void GridMap::resetBuffer()
+ {
+   Eigen::Vector3d min_pos = mp_.map_min_boundary_;
+@@ -1051,17 +1148,6 @@ bool GridMap::lookupTransformSafe(const std::string &target_frame, const std::st
+         rclcpp::Duration::from_seconds(mp_.tf_lookup_timeout_));
+     return true;
+   }
+-  catch (const tf2::TransformException &)
+-  {
+-  }
+-
+-  try
+-  {
+-    transform = tf_buffer_->lookupTransform(
+-        target_frame, source_frame, rclcpp::Time(0, 0, node_->get_clock()->get_clock_type()),
+-        rclcpp::Duration::from_seconds(mp_.tf_lookup_timeout_));
+-    return true;
+-  }
+   catch (const tf2::TransformException &ex)
+   {
+     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+diff --git a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+index 872d120..b6fc7b3 100644
+--- a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
++++ b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+@@ -77,16 +77,6 @@ namespace ego_planner
+     double reference_path_z_offset_;
+     double reference_path_start_skip_dist_;
+     double reference_path_guide_z_margin_;
+-    double reference_path_target_search_radius_;
+-    double reference_path_target_search_step_;
+-    double reference_path_target_backtrack_dist_;
+-    double reference_path_gate_z_min_above_;
+-    double reference_path_gate_z_max_above_;
+-    int reference_path_hard_block_min_samples_;
+-    double reference_path_hard_block_min_length_;
+-    double reference_path_blocked_hold_time_;
+-    int reference_path_clear_required_count_;
+-    bool reference_path_sanitize_waypoints_;
+     double reference_path_update_min_interval_;
+     double reference_path_start_change_threshold_;
+     double reference_path_goal_change_threshold_;
+@@ -94,12 +84,10 @@ namespace ego_planner
+     std::string odom_world_frame_;
+     double odom_z_offset_;
+     double replan_exec_interval_;
+-    double blocked_replan_interval_;
+     double goal_reached_dist_;
+     double target_safety_radius_;
+     double target_safety_z_below_;
+     double target_safety_z_above_;
+-    int max_replan_failures_;
+     int exec_interval_ms_;
+     int safety_interval_ms_;
+     double execution_state_timeout_;
+@@ -112,12 +100,9 @@ namespace ego_planner
+     bool stop_sent_in_wait_replan_{false};
+     bool has_last_replan_request_{false};
+     bool force_wait_replan_{false};
+-    bool reference_path_blocked_wait_active_{false};
+     bool have_last_reference_path_signature_{false};
+-    int reference_path_clear_count_{0};
+     std::string force_wait_replan_reason_;
+     rclcpp::Time last_replan_request_time_;
+-    rclcpp::Time reference_path_blocked_wait_until_;
+     rclcpp::Time last_reference_path_accept_time_;
+     Eigen::Vector3d last_reference_path_start_;
+     Eigen::Vector3d last_reference_path_goal_;
+@@ -162,7 +147,7 @@ namespace ego_planner
+     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+ 
+     /* helper functions */
+-    bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
++    bool callReboundReplan(bool use_polynomial_initialization); // deterministic front-end and back-end method
+     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
+     bool planFromGlobalTraj(const int trial_times = 1);
+     bool planFromCurrentTraj(const int trial_times = 1);
+diff --git a/planner/plan_manage/include/ego_planner/planner_manager.h b/planner/plan_manage/include/ego_planner/planner_manager.h
+index d832be3..27eab2e 100644
+--- a/planner/plan_manage/include/ego_planner/planner_manager.h
++++ b/planner/plan_manage/include/ego_planner/planner_manager.h
+@@ -30,7 +30,7 @@ namespace ego_planner
+ 
+     /* main planning interface */
+     bool reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel, Eigen::Vector3d start_acc,
+-                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit, bool flag_randomPolyTraj);
++                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit);
+     bool EmergencyStop(Eigen::Vector3d stop_pos);
+     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
+                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
+@@ -67,6 +67,7 @@ namespace ego_planner
+ 
+     int continous_failures_count_{0};
+     bool verbose_replan_log_{false};
++    bool have_planned_once_{false};
+ 
+     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
+ 
+diff --git a/planner/plan_manage/launch/advanced_param.launch.py b/planner/plan_manage/launch/advanced_param.launch.py
+index 7599376..5346c63 100644
+--- a/planner/plan_manage/launch/advanced_param.launch.py
++++ b/planner/plan_manage/launch/advanced_param.launch.py
+@@ -146,6 +146,10 @@ def generate_launch_description():
+             {'grid_map/local_update_range_y': 5.5},
+             {'grid_map/local_update_range_z': 4.5},
+             {'grid_map/obstacles_inflation': 0.099},
++            {'grid_map/footprint_radius': 0.25},
++            {'grid_map/footprint_offset': 0.18},
++            {'grid_map/footprint_z_down': 0.18},
++            {'grid_map/footprint_z_up': 0.22},
+             {'grid_map/local_map_margin': 10},
+             {'grid_map/ground_height': -0.01},
+             # camera parameter
+@@ -182,6 +186,8 @@ def generate_launch_description():
+             {'manager/control_points_distance': 0.4},
+             {'manager/feasibility_tolerance': 0.05},
+             {'manager/planning_horizon': planning_horizon},
++            {'manager/replan_start_tolerance': 0.25},
++            {'manager/z_reference_tolerance': 0.25},
+             {'manager/use_distinctive_trajs': use_distinctive_trajs},
+             {'manager/drone_id': drone_id},
+             # Trajectory optimization parameters
+diff --git a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+index 0776a98..53b5deb 100644
+--- a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+@@ -22,16 +22,6 @@ def generate_launch_description():
+     reference_path_z_offset = LaunchConfiguration('reference_path_z_offset')
+     reference_path_start_skip_dist = LaunchConfiguration('reference_path_start_skip_dist')
+     reference_path_guide_z_margin = LaunchConfiguration('reference_path_guide_z_margin')
+-    reference_path_target_search_radius = LaunchConfiguration('reference_path_target_search_radius')
+-    reference_path_target_search_step = LaunchConfiguration('reference_path_target_search_step')
+-    reference_path_target_backtrack_dist = LaunchConfiguration('reference_path_target_backtrack_dist')
+-    reference_path_gate_z_min_above = LaunchConfiguration('reference_path_gate_z_min_above')
+-    reference_path_gate_z_max_above = LaunchConfiguration('reference_path_gate_z_max_above')
+-    reference_path_hard_block_min_samples = LaunchConfiguration('reference_path_hard_block_min_samples')
+-    reference_path_hard_block_min_length = LaunchConfiguration('reference_path_hard_block_min_length')
+-    reference_path_blocked_hold_time = LaunchConfiguration('reference_path_blocked_hold_time')
+-    reference_path_clear_required_count = LaunchConfiguration('reference_path_clear_required_count')
+-    reference_path_sanitize_waypoints = LaunchConfiguration('reference_path_sanitize_waypoints')
+     reference_path_update_min_interval = LaunchConfiguration('reference_path_update_min_interval')
+     reference_path_start_change_threshold = LaunchConfiguration('reference_path_start_change_threshold')
+     reference_path_goal_change_threshold = LaunchConfiguration('reference_path_goal_change_threshold')
+@@ -39,12 +29,10 @@ def generate_launch_description():
+     emergency_time = LaunchConfiguration('emergency_time')
+     continuous_replan = LaunchConfiguration('continuous_replan')
+     replan_exec_interval = LaunchConfiguration('replan_exec_interval')
+-    blocked_replan_interval = LaunchConfiguration('blocked_replan_interval')
+     goal_reached_dist = LaunchConfiguration('goal_reached_dist')
+     target_safety_radius = LaunchConfiguration('target_safety_radius')
+     target_safety_z_below = LaunchConfiguration('target_safety_z_below')
+     target_safety_z_above = LaunchConfiguration('target_safety_z_above')
+-    max_replan_failures = LaunchConfiguration('max_replan_failures')
+     exec_interval_ms = LaunchConfiguration('exec_interval_ms')
+     safety_interval_ms = LaunchConfiguration('safety_interval_ms')
+     execution_state_timeout = LaunchConfiguration('execution_state_timeout')
+@@ -93,6 +81,12 @@ def generate_launch_description():
+     local_update_range_y = LaunchConfiguration('local_update_range_y')
+     local_update_range_z = LaunchConfiguration('local_update_range_z')
+     obstacles_inflation = LaunchConfiguration('obstacles_inflation')
++    footprint_radius = LaunchConfiguration('footprint_radius')
++    footprint_offset = LaunchConfiguration('footprint_offset')
++    footprint_z_down = LaunchConfiguration('footprint_z_down')
++    footprint_z_up = LaunchConfiguration('footprint_z_up')
++    replan_start_tolerance = LaunchConfiguration('replan_start_tolerance')
++    z_reference_tolerance = LaunchConfiguration('z_reference_tolerance')
+     local_map_margin = LaunchConfiguration('local_map_margin')
+     ground_height = LaunchConfiguration('ground_height')
+     min_ray_length = LaunchConfiguration('min_ray_length')
+@@ -103,9 +97,6 @@ def generate_launch_description():
+     visualization_truncate_height = LaunchConfiguration('visualization_truncate_height')
+     pointcloud_vertical_inflation = LaunchConfiguration('pointcloud_vertical_inflation')
+     project_pointcloud_to_ground = LaunchConfiguration('project_pointcloud_to_ground')
+-    suppress_z_collision_gradient = LaunchConfiguration('suppress_z_collision_gradient')
+-    lambda_z_penalty = LaunchConfiguration('lambda_z_penalty')
+-    z_gradient_dominance_threshold = LaunchConfiguration('z_gradient_dominance_threshold')
+     dist0 = LaunchConfiguration('dist0')
+ 
+     ego_planner_node = Node(
+@@ -146,16 +137,6 @@ def generate_launch_description():
+             {'fsm/reference_path_z_offset': ParameterValue(reference_path_z_offset, value_type=float)},
+             {'fsm/reference_path_start_skip_dist': ParameterValue(reference_path_start_skip_dist, value_type=float)},
+             {'fsm/reference_path_guide_z_margin': ParameterValue(reference_path_guide_z_margin, value_type=float)},
+-            {'fsm/reference_path_target_search_radius': ParameterValue(reference_path_target_search_radius, value_type=float)},
+-            {'fsm/reference_path_target_search_step': ParameterValue(reference_path_target_search_step, value_type=float)},
+-            {'fsm/reference_path_target_backtrack_dist': ParameterValue(reference_path_target_backtrack_dist, value_type=float)},
+-            {'fsm/reference_path_gate_z_min_above': ParameterValue(reference_path_gate_z_min_above, value_type=float)},
+-            {'fsm/reference_path_gate_z_max_above': ParameterValue(reference_path_gate_z_max_above, value_type=float)},
+-            {'fsm/reference_path_hard_block_min_samples': ParameterValue(reference_path_hard_block_min_samples, value_type=int)},
+-            {'fsm/reference_path_hard_block_min_length': ParameterValue(reference_path_hard_block_min_length, value_type=float)},
+-            {'fsm/reference_path_blocked_hold_time': ParameterValue(reference_path_blocked_hold_time, value_type=float)},
+-            {'fsm/reference_path_clear_required_count': ParameterValue(reference_path_clear_required_count, value_type=int)},
+-            {'fsm/reference_path_sanitize_waypoints': ParameterValue(reference_path_sanitize_waypoints, value_type=bool)},
+             {'fsm/reference_path_update_min_interval': ParameterValue(reference_path_update_min_interval, value_type=float)},
+             {'fsm/reference_path_start_change_threshold': ParameterValue(reference_path_start_change_threshold, value_type=float)},
+             {'fsm/reference_path_goal_change_threshold': ParameterValue(reference_path_goal_change_threshold, value_type=float)},
+@@ -163,12 +144,10 @@ def generate_launch_description():
+             {'fsm/odom_world_frame': frame_id},
+             {'fsm/odom_z_offset': ParameterValue(odom_z_offset, value_type=float)},
+             {'fsm/replan_exec_interval': ParameterValue(replan_exec_interval, value_type=float)},
+-            {'fsm/blocked_replan_interval': ParameterValue(blocked_replan_interval, value_type=float)},
+             {'fsm/goal_reached_dist': ParameterValue(goal_reached_dist, value_type=float)},
+             {'fsm/target_safety_radius': ParameterValue(target_safety_radius, value_type=float)},
+             {'fsm/target_safety_z_below': ParameterValue(target_safety_z_below, value_type=float)},
+             {'fsm/target_safety_z_above': ParameterValue(target_safety_z_above, value_type=float)},
+-            {'fsm/max_replan_failures': ParameterValue(max_replan_failures, value_type=int)},
+             {'fsm/exec_interval_ms': ParameterValue(exec_interval_ms, value_type=int)},
+             {'fsm/safety_interval_ms': ParameterValue(safety_interval_ms, value_type=int)},
+             {'fsm/execution_state_timeout': ParameterValue(execution_state_timeout, value_type=float)},
+@@ -181,6 +160,10 @@ def generate_launch_description():
+             {'grid_map/local_update_range_y': ParameterValue(local_update_range_y, value_type=float)},
+             {'grid_map/local_update_range_z': ParameterValue(local_update_range_z, value_type=float)},
+             {'grid_map/obstacles_inflation': ParameterValue(obstacles_inflation, value_type=float)},
++            {'grid_map/footprint_radius': ParameterValue(footprint_radius, value_type=float)},
++            {'grid_map/footprint_offset': ParameterValue(footprint_offset, value_type=float)},
++            {'grid_map/footprint_z_down': ParameterValue(footprint_z_down, value_type=float)},
++            {'grid_map/footprint_z_up': ParameterValue(footprint_z_up, value_type=float)},
+             {'grid_map/local_map_margin': ParameterValue(local_map_margin, value_type=int)},
+             {'grid_map/ground_height': ParameterValue(ground_height, value_type=float)},
+             {'grid_map/cx': ParameterValue(cx, value_type=float)},
+@@ -218,6 +201,8 @@ def generate_launch_description():
+             {'manager/control_points_distance': 0.2},
+             {'manager/feasibility_tolerance': 0.05},
+             {'manager/planning_horizon': ParameterValue(planning_horizon, value_type=float)},
++            {'manager/replan_start_tolerance': ParameterValue(replan_start_tolerance, value_type=float)},
++            {'manager/z_reference_tolerance': ParameterValue(z_reference_tolerance, value_type=float)},
+             {'manager/use_distinctive_trajs': ParameterValue(use_distinctive_trajs, value_type=bool)},
+             {'manager/drone_id': ParameterValue(drone_id, value_type=int)},
+             {'manager/verbose_replan_log': False},
+@@ -225,9 +210,6 @@ def generate_launch_description():
+             {'optimization/lambda_collision': 1.0},
+             {'optimization/lambda_feasibility': 0.1},
+             {'optimization/lambda_fitness': 2.0},
+-            {'optimization/suppress_z_collision_gradient': ParameterValue(suppress_z_collision_gradient, value_type=bool)},
+-            {'optimization/lambda_z_penalty': ParameterValue(lambda_z_penalty, value_type=float)},
+-            {'optimization/z_gradient_dominance_threshold': ParameterValue(z_gradient_dominance_threshold, value_type=float)},
+             {'optimization/dist0': ParameterValue(dist0, value_type=float)},
+             {'optimization/swarm_clearance': 0.5},
+             {'optimization/max_vel': ParameterValue(max_vel, value_type=float)},
+@@ -329,48 +311,8 @@ def generate_launch_description():
+             description='Ignore near-duplicate reference poses very close to odom before fitting the EGO global guide'),
+         DeclareLaunchArgument(
+             'reference_path_guide_z_margin',
+-            default_value='0.45',
+-            description='Maximum z overshoot allowed outside the input reference z envelope when fitting the EGO global guide'),
+-        DeclareLaunchArgument(
+-            'reference_path_target_search_radius',
+-            default_value='0.9',
+-            description='Maximum lateral search radius used to project an unsafe reference target back into local free space; 0.9 matches 3d-navi FSM default'),
+-        DeclareLaunchArgument(
+-            'reference_path_target_search_step',
+-            default_value='0.05',
+-            description='Search lattice step for projecting unsafe reference waypoints and local targets'),
+-        DeclareLaunchArgument(
+-            'reference_path_target_backtrack_dist',
+-            default_value='1.5',
+-            description='Maximum distance to walk backward along the guide path when the horizon target cannot be projected'),
+-        DeclareLaunchArgument(
+-            'reference_path_gate_z_min_above',
+             default_value='0.25',
+-            description='Minimum height above the reference path used to classify closed gates; keeps low stair structure traversable'),
+-        DeclareLaunchArgument(
+-            'reference_path_gate_z_max_above',
+-            default_value='1.0',
+-            description='Maximum height above the reference path used to classify closed gates or body-height dynamic blockages'),
+-        DeclareLaunchArgument(
+-            'reference_path_hard_block_min_samples',
+-            default_value='3',
+-            description='Consecutive elevated/no-passage reference samples required before EGO treats local occupancy as a hard blockage'),
+-        DeclareLaunchArgument(
+-            'reference_path_hard_block_min_length',
+-            default_value='0.25',
+-            description='Minimum consecutive elevated/no-passage reference length required before EGO holds for a hard blockage'),
+-        DeclareLaunchArgument(
+-            'reference_path_blocked_hold_time',
+-            default_value='1.0',
+-            description='Minimum time to keep publishing a stop trajectory after a reference-path blockage is detected'),
+-        DeclareLaunchArgument(
+-            'reference_path_clear_required_count',
+-            default_value='2',
+-            description='Number of consecutive unblocked reference-path checks required before EGO may publish a forward trajectory again'),
+-        DeclareLaunchArgument(
+-            'reference_path_sanitize_waypoints',
+-            default_value='true',
+-            description='Project only locally observed unsafe global-path waypoints before fitting the EGO global guide'),
++            description='Maximum z overshoot allowed outside the input reference z envelope when fitting the EGO global guide'),
+         DeclareLaunchArgument(
+             'reference_path_update_min_interval',
+             default_value='0.8',
+@@ -399,10 +341,6 @@ def generate_launch_description():
+             'replan_exec_interval',
+             default_value='0.2',
+             description='Minimum interval between normal replans while executing a trajectory'),
+-        DeclareLaunchArgument(
+-            'blocked_replan_interval',
+-            default_value='0.4',
+-            description='Retry interval after the planner enters blocked wait and publishes a stop trajectory'),
+         DeclareLaunchArgument(
+             'goal_reached_dist',
+             default_value='0.3',
+@@ -419,10 +357,6 @@ def generate_launch_description():
+             'target_safety_z_above',
+             default_value='0.45',
+             description='Height checked above target z for target footprint safety; keeps stair support points below the body band usable'),
+-        DeclareLaunchArgument(
+-            'max_replan_failures',
+-            default_value='5',
+-            description='Consecutive local replanning failures before entering blocked wait and retry mode'),
+         DeclareLaunchArgument(
+             'exec_interval_ms',
+             default_value='200',
+@@ -497,6 +431,12 @@ def generate_launch_description():
+         DeclareLaunchArgument('local_update_range_y', default_value='8.0', description='Local map update half-range along Y'),
+         DeclareLaunchArgument('local_update_range_z', default_value='5.0', description='Local map update half-range along Z for multi-level stairs'),
+         DeclareLaunchArgument('obstacles_inflation', default_value='0.10', description='Obstacle inflation radius'),
++        DeclareLaunchArgument('footprint_radius', default_value='0.25', description='Measured Go2 half-width plus safety margin for each footprint cylinder'),
++        DeclareLaunchArgument('footprint_offset', default_value='0.18', description='Forward and rearward offset of the two Go2 footprint cylinders'),
++        DeclareLaunchArgument('footprint_z_down', default_value='0.18', description='Collision volume below the body-frame trajectory height; excludes the leg support region'),
++        DeclareLaunchArgument('footprint_z_up', default_value='0.22', description='Collision volume above the body-frame trajectory height'),
++        DeclareLaunchArgument('replan_start_tolerance', default_value='0.25', description='Maximum allowed odom-to-executing-trajectory deviation for deterministic replanning'),
++        DeclareLaunchArgument('z_reference_tolerance', default_value='0.25', description='Maximum local-trajectory Z deviation from the external/global reference'),
+         DeclareLaunchArgument('local_map_margin', default_value='10', description='Voxel margin used when clearing the rolling local map'),
+         DeclareLaunchArgument('ground_height', default_value='-1.0', description='Ground height of the occupancy map'),
+         DeclareLaunchArgument('min_ray_length', default_value='0.02', description='Ignore pointcloud returns closer than this distance to the robot'),
+@@ -505,9 +445,6 @@ def generate_launch_description():
+         DeclareLaunchArgument('pointcloud_body_clearance_radius', default_value='0.02', description='Ignore /cloud_registered returns inside this XY radius around the robot to reduce near-body self-occupancy'),
+         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='Extra vertical inflation applied to pointcloud obstacles; 0.10 m matches the 3d-navi stair-friendly Z inflation scale'),
+         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
+-        DeclareLaunchArgument('suppress_z_collision_gradient', default_value='true', description='Prefer XY obstacle avoidance instead of changing trajectory height'),
+-        DeclareLaunchArgument('lambda_z_penalty', default_value='1.2', description='Extra penalty when a collision direction is dominated by Z'),
+-        DeclareLaunchArgument('z_gradient_dominance_threshold', default_value='0.5', description='Absolute Z component above which a collision direction is treated as Z-dominated'),
+         DeclareLaunchArgument('dist0', default_value='0.8', description='Collision cost distance used by EGO optimization; 0.4 matches 3d-navi safety margin, gives turns adequate clearance without blocking 0.7 m doors'),
+         DeclareLaunchArgument('virtual_ceil_height', default_value='50.5', description='Virtual ceiling height used by the occupancy map; keep it above stair trajectories so it clamps to the map top instead of blocking climbs'),
+         DeclareLaunchArgument('visualization_truncate_height', default_value='5.0', description='Hide occupancy points above this height in RViz'),
+diff --git a/planner/plan_manage/src/ego_replan_fsm.cpp b/planner/plan_manage/src/ego_replan_fsm.cpp
+index e1eb60c..a527054 100644
+--- a/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -3,7 +3,6 @@
+ #include <tf2/LinearMath/Quaternion.h>
+ #include <tf2/LinearMath/Transform.h>
+ #include <algorithm>
+-#include <array>
+ #include <cmath>
+ #include <iomanip>
+ #include <limits>
+@@ -14,7 +13,22 @@ namespace ego_planner
+ {
+   namespace
+   {
+-    std::string formatPointState(const GridMap::Ptr &map, const Eigen::Vector3d &pt)
++    bool planarYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to, double &yaw)
++    {
++      const Eigen::Vector2d direction = (to - from).head<2>();
++      if (!direction.allFinite() || direction.norm() < 1e-6)
++        return false;
++      yaw = std::atan2(direction.y(), direction.x());
++      return true;
++    }
++
++    double quaternionYaw(const Eigen::Quaterniond &orientation)
++    {
++      const Eigen::Matrix3d rotation = orientation.normalized().toRotationMatrix();
++      return std::atan2(rotation(1, 0), rotation(0, 0));
++    }
++
++    std::string formatPointState(const GridMap::Ptr &map, const Eigen::Vector3d &pt, double yaw)
+     {
+       std::ostringstream oss;
+       oss << std::fixed << std::setprecision(2)
+@@ -26,14 +40,15 @@ namespace ego_planner
+         return oss.str();
+       }
+ 
+-      oss << " in_map=" << map->isInMap(pt)
+-          << " occ=" << map->getInflateOccupancy(pt);
++      const auto collision = map->checkFootprint(pt, yaw);
++      oss << " footprint_status=" << static_cast<int>(collision.status)
++          << " cylinder=" << collision.cylinder_index;
+       return oss.str();
+     }
+ 
+-    bool isPointCollisionFree(const GridMap::Ptr &map, const Eigen::Vector3d &pt)
++    bool isFootprintCollisionFree(const GridMap::Ptr &map, const Eigen::Vector3d &pt, double yaw)
+     {
+-      return map == nullptr || (map->isInMap(pt) && map->getInflateOccupancy(pt) == 0);
++      return map != nullptr && map->isFootprintFree(pt, yaw);
+     }
+ 
+     double polylineLength(const std::vector<Eigen::Vector3d> &points)
+@@ -49,547 +64,21 @@ namespace ego_planner
+     }
+ 
+     bool isFootprintBandCollisionFree(const GridMap::Ptr &map, const Eigen::Vector3d &center,
+-                                      double radius, double z_below, double z_above)
+-    {
+-      if (map == nullptr)
+-        return true;
+-
+-      const double resolution = std::max(0.05, map->getResolution());
+-      const double safe_radius = std::max(0.0, radius);
+-      const double z_min = center.z() - std::max(0.0, z_below);
+-      const double z_max = center.z() + std::max(0.0, z_above);
+-      const int z_steps = std::max(1, static_cast<int>(std::ceil((z_max - z_min) / resolution)));
+-
+-      static const std::array<Eigen::Vector2d, 8> kDirs = {
+-          Eigen::Vector2d(1.0, 0.0),   Eigen::Vector2d(-1.0, 0.0),
+-          Eigen::Vector2d(0.0, 1.0),   Eigen::Vector2d(0.0, -1.0),
+-          Eigen::Vector2d(0.7071, 0.7071),  Eigen::Vector2d(0.7071, -0.7071),
+-          Eigen::Vector2d(-0.7071, 0.7071), Eigen::Vector2d(-0.7071, -0.7071)};
+-
+-      std::array<double, 3> radii = {0.0, safe_radius * 0.5, safe_radius};
+-      for (int z_idx = 0; z_idx <= z_steps; ++z_idx)
+-      {
+-        Eigen::Vector3d sample = center;
+-        sample.z() = std::min(z_max, z_min + z_idx * resolution);
+-        if (!isPointCollisionFree(map, sample))
+-          return false;
+-
+-        for (double sample_radius : radii)
+-        {
+-          if (sample_radius <= 1e-6)
+-            continue;
+-
+-          for (const auto &dir : kDirs)
+-          {
+-            Eigen::Vector3d offset_sample = sample;
+-            offset_sample.x() += sample_radius * dir.x();
+-            offset_sample.y() += sample_radius * dir.y();
+-            if (!isPointCollisionFree(map, offset_sample))
+-              return false;
+-          }
+-        }
+-      }
+-
+-      return true;
+-    }
+-
+-    bool findNearbyFreePoint(const GridMap::Ptr &map, const Eigen::Vector3d &seed,
+-                             double max_radius, Eigen::Vector3d &resolved_pt)
+-    {
+-      if (isPointCollisionFree(map, seed))
+-      {
+-        resolved_pt = seed;
+-        return true;
+-      }
+-
+-      if (map == nullptr)
+-        return false;
+-
+-      const double resolution = std::max(0.05, map->getResolution());
+-      const double search_radius = std::max(resolution, max_radius);
+-      static const std::array<Eigen::Vector2d, 8> kSearchDirs = {
+-          Eigen::Vector2d(1.0, 0.0),   Eigen::Vector2d(-1.0, 0.0),
+-          Eigen::Vector2d(0.0, 1.0),   Eigen::Vector2d(0.0, -1.0),
+-          Eigen::Vector2d(0.7071, 0.7071),  Eigen::Vector2d(0.7071, -0.7071),
+-          Eigen::Vector2d(-0.7071, 0.7071), Eigen::Vector2d(-0.7071, -0.7071)};
+-      static const std::array<int, 3> kZOffsets = {0, 1, -1};
+-
+-      for (double radius = resolution; radius <= search_radius + 1e-6; radius += resolution)
+-      {
+-        for (const int z_step : kZOffsets)
+-        {
+-          for (const auto &dir : kSearchDirs)
+-          {
+-            Eigen::Vector3d candidate = seed;
+-            candidate.x() += radius * dir.x();
+-            candidate.y() += radius * dir.y();
+-            candidate.z() += z_step * resolution;
+-            if (isPointCollisionFree(map, candidate))
+-            {
+-              resolved_pt = candidate;
+-              return true;
+-            }
+-          }
+-        }
+-      }
+-
+-      return false;
+-    }
+-
+-    bool isSegmentCollisionFree(const GridMap::Ptr &map, const Eigen::Vector3d &from,
+-                                const Eigen::Vector3d &to, double sample_step,
+-                                double safety_radius, double z_below, double z_above)
++                                      double radius, double z_below, double z_above, double yaw)
+     {
+-      if (map == nullptr)
+-        return true;
+-
+-      const double segment_length = (to - from).norm();
+-      if (segment_length <= 1e-6)
+-        return isFootprintBandCollisionFree(map, to, safety_radius, z_below, z_above);
+-
+-      const double step = std::max(0.05, sample_step);
+-      for (double traveled = 0.0; traveled <= segment_length + 1e-6; traveled += step)
+-      {
+-        const double ratio = std::min(1.0, traveled / segment_length);
+-        const Eigen::Vector3d sample = from + ratio * (to - from);
+-        if (!isFootprintBandCollisionFree(map, sample, safety_radius, z_below, z_above))
+-          return false;
+-      }
+-
+-      return true;
++      (void)radius;
++      (void)z_below;
++      (void)z_above;
++      return isFootprintCollisionFree(map, center, yaw);
+     }
+ 
+-    bool isLocalTargetSafe(const GridMap::Ptr &map, const Eigen::Vector3d &goal, double safety_radius,
++    bool isLocalTargetSafe(const GridMap::Ptr &map, const Eigen::Vector3d &from,
++                           const Eigen::Vector3d &goal, double safety_radius,
+                            double z_below, double z_above)
+     {
+-      return isFootprintBandCollisionFree(map, goal, safety_radius, z_below, z_above);
+-    }
+-
+-    bool findSafeReturnToGlobalPath(const GridMap::Ptr &map, GlobalTrajData &global_traj,
+-                                    double start_time, double sample_time_step,
+-                                    double min_progress_dist, double max_progress_dist,
+-                                    const Eigen::Vector3d &from_pt, double safety_radius,
+-                                    double z_below, double z_above, double line_check_step,
+-                                    Eigen::Vector3d &rejoin_pt, double &rejoin_time,
+-                                    double &rejoin_progress)
+-    {
+-      const double duration = global_traj.global_duration_;
+-      if (duration <= 1e-6)
+-        return false;
+-
+-      const double t0 = std::clamp(start_time, 0.0, duration);
+-      const double dt = std::max(0.05, sample_time_step);
+-      const double min_progress = std::max(0.0, min_progress_dist);
+-      const double max_progress = std::max(min_progress, max_progress_dist);
+-
+-      Eigen::Vector3d prev = global_traj.getPosition(t0);
+-      bool found = false;
+-      double progress = 0.0;
+-      Eigen::Vector3d best_pt = prev;
+-      double best_time = t0;
+-      double best_progress = 0.0;
+-
+-      for (double t = t0 + dt; t <= duration + 1e-6; t += dt)
+-      {
+-        const double sample_t = std::min(duration, t);
+-        const Eigen::Vector3d sample_pt = global_traj.getPosition(sample_t);
+-        progress += (sample_pt - prev).norm();
+-        prev = sample_pt;
+-
+-        if (progress + 1e-6 < min_progress)
+-          continue;
+-        if (progress > max_progress + 1e-6)
+-          break;
+-
+-        if (!isLocalTargetSafe(map, sample_pt, safety_radius, z_below, z_above))
+-          continue;
+-        if (!isSegmentCollisionFree(map, from_pt, sample_pt, line_check_step,
+-                                    safety_radius, z_below, z_above))
+-          continue;
+-
+-        best_pt = sample_pt;
+-        best_time = sample_t;
+-        best_progress = progress;
+-        found = true;
+-      }
+-
+-      if (!found)
+-        return false;
+-
+-      rejoin_pt = best_pt;
+-      rejoin_time = best_time;
+-      rejoin_progress = best_progress;
+-      return true;
+-    }
+-
+-    struct ReferenceProjection
+-    {
+-      Eigen::Vector3d point = Eigen::Vector3d::Zero();
+-      double clearance{0.0};
+-      double lateral_offset{0.0};
+-      double longitudinal_offset{0.0};
+-      bool shifted{false};
+-    };
+-
+-    std::vector<double> buildSignedOffsets(double max_abs, double step)
+-    {
+-      std::vector<double> offsets;
+-      offsets.push_back(0.0);
+-
+-      const double bounded_max = std::max(0.0, max_abs);
+-      const double bounded_step = std::max(1e-3, step);
+-      for (double offset = bounded_step; offset <= bounded_max + 1e-6; offset += bounded_step)
+-      {
+-        offsets.push_back(offset);
+-        offsets.push_back(-offset);
+-      }
+-
+-      return offsets;
+-    }
+-
+-    bool buildPlanarPathFrame(const Eigen::Vector3d &tangent_hint,
+-                              Eigen::Vector3d &tangent, Eigen::Vector3d &normal)
+-    {
+-      tangent = tangent_hint;
+-      tangent.z() = 0.0;
+-      if (tangent.head<2>().norm() < 1e-3)
+-        return false;
+-
+-      tangent.normalize();
+-      normal = Eigen::Vector3d(-tangent.y(), tangent.x(), 0.0);
+-      return true;
+-    }
+-
+-    double estimatePlanarClearance(const GridMap::Ptr &map, const Eigen::Vector3d &center,
+-                                   double max_radius, double z_below, double z_above)
+-    {
+-      if (map == nullptr)
+-        return max_radius;
+-      if (!map->isInMap(center) || map->getInflateOccupancy(center) != 0)
+-        return -1.0;
+-
+-      const double resolution = std::max(0.05, map->getResolution());
+-      const double radius_limit = std::max(0.0, max_radius);
+-      double clearance = 0.0;
+-
+-      for (double radius = resolution; radius <= radius_limit + 1e-6; radius += resolution)
+-      {
+-        if (!isFootprintBandCollisionFree(map, center, radius, z_below, z_above))
+-          break;
+-        clearance = radius;
+-      }
+-
+-      return clearance;
+-    }
+-
+-    bool projectReferencePointToFreeSpace(const GridMap::Ptr &map,
+-                                          const Eigen::Vector3d &reference_pt,
+-                                          const Eigen::Vector3d &tangent_hint,
+-                                          double safety_radius,
+-                                          double z_below,
+-                                          double z_above,
+-                                          double max_lateral_offset,
+-                                          double max_longitudinal_offset,
+-                                          double search_step,
+-                                          ReferenceProjection &projection)
+-    {
+-      projection.point = reference_pt;
+-      projection.clearance = safety_radius;
+-      projection.lateral_offset = 0.0;
+-      projection.longitudinal_offset = 0.0;
+-      projection.shifted = false;
+-
+-      if (map == nullptr)
+-        return true;
+-
+-      Eigen::Vector3d tangent;
+-      Eigen::Vector3d normal;
+-      if (!buildPlanarPathFrame(tangent_hint, tangent, normal))
+-      {
+-        tangent = Eigen::Vector3d::UnitX();
+-        normal = Eigen::Vector3d::UnitY();
+-      }
+-
+-      const double resolution = std::max(0.05, map->getResolution());
+-      const double step = std::max(resolution, search_step);
+-      const double lateral_limit = std::max(0.0, max_lateral_offset);
+-      const double longitudinal_limit = std::max(0.0, max_longitudinal_offset);
+-      const double clearance_eval_radius =
+-          std::max(safety_radius, std::min(lateral_limit, safety_radius + 0.5));
+-
+-      const std::vector<double> longitudinal_offsets = buildSignedOffsets(longitudinal_limit, step);
+-      const std::vector<double> lateral_offsets = buildSignedOffsets(lateral_limit, step);
+-
+-      bool found = false;
+-      double best_score = std::numeric_limits<double>::infinity();
+-      ReferenceProjection best_projection;
+-
+-      for (double longitudinal_offset : longitudinal_offsets)
+-      {
+-        for (double lateral_offset : lateral_offsets)
+-        {
+-          Eigen::Vector3d candidate =
+-              reference_pt + tangent * longitudinal_offset + normal * lateral_offset;
+-          candidate.z() = reference_pt.z();
+-
+-          if (!map->isInMap(candidate))
+-            continue;
+-          if (!isFootprintBandCollisionFree(map, candidate, safety_radius, z_below, z_above))
+-            continue;
+-
+-          const double clearance = estimatePlanarClearance(
+-              map, candidate, clearance_eval_radius, z_below, z_above);
+-          if (clearance < -1e-6)
+-            continue;
+-          const double effective_clearance = std::max(clearance, safety_radius);
+-
+-          const double abs_lat = std::abs(lateral_offset);
+-          const double abs_long = std::abs(longitudinal_offset);
+-          const double shift = std::hypot(abs_lat, abs_long);
+-          const double score =
+-              abs_lat * 1.0 + abs_long * 1.8 + shift * 0.2 - effective_clearance * 0.35 +
+-              (longitudinal_offset < -1e-6 ? 0.15 : 0.0);
+-
+-          if (!found || score < best_score)
+-          {
+-            found = true;
+-            best_score = score;
+-            best_projection.point = candidate;
+-            best_projection.clearance = effective_clearance;
+-            best_projection.lateral_offset = lateral_offset;
+-            best_projection.longitudinal_offset = longitudinal_offset;
+-            best_projection.shifted = shift > 1e-3;
+-          }
+-        }
+-      }
+-
+-      if (!found)
+-        return false;
+-
+-      projection = best_projection;
+-      return true;
+-    }
+-
+-    enum class ReferenceGateSeverity
+-    {
+-      CLEAR,
+-      SOFT_BLOCK,
+-      HARD_BLOCK
+-    };
+-
+-    struct ReferenceGateAssessment
+-    {
+-      ReferenceGateSeverity severity{ReferenceGateSeverity::CLEAR};
+-      Eigen::Vector3d blocked_point = Eigen::Vector3d::Zero();
+-      double blocked_time{0.0};
+-      Eigen::Vector3d last_free_point = Eigen::Vector3d::Zero();
+-      double last_free_time{0.0};
+-      int blocked_sample_count{0};
+-      double blocked_length{0.0};
+-      bool elevated_band_blocked{false};
+-      bool lateral_passage_found{false};
+-    };
+-
+-    bool isElevatedBandFreeAtStation(const GridMap::Ptr &map,
+-                                     const Eigen::Vector3d &station,
+-                                     double safety_radius,
+-                                     double z_min_above,
+-                                     double z_max_above)
+-    {
+-      const double z_min = std::max(0.0, std::min(z_min_above, z_max_above));
+-      const double z_max = std::max(z_min, std::max(z_min_above, z_max_above));
+-      Eigen::Vector3d band_center = station;
+-      band_center.z() += 0.5 * (z_min + z_max);
+-      const double half_height = 0.5 * (z_max - z_min);
+-      return isFootprintBandCollisionFree(map, band_center, safety_radius, half_height, half_height);
+-    }
+-
+-    bool hasLateralPassageInElevatedBand(const GridMap::Ptr &map,
+-                                         const Eigen::Vector3d &station,
+-                                         const Eigen::Vector3d &tangent_hint,
+-                                         double safety_radius,
+-                                         double z_min_above,
+-                                         double z_max_above,
+-                                         double lateral_radius,
+-                                         double lateral_step)
+-    {
+-      if (map == nullptr)
+-        return true;
+-
+-      Eigen::Vector3d tangent;
+-      Eigen::Vector3d normal;
+-      if (!buildPlanarPathFrame(tangent_hint, tangent, normal))
+-      {
+-        tangent = Eigen::Vector3d::UnitX();
+-        normal = Eigen::Vector3d::UnitY();
+-      }
+-
+-      const double resolution = std::max(0.05, map->getResolution());
+-      const double step = std::max(resolution, lateral_step);
+-      const double radius = std::max(0.0, lateral_radius);
+-      const std::vector<double> lateral_offsets = buildSignedOffsets(radius, step);
+-
+-      for (double lateral_offset : lateral_offsets)
+-      {
+-        Eigen::Vector3d candidate = station + normal * lateral_offset;
+-        candidate.z() = station.z();
+-        if (!map->isInMap(candidate))
+-          continue;
+-
+-        if (isElevatedBandFreeAtStation(map, candidate, safety_radius, z_min_above, z_max_above))
+-          return true;
+-      }
+-
+-      return false;
+-    }
+-
+-    Eigen::Vector3d referenceTangent(GlobalTrajData &global_traj, double time, double duration, double sample_step)
+-    {
+-      const double clamped_time = std::clamp(time, 0.0, duration);
+-      Eigen::Vector3d tangent = global_traj.getVelocity(clamped_time);
+-      tangent.z() = 0.0;
+-      if (tangent.head<2>().norm() > 1e-3)
+-        return tangent;
+-
+-      const double prev_t = std::max(0.0, clamped_time - sample_step);
+-      const double next_t = std::min(duration, clamped_time + sample_step);
+-      tangent = global_traj.getPosition(next_t) - global_traj.getPosition(prev_t);
+-      tangent.z() = 0.0;
+-      return tangent;
+-    }
+-
+-    ReferenceGateAssessment assessReferenceGateBlock(const GridMap::Ptr &map,
+-                                                     GlobalTrajData &global_traj,
+-                                                     double start_time,
+-                                                     double end_time,
+-                                                     double sample_step,
+-                                                     double safety_radius,
+-                                                     double z_below,
+-                                                     double z_above,
+-                                                     double gate_z_min_above,
+-                                                     double gate_z_max_above,
+-                                                     double lateral_radius,
+-                                                     double lateral_step,
+-                                                     int hard_block_min_samples,
+-                                                     double hard_block_min_length)
+-    {
+-      ReferenceGateAssessment assessment;
+-      if (map == nullptr)
+-        return assessment;
+-
+-      const double duration = global_traj.global_duration_;
+-      if (duration <= 1e-6)
+-        return assessment;
+-
+-      const double from_time = std::clamp(std::min(start_time, end_time), 0.0, duration);
+-      const double to_time = std::clamp(std::max(start_time, end_time), 0.0, duration);
+-      if (to_time <= from_time + 1e-6)
+-        return assessment;
+-
+-      const double step = std::max(0.05, sample_step);
+-      const int min_hard_samples = std::max(1, hard_block_min_samples);
+-      const double min_hard_length = std::max(0.0, hard_block_min_length);
+-      assessment.last_free_time = from_time;
+-      assessment.last_free_point = global_traj.getPosition(from_time);
+-
+-      int hard_run_count = 0;
+-      double hard_run_length = 0.0;
+-      bool have_previous_hard_station = false;
+-      Eigen::Vector3d previous_hard_station = Eigen::Vector3d::Zero();
+-
+-      auto resetHardRun = [&]()
+-      {
+-        hard_run_count = 0;
+-        hard_run_length = 0.0;
+-        have_previous_hard_station = false;
+-      };
+-
+-      auto rememberSoftBlock = [&](const Eigen::Vector3d &station, double sample_time)
+-      {
+-        if (assessment.severity == ReferenceGateSeverity::CLEAR)
+-        {
+-          assessment.severity = ReferenceGateSeverity::SOFT_BLOCK;
+-          assessment.blocked_time = sample_time;
+-          assessment.blocked_point = station;
+-        }
+-      };
+-
+-      for (double t = from_time; t <= to_time + 1e-6; t += step)
+-      {
+-        const double sample_time = std::min(to_time, t);
+-        const Eigen::Vector3d station = global_traj.getPosition(sample_time);
+-        if (!map->isInMap(station))
+-        {
+-          resetHardRun();
+-          continue;
+-        }
+-
+-        if (isFootprintBandCollisionFree(map, station, safety_radius, z_below, z_above))
+-        {
+-          assessment.last_free_time = sample_time;
+-          assessment.last_free_point = station;
+-          resetHardRun();
+-        }
+-        else
+-        {
+-          const Eigen::Vector3d tangent = referenceTangent(global_traj, sample_time, duration, step);
+-          const bool elevated_band_free =
+-              isElevatedBandFreeAtStation(map, station, safety_radius,
+-                                          gate_z_min_above, gate_z_max_above);
+-          bool lateral_passage_found = false;
+-          if (!elevated_band_free)
+-          {
+-            lateral_passage_found =
+-                hasLateralPassageInElevatedBand(map, station, tangent, safety_radius,
+-                                                gate_z_min_above, gate_z_max_above,
+-                                                lateral_radius, lateral_step);
+-          }
+-
+-          rememberSoftBlock(station, sample_time);
+-
+-          if (elevated_band_free || lateral_passage_found)
+-          {
+-            assessment.lateral_passage_found =
+-                assessment.lateral_passage_found || lateral_passage_found;
+-            resetHardRun();
+-            continue;
+-          }
+-
+-          if (hard_run_count == 0)
+-          {
+-            assessment.blocked_time = sample_time;
+-            assessment.blocked_point = station;
+-            hard_run_length = 0.0;
+-          }
+-          else if (have_previous_hard_station)
+-          {
+-            hard_run_length += (station - previous_hard_station).norm();
+-          }
+-
+-          previous_hard_station = station;
+-          have_previous_hard_station = true;
+-          hard_run_count++;
+-
+-          assessment.elevated_band_blocked = true;
+-          assessment.lateral_passage_found = false;
+-          assessment.blocked_sample_count =
+-              std::max(assessment.blocked_sample_count, hard_run_count);
+-          assessment.blocked_length =
+-              std::max(assessment.blocked_length, hard_run_length);
+-
+-          if (hard_run_count >= min_hard_samples &&
+-              hard_run_length + 1e-6 >= min_hard_length)
+-          {
+-            assessment.severity = ReferenceGateSeverity::HARD_BLOCK;
+-            return assessment;
+-          }
+-        }
+-
+-        if (sample_time >= to_time - 1e-6)
+-          break;
+-      }
+-
+-      return assessment;
++      double yaw = 0.0;
++      return planarYaw(from, goal, yaw) &&
++             isFootprintBandCollisionFree(map, goal, safety_radius, z_below, z_above, yaw);
+     }
+ 
+   } // namespace
+@@ -625,16 +114,6 @@ namespace ego_planner
+     node_->declare_parameter("fsm/reference_path_z_offset", 0.0);
+     node_->declare_parameter("fsm/reference_path_start_skip_dist", 0.2);
+     node_->declare_parameter("fsm/reference_path_guide_z_margin", 0.45);
+-    node_->declare_parameter("fsm/reference_path_target_search_radius", 0.9);
+-    node_->declare_parameter("fsm/reference_path_target_search_step", 0.1);
+-    node_->declare_parameter("fsm/reference_path_target_backtrack_dist", 2.0);
+-    node_->declare_parameter("fsm/reference_path_gate_z_min_above", 0.25);
+-    node_->declare_parameter("fsm/reference_path_gate_z_max_above", 1.0);
+-    node_->declare_parameter("fsm/reference_path_hard_block_min_samples", 3);
+-    node_->declare_parameter("fsm/reference_path_hard_block_min_length", 0.25);
+-    node_->declare_parameter("fsm/reference_path_blocked_hold_time", 1.0);
+-    node_->declare_parameter("fsm/reference_path_clear_required_count", 2);
+-    node_->declare_parameter("fsm/reference_path_sanitize_waypoints", true);
+     node_->declare_parameter("fsm/reference_path_update_min_interval", 0.8);
+     node_->declare_parameter("fsm/reference_path_start_change_threshold", 0.25);
+     node_->declare_parameter("fsm/reference_path_goal_change_threshold", 0.20);
+@@ -642,12 +121,10 @@ namespace ego_planner
+     node_->declare_parameter("fsm/odom_world_frame", std::string(""));
+     node_->declare_parameter("fsm/odom_z_offset", 0.0);
+     node_->declare_parameter("fsm/replan_exec_interval", 0.2);
+-    node_->declare_parameter("fsm/blocked_replan_interval", 0.4);
+     node_->declare_parameter("fsm/goal_reached_dist", 0.3);
+     node_->declare_parameter("fsm/target_safety_radius", 0.18);
+     node_->declare_parameter("fsm/target_safety_z_below", 0.05);
+     node_->declare_parameter("fsm/target_safety_z_above", 0.45);
+-    node_->declare_parameter("fsm/max_replan_failures", 5);
+     node_->declare_parameter("fsm/exec_interval_ms", 200);
+     node_->declare_parameter("fsm/safety_interval_ms", 100);
+     node_->declare_parameter("fsm/execution_state_timeout", 0.30);
+@@ -666,16 +143,6 @@ namespace ego_planner
+     node_->get_parameter("fsm/reference_path_z_offset", reference_path_z_offset_);
+     node_->get_parameter("fsm/reference_path_start_skip_dist", reference_path_start_skip_dist_);
+     node_->get_parameter("fsm/reference_path_guide_z_margin", reference_path_guide_z_margin_);
+-    node_->get_parameter("fsm/reference_path_target_search_radius", reference_path_target_search_radius_);
+-    node_->get_parameter("fsm/reference_path_target_search_step", reference_path_target_search_step_);
+-    node_->get_parameter("fsm/reference_path_target_backtrack_dist", reference_path_target_backtrack_dist_);
+-    node_->get_parameter("fsm/reference_path_gate_z_min_above", reference_path_gate_z_min_above_);
+-    node_->get_parameter("fsm/reference_path_gate_z_max_above", reference_path_gate_z_max_above_);
+-    node_->get_parameter("fsm/reference_path_hard_block_min_samples", reference_path_hard_block_min_samples_);
+-    node_->get_parameter("fsm/reference_path_hard_block_min_length", reference_path_hard_block_min_length_);
+-    node_->get_parameter("fsm/reference_path_blocked_hold_time", reference_path_blocked_hold_time_);
+-    node_->get_parameter("fsm/reference_path_clear_required_count", reference_path_clear_required_count_);
+-    node_->get_parameter("fsm/reference_path_sanitize_waypoints", reference_path_sanitize_waypoints_);
+     node_->get_parameter("fsm/reference_path_update_min_interval", reference_path_update_min_interval_);
+     node_->get_parameter("fsm/reference_path_start_change_threshold", reference_path_start_change_threshold_);
+     node_->get_parameter("fsm/reference_path_goal_change_threshold", reference_path_goal_change_threshold_);
+@@ -683,12 +150,10 @@ namespace ego_planner
+     node_->get_parameter("fsm/odom_world_frame", odom_world_frame_);
+     node_->get_parameter("fsm/odom_z_offset", odom_z_offset_);
+     node_->get_parameter("fsm/replan_exec_interval", replan_exec_interval_);
+-    node_->get_parameter("fsm/blocked_replan_interval", blocked_replan_interval_);
+     node_->get_parameter("fsm/goal_reached_dist", goal_reached_dist_);
+     node_->get_parameter("fsm/target_safety_radius", target_safety_radius_);
+     node_->get_parameter("fsm/target_safety_z_below", target_safety_z_below_);
+     node_->get_parameter("fsm/target_safety_z_above", target_safety_z_above_);
+-    node_->get_parameter("fsm/max_replan_failures", max_replan_failures_);
+     node_->get_parameter("fsm/exec_interval_ms", exec_interval_ms_);
+     node_->get_parameter("fsm/safety_interval_ms", safety_interval_ms_);
+     node_->get_parameter("fsm/execution_state_timeout", execution_state_timeout_);
+@@ -704,12 +169,7 @@ namespace ego_planner
+       odom_world_frame_ = "world";
+ 
+     if (reference_path_topic_.empty())
+-    {
+-      reference_path_topic_ = "/global_path";
+-      RCLCPP_WARN(node_->get_logger(), "fsm/reference_path_topic is empty, fallback to %s", reference_path_topic_.c_str());
+-    }
+-    reference_path_hard_block_min_samples_ = std::max(1, reference_path_hard_block_min_samples_);
+-    reference_path_hard_block_min_length_ = std::max(0.0, reference_path_hard_block_min_length_);
++      throw std::runtime_error("fsm/reference_path_topic must not be empty");
+     reference_path_start_skip_dist_ = std::max(0.0, reference_path_start_skip_dist_);
+     reference_path_guide_z_margin_ = std::max(0.0, reference_path_guide_z_margin_);
+ 
+@@ -718,12 +178,9 @@ namespace ego_planner
+     stop_sent_in_wait_replan_ = false;
+     has_last_replan_request_ = false;
+     force_wait_replan_ = false;
+-    reference_path_blocked_wait_active_ = false;
+     have_last_reference_path_signature_ = false;
+-    reference_path_clear_count_ = 0;
+     force_wait_replan_reason_.clear();
+     last_replan_request_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+-    reference_path_blocked_wait_until_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+     last_reference_path_accept_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+     last_reference_path_start_.setZero();
+     last_reference_path_goal_.setZero();
+@@ -1026,12 +483,6 @@ namespace ego_planner
+ 
+     auto map = planner_manager_->grid_map_;
+     const double waypoint_safety_radius = std::max(0.0, target_safety_radius_);
+-    const double waypoint_search_radius = std::max(0.0, reference_path_target_search_radius_);
+-    const double waypoint_search_step =
+-        std::max((map != nullptr) ? map->getResolution() : 0.05,
+-                 reference_path_target_search_step_);
+-    const double waypoint_longitudinal_search =
+-        std::min(0.5, waypoint_search_radius * 0.5);
+ 
+     auto waypointTangent = [&](size_t idx) -> Eigen::Vector3d
+     {
+@@ -1044,91 +495,63 @@ namespace ego_planner
+       return waypoints[idx] - waypoints[idx - 1];
+     };
+ 
+-    size_t projected_waypoint_count = 0;
+-    if (reference_path_sanitize_waypoints_ && map != nullptr)
++    if (map != nullptr)
+     {
+       for (size_t idx = 0; idx < waypoints.size(); ++idx)
+       {
+         if (!map->isInMap(waypoints[idx]))
+           continue;
+ 
+-        ReferenceProjection projection;
+-        if (projectReferencePointToFreeSpace(
+-                map, waypoints[idx], waypointTangent(idx), waypoint_safety_radius,
+-                target_safety_z_below_, target_safety_z_above_,
+-                waypoint_search_radius, waypoint_longitudinal_search,
+-                waypoint_search_step, projection) &&
+-            projection.shifted)
++        const Eigen::Vector3d tangent = waypointTangent(idx);
++        double waypoint_yaw = 0.0;
++        if (!planarYaw(Eigen::Vector3d::Zero(), tangent, waypoint_yaw) ||
++            !isFootprintBandCollisionFree(map, waypoints[idx], waypoint_safety_radius,
++                                          target_safety_z_below_, target_safety_z_above_,
++                                          waypoint_yaw))
+         {
+-          waypoints[idx] = projection.point;
+-          projected_waypoint_count++;
++          RCLCPP_ERROR(node_->get_logger(),
++                       "[EGO] Reject reference path: waypoint %zu has an invalid or occupied footprint.",
++                       idx);
++          if (have_target_)
++          {
++            callEmergencyStop(odom_pos_);
++            stop_sent_in_wait_replan_ = true;
++            force_wait_replan_ = true;
++            force_wait_replan_reason_ = "reference waypoint footprint is occupied";
++            changeFSMExecState(WAIT_REPLAN, "REF_PATH");
++          }
++          return;
+         }
+       }
+-
+-      if (projected_waypoint_count > 0)
+-      {
+-        RCLCPP_WARN_THROTTLE(
+-            node_->get_logger(), *node_->get_clock(), 1000,
+-            "[EGO] Projected %zu local reference waypoints off occupied/near-obstacle cells before fitting the global guide.",
+-            projected_waypoint_count);
+-      }
+     }
+ 
+     Eigen::Vector3d requested_end_pt = waypoints.back();
+-    Eigen::Vector3d local_end_pt = requested_end_pt;
+-    bool clipped_terminal_goal = false;
+-    int local_end_pose_index = static_cast<int>(waypoints.size()) - 1;
+     const double terminal_check_radius = waypoint_safety_radius;
+-    const auto isTerminalGoalSafe = [&](const Eigen::Vector3d &goal) -> bool
+-    {
+-      return isLocalTargetSafe(
+-          map, goal, terminal_check_radius, target_safety_z_below_, target_safety_z_above_);
+-    };
+-
+-    if (map != nullptr && map->isInMap(requested_end_pt) && !isTerminalGoalSafe(requested_end_pt))
+-    {
+-      for (int idx = static_cast<int>(waypoints.size()) - 2; idx >= 0; --idx)
+-      {
+-        const Eigen::Vector3d candidate_end_pt = waypoints[idx];
+-
+-        if (isTerminalGoalSafe(candidate_end_pt))
+-        {
+-          local_end_pt = candidate_end_pt;
+-          clipped_terminal_goal = true;
+-          local_end_pose_index = idx;
+-          break;
+-        }
+-      }
+-
+-      if (!clipped_terminal_goal)
++    const Eigen::Vector3d terminal_from = waypoints.size() >= 2
++                                               ? waypoints[waypoints.size() - 2]
++                                               : odom_pos_;
++    if (map != nullptr && map->isInMap(requested_end_pt) &&
++        !isLocalTargetSafe(map, terminal_from, requested_end_pt, terminal_check_radius,
++                           target_safety_z_below_, target_safety_z_above_))
++    {
++      double terminal_yaw = quaternionYaw(odom_orient_);
++      planarYaw(terminal_from, requested_end_pt, terminal_yaw);
++      RCLCPP_ERROR(
++          node_->get_logger(),
++          "[EGO] Reject reference path with unsafe terminal footprint: %s",
++          formatPointState(map, requested_end_pt, terminal_yaw).c_str());
++      if (have_target_)
+       {
+-        RCLCPP_WARN_THROTTLE(
+-            node_->get_logger(), *node_->get_clock(), 1000,
+-            "[EGO] Reference path rejected because no target on the path satisfies footprint safety. requested=%s",
+-            formatPointState(map, requested_end_pt).c_str());
+-        return;
++        callEmergencyStop(odom_pos_);
++        stop_sent_in_wait_replan_ = true;
++        force_wait_replan_ = true;
++        force_wait_replan_reason_ = "reference path terminal footprint is occupied";
++        changeFSMExecState(WAIT_REPLAN, "REF_PATH");
+       }
++      return;
+     }
+ 
+-    const Eigen::Vector3d candidate_end_pt = local_end_pt;
+-
+-    if (clipped_terminal_goal)
+-    {
+-      waypoints.resize(static_cast<size_t>(local_end_pose_index + 1));
+-    }
+-
+-    if ((waypoints.back() - candidate_end_pt).norm() > 1e-3)
+-    {
+-      waypoints.push_back(candidate_end_pt);
+-    }
+-
+-    if (clipped_terminal_goal)
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Reference path terminal point is occupied or too close to occupancy_inflate, clip local goal by %.3f m.",
+-          (requested_end_pt - candidate_end_pt).norm());
+-    }
++    const Eigen::Vector3d candidate_end_pt = requested_end_pt;
+ 
+     if ((candidate_end_pt - odom_pos_).norm() <= goal_reached_dist_)
+     {
+@@ -1215,17 +638,6 @@ namespace ego_planner
+           rclcpp::Duration::from_seconds(0.1));
+       return true;
+     }
+-    catch (const tf2::TransformException &)
+-    {
+-    }
+-
+-    try
+-    {
+-      transform = tf_buffer_->lookupTransform(
+-          target_frame, source_frame, rclcpp::Time(0, 0, node_->get_clock()->get_clock_type()),
+-          rclcpp::Duration::from_seconds(0.1));
+-      return true;
+-    }
+     catch (const tf2::TransformException &ex)
+     {
+       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+@@ -1606,8 +1018,6 @@ namespace ego_planner
+     replan_failure_count_ = 0;
+     stop_sent_in_wait_replan_ = false;
+     force_wait_replan_ = false;
+-    reference_path_blocked_wait_active_ = false;
+-    reference_path_clear_count_ = 0;
+     force_wait_replan_reason_.clear();
+     markReplanAttempt(now);
+   }
+@@ -1625,9 +1035,7 @@ namespace ego_planner
+     stop_sent_in_wait_replan_ = false;
+     has_last_replan_request_ = false;
+     force_wait_replan_ = false;
+-    reference_path_blocked_wait_active_ = false;
+     have_last_reference_path_signature_ = false;
+-    reference_path_clear_count_ = 0;
+     force_wait_replan_reason_.clear();
+   }
+ 
+@@ -1733,7 +1141,7 @@ namespace ego_planner
+         if (have_odom_ && have_target_ && have_trigger_)
+         {
+           markReplanAttempt(now);
+-          bool success = planFromGlobalTraj(3);
++          bool success = planFromGlobalTraj(1);
+           if (success)
+           {
+             changeFSMExecState(WAIT_TRAJ_START, "FSM");
+@@ -1743,21 +1151,11 @@ namespace ego_planner
+           }
+           else
+           {
+-            if (force_wait_replan_)
+-            {
+-              markReplanAttempt(now);
+-              stop_sent_in_wait_replan_ = false;
+-              RCLCPP_WARN_THROTTLE(
+-                  node_->get_logger(), *node_->get_clock(), 1000,
+-                  "[EGO] %s Hold position and retry from odom after %.2f s.",
+-                  force_wait_replan_reason_.c_str(), blocked_replan_interval_);
+-              changeFSMExecState(WAIT_REPLAN, "FSM");
+-            }
+-            else
+-            {
+-              RCLCPP_ERROR(node_->get_logger(), "Failed to generate the first trajectory!!!");
+-              changeFSMExecState(SEQUENTIAL_START, "FSM");
+-            }
++            stop_sent_in_wait_replan_ = false;
++            if (force_wait_replan_reason_.empty())
++              force_wait_replan_reason_ = "deterministic initial planning failed";
++            RCLCPP_ERROR(node_->get_logger(), "[EGO] %s", force_wait_replan_reason_.c_str());
++            changeFSMExecState(WAIT_REPLAN, "FSM");
+           }
+         }
+         else
+@@ -1772,7 +1170,7 @@ namespace ego_planner
+     case GEN_NEW_TRAJ:
+     {
+       markReplanAttempt(now);
+-      bool success = planFromGlobalTraj(3);
++      bool success = planFromGlobalTraj(1);
+       if (success)
+       {
+         changeFSMExecState(WAIT_TRAJ_START, "FSM");
+@@ -1782,21 +1180,11 @@ namespace ego_planner
+       }
+       else
+       {
+-        if (force_wait_replan_)
+-        {
+-          markReplanAttempt(now);
+-          stop_sent_in_wait_replan_ = false;
+-          RCLCPP_WARN_THROTTLE(
+-              node_->get_logger(), *node_->get_clock(), 1000,
+-              "[EGO] %s Hold position and retry from odom after %.2f s.",
+-              force_wait_replan_reason_.c_str(), blocked_replan_interval_);
+-          changeFSMExecState(WAIT_REPLAN, "FSM");
+-        }
+-        else
+-        {
+-          stop_sent_in_wait_replan_ = false;
+-          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+-        }
++        stop_sent_in_wait_replan_ = false;
++        if (force_wait_replan_reason_.empty())
++          force_wait_replan_reason_ = "deterministic planning failed";
++        RCLCPP_ERROR(node_->get_logger(), "[EGO] %s", force_wait_replan_reason_.c_str());
++        changeFSMExecState(WAIT_REPLAN, "FSM");
+       }
+       break;
+     }
+@@ -1811,36 +1199,11 @@ namespace ego_planner
+       }
+       else
+       {
+-        if (force_wait_replan_)
+-        {
+-          markReplanAttempt(now);
+-          replan_failure_count_ = 0;
+-          stop_sent_in_wait_replan_ = false;
+-          RCLCPP_WARN_THROTTLE(
+-              node_->get_logger(), *node_->get_clock(), 1000,
+-              "[EGO] %s Hold position and retry from odom after %.2f s.",
+-              force_wait_replan_reason_.c_str(), blocked_replan_interval_);
+-          changeFSMExecState(WAIT_REPLAN, "FSM");
+-        }
+-        else
+-        {
+-          replan_failure_count_++;
+-
+-          if (max_replan_failures_ > 0 &&
+-              replan_failure_count_ >= max_replan_failures_)
+-          {
+-            markReplanAttempt(now);
+-            RCLCPP_WARN_THROTTLE(
+-                node_->get_logger(), *node_->get_clock(), 1000,
+-                "[EGO] Replan from current trajectory failed %d times, hold position and retry from odom after %.2f s.",
+-                replan_failure_count_, blocked_replan_interval_);
+-            changeFSMExecState(WAIT_REPLAN, "FSM");
+-          }
+-          else
+-          {
+-            changeFSMExecState(REPLAN_TRAJ, "FSM");
+-          }
+-        }
++        stop_sent_in_wait_replan_ = false;
++        if (force_wait_replan_reason_.empty())
++          force_wait_replan_reason_ = "deterministic replanning failed";
++        RCLCPP_ERROR(node_->get_logger(), "[EGO] %s", force_wait_replan_reason_.c_str());
++        changeFSMExecState(WAIT_REPLAN, "FSM");
+       }
+ 
+       break;
+@@ -1966,45 +1329,22 @@ namespace ego_planner
+         stop_sent_in_wait_replan_ = true;
+       }
+ 
+-      if (reference_path_blocked_wait_active_ &&
+-          (reference_path_blocked_wait_until_ - now).seconds() > 0.0)
+-      {
+-        break;
+-      }
+-
+-      if (replanIntervalElapsed(now, blocked_replan_interval_))
+-      {
+-        replan_failure_count_ = 0;
+-        stop_sent_in_wait_replan_ = false;
+-        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+-      }
++      RCLCPP_WARN_THROTTLE(
++          node_->get_logger(), *node_->get_clock(), 2000,
++          "[EGO] BLOCKED_STOP: waiting for a new target or reference-path event.");
+ 
+       break;
+     }
+ 
+     case EMERGENCY_STOP:
+     {
+-
+-      if (flag_escape_emergency_) // Avoiding repeated calls
++      if (flag_escape_emergency_)
+       {
+         callEmergencyStop(odom_pos_);
++        stop_sent_in_wait_replan_ = true;
+       }
+-      else
+-      {
+-        if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+-        {
+-          if (have_target_)
+-          {
+-            changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+-          }
+-          else
+-          {
+-            changeFSMExecState(WAIT_TARGET, "FSM");
+-          }
+-        }
+-      }
+-
+       flag_escape_emergency_ = false;
++      changeFSMExecState(have_target_ ? WAIT_REPLAN : WAIT_TARGET, "EMERGENCY_STOP");
+       break;
+     }
+     }
+@@ -2018,30 +1358,16 @@ namespace ego_planner
+ 
+   bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) // zx-todo
+   {
++    (void)trial_times;
+     start_pt_ = odom_pos_;
+     start_vel_ = odom_vel_;
+     start_acc_.setZero();
+-
+-    bool flag_random_poly_init;
+-    if (timesOfConsecutiveStateCalls().first == 1)
+-      flag_random_poly_init = false;
+-    else
+-      flag_random_poly_init = true;
+-
+-    for (int i = 0; i < trial_times; i++)
+-    {
+-      if (callReboundReplan(true, flag_random_poly_init))
+-      {
+-        return true;
+-      }
+-      if (force_wait_replan_)
+-        break;
+-    }
+-    return false;
++    return callReboundReplan(true);
+   }
+ 
+   bool EGOReplanFSM::planFromCurrentTraj(const int trial_times /*=1*/)
+   {
++    (void)trial_times;
+ 
+     LocalTrajData *info = &planner_manager_->local_data_;
+     auto map = planner_manager_->grid_map_;
+@@ -2059,42 +1385,31 @@ namespace ego_planner
+     const Eigen::Vector3d traj_start_vel = info->velocity_traj_.evaluateDeBoorT(t_cur);
+     const Eigen::Vector3d traj_start_acc = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+     const double start_deviation = (traj_start_pt - odom_pos_).norm();
+-    const bool traj_start_in_map = (map == nullptr) || map->isInMap(traj_start_pt);
+-    const bool odom_in_map = (map == nullptr) || map->isInMap(odom_pos_);
+-    const bool traj_start_free = isPointCollisionFree(map, traj_start_pt);
+-    const bool odom_start_free = isPointCollisionFree(map, odom_pos_);
+-    const double max_start_deviation =
+-        std::max(0.2,
+-                 std::max(planner_manager_->pp_.ctrl_pt_dist,
+-                          std::max(0.0, planner_manager_->pp_.max_vel_) *
+-                              std::max(0.0, replan_exec_interval_)));
+-    const bool traj_start_occupied = !traj_start_free;
+-    const bool odom_start_occupied = !odom_start_free;
+-    const double start_search_radius =
+-        std::max(0.35,
+-                 std::max(planner_manager_->pp_.ctrl_pt_dist * 1.5,
+-                          std::max(0.0, planner_manager_->pp_.max_vel_) * 0.5));
+-    const double backtrack_window =
+-        std::min(t_cur, std::max(0.4, std::max(replan_exec_interval_ * 4.0,
+-                                               planner_manager_->pp_.ctrl_pt_dist / std::max(0.3, planner_manager_->pp_.max_vel_))));
+-    const double backtrack_step = std::max(0.03, std::min(0.1, std::max(0.05, replan_exec_interval_ * 0.5)));
+-
+-    bool have_safe_start = false;
+-    bool use_poly_start = false;
+-    std::string start_source = "traj";
+-    double start_adjustment = 0.0;
+-    auto setStartState = [&](const Eigen::Vector3d &pt, const Eigen::Vector3d &vel,
+-                             const Eigen::Vector3d &acc, const std::string &source,
+-                             bool force_poly_init, double adjustment)
+-    {
+-      start_pt_ = pt;
+-      start_vel_ = vel;
+-      start_acc_ = acc;
+-      start_source = source;
+-      use_poly_start = force_poly_init;
+-      start_adjustment = adjustment;
+-      have_safe_start = true;
+-    };
++    const double heading_sample_time = std::min(info->duration_, t_cur + 0.10);
++    const Eigen::Vector3d heading_sample = info->position_traj_.evaluateDeBoorT(heading_sample_time);
++    double start_yaw = 0.0;
++    bool have_start_yaw = planarYaw(traj_start_pt, heading_sample, start_yaw);
++    if (!have_start_yaw)
++    {
++      const double previous_time = std::max(0.0, t_cur - 0.10);
++      const Eigen::Vector3d previous_position = info->position_traj_.evaluateDeBoorT(previous_time);
++      have_start_yaw = planarYaw(previous_position, traj_start_pt, start_yaw);
++    }
++    if (!map || !have_start_yaw ||
++        start_deviation > planner_manager_->pp_.replan_start_tolerance_ ||
++        !map->isFootprintFree(traj_start_pt, start_yaw) ||
++        !map->isFootprintFree(odom_pos_, quaternionYaw(odom_orient_)))
++    {
++      RCLCPP_ERROR(
++          node_->get_logger(),
++          "[EGO] Deterministic replan start rejected: deviation=%.3f limit=%.3f map=%d.",
++          start_deviation, planner_manager_->pp_.replan_start_tolerance_, map != nullptr);
++      return false;
++    }
++
++    start_pt_ = traj_start_pt;
++    start_vel_ = traj_start_vel;
++    start_acc_ = traj_start_acc;
+ 
+     if (visualization_ != nullptr)
+     {
+@@ -2102,138 +1417,12 @@ namespace ego_planner
+       visualization_->displayGoalPoint(traj_start_pt, Eigen::Vector4d(1.0, 1.0, 0.0, 1.0), 0.18, 9001);
+     }
+ 
+-    if (traj_start_free && (!odom_start_free || start_deviation <= max_start_deviation))
+-    {
+-      setStartState(traj_start_pt, traj_start_vel, traj_start_acc, "traj", false, 0.0);
+-    }
+-    else if (odom_start_free && (!traj_start_free || start_deviation > max_start_deviation))
+-    {
+-      setStartState(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), "odom", true, start_deviation);
+-    }
+-    else if (traj_start_free)
+-    {
+-      setStartState(traj_start_pt, traj_start_vel, traj_start_acc, "traj", false, 0.0);
+-    }
+-    else
+-    {
+-      for (double sample_t = t_cur - backtrack_step;
+-           sample_t >= std::max(0.0, t_cur - backtrack_window);
+-           sample_t -= backtrack_step)
+-      {
+-        const Eigen::Vector3d sample_pt = info->position_traj_.evaluateDeBoorT(sample_t);
+-        if (isPointCollisionFree(map, sample_pt))
+-        {
+-          setStartState(sample_pt,
+-                        info->velocity_traj_.evaluateDeBoorT(sample_t),
+-                        info->acceleration_traj_.evaluateDeBoorT(sample_t),
+-                        "backtracked_traj", true, t_cur - sample_t);
+-          break;
+-        }
+-      }
+-
+-      if (!have_safe_start && odom_start_free)
+-      {
+-        setStartState(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), "odom", true, start_deviation);
+-      }
+-
+-      if (!have_safe_start)
+-      {
+-        Eigen::Vector3d nearby_odom_pt;
+-        if (findNearbyFreePoint(map, odom_pos_, start_search_radius, nearby_odom_pt))
+-        {
+-          setStartState(nearby_odom_pt, odom_vel_, Eigen::Vector3d::Zero(),
+-                        "nearby_odom", true, (nearby_odom_pt - odom_pos_).norm());
+-        }
+-      }
+-
+-      if (!have_safe_start)
+-      {
+-        Eigen::Vector3d nearby_traj_pt;
+-        if (findNearbyFreePoint(map, traj_start_pt, start_search_radius, nearby_traj_pt))
+-        {
+-          setStartState(nearby_traj_pt, traj_start_vel, traj_start_acc,
+-                        "nearby_traj", true, (nearby_traj_pt - traj_start_pt).norm());
+-        }
+-      }
+-    }
+-
+-    if (!have_safe_start)
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Replan start remains occupied or out of map, skip this replan. odom=%s | traj_start=%s",
+-          formatPointState(map, odom_pos_).c_str(),
+-          formatPointState(map, traj_start_pt).c_str());
+-      return false;
+-    }
+-
+-    if (start_source == "odom")
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Replan start reset to odom (traj_start_occ=%d, odom_start_occ=%d, deviation=%.3f).",
+-          traj_start_occupied, odom_start_occupied, start_deviation);
+-    }
+-    else if (start_source == "backtracked_traj" || start_source == "nearby_odom" || start_source == "nearby_traj")
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Replan start adjusted to %s (traj_start_occ=%d, odom_start_occ=%d, adjustment=%.3f).",
+-          start_source.c_str(), traj_start_occupied, odom_start_occupied, start_adjustment);
+-    }
+-
+     if (visualization_ != nullptr)
+     {
+       visualization_->displayGoalPoint(start_pt_, Eigen::Vector4d(1.0, 0.5, 0.0, 1.0), 0.18, 9002);
+     }
+ 
+-    if (map != nullptr)
+-    {
+-      if (use_poly_start || !traj_start_in_map || !odom_in_map || traj_start_occupied || odom_start_occupied)
+-      {
+-        const std::string odom_state = formatPointState(map, odom_pos_);
+-        const std::string traj_start_state = formatPointState(map, traj_start_pt);
+-        const std::string selected_start_state = formatPointState(map, start_pt_);
+-
+-        RCLCPP_WARN_THROTTLE(
+-            node_->get_logger(), *node_->get_clock(), 1000,
+-            "[EGO][debug] odom=%s | traj_start=%s | selected_start=%s",
+-            odom_state.c_str(), traj_start_state.c_str(), selected_start_state.c_str());
+-      }
+-    }
+-
+-    // When the current odom state has already diverged from the running local
+-    // trajectory, reinitialize the first rebound attempt from the current state
+-    // instead of seeding from the stale trajectory tail.
+-    bool success = callReboundReplan(use_poly_start, false);
+-
+-    if (!success)
+-    {
+-      if (force_wait_replan_)
+-        return false;
+-
+-      success = callReboundReplan(true, false);
+-      if (!success)
+-      {
+-        if (force_wait_replan_)
+-          return false;
+-
+-        for (int i = 0; i < trial_times; i++)
+-        {
+-          success = callReboundReplan(true, true);
+-          if (success)
+-            break;
+-          if (force_wait_replan_)
+-            return false;
+-        }
+-        if (!success)
+-        {
+-          return false;
+-        }
+-      }
+-    }
+-
+-    return true;
++    return callReboundReplan(false);
+   }
+ 
+   void EGOReplanFSM::checkCollisionCallback()
+@@ -2277,7 +1466,12 @@ namespace ego_planner
+         break;
+ 
+       bool occ = false;
+-      occ |= map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t));
++      const Eigen::Vector3d footprint_position = info->position_traj_.evaluateDeBoorT(t);
++      const double next_t = std::min(info->duration_, t + time_step);
++      const Eigen::Vector3d footprint_next = info->position_traj_.evaluateDeBoorT(next_t);
++      double footprint_yaw = 0.0;
++      occ = !planarYaw(footprint_position, footprint_next, footprint_yaw) ||
++            !map->isFootprintFree(footprint_position, footprint_yaw);
+ 
+       for (size_t id = 0; id < planner_manager_->swarm_trajs_buf_.size(); id++)
+       {
+@@ -2340,7 +1534,7 @@ namespace ego_planner
+     }
+   }
+ 
+-  bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
++  bool EGOReplanFSM::callReboundReplan(bool use_polynomial_initialization)
+   {
+     force_wait_replan_ = false;
+     force_wait_replan_reason_.clear();
+@@ -2348,41 +1542,25 @@ namespace ego_planner
+     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> target_candidates;
+     getLocalTarget(&target_candidates);
+ 
+-    if (target_candidates.empty())
++    double diagnostic_yaw = quaternionYaw(odom_orient_);
++    planarYaw(start_pt_, local_target_pt_, diagnostic_yaw);
++    if (target_candidates.size() != 1)
+     {
+       have_new_target_ = false;
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 500,
+-          "[EGO] No safe local target candidates found for this replan request. start=%s | requested=%s | reason=%s",
+-          formatPointState(planner_manager_->grid_map_, start_pt_).c_str(),
+-          formatPointState(planner_manager_->grid_map_, local_target_pt_).c_str(),
+-          force_wait_replan_ ? force_wait_replan_reason_.c_str() : "no admissible target candidate");
++      RCLCPP_ERROR(
++          node_->get_logger(),
++          "[EGO] Deterministic local-target selection produced %zu candidates. start=%s | requested=%s",
++          target_candidates.size(),
++          formatPointState(planner_manager_->grid_map_, start_pt_, diagnostic_yaw).c_str(),
++          formatPointState(planner_manager_->grid_map_, local_target_pt_, diagnostic_yaw).c_str());
+       return false;
+     }
+ 
+-    bool plan_and_refine_success = false;
+-    bool force_poly_init = have_new_target_ || flag_use_poly_init;
+-    for (size_t candidate_idx = 0; candidate_idx < target_candidates.size(); ++candidate_idx)
+-    {
+-      local_target_pt_ = target_candidates[candidate_idx].first;
+-      local_target_vel_ = target_candidates[candidate_idx].second;
+-
+-      plan_and_refine_success =
+-          planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_,
+-                                          force_poly_init, flag_randomPolyTraj);
+-      if (plan_and_refine_success)
+-        break;
+-
+-      force_poly_init = true;
+-      if (candidate_idx + 1 < target_candidates.size())
+-      {
+-        RCLCPP_WARN_THROTTLE(
+-            node_->get_logger(), *node_->get_clock(), 500,
+-            "[EGO] Local target candidate %zu/%zu failed, trying next candidate. target=%s",
+-            candidate_idx + 1, target_candidates.size(),
+-            formatPointState(planner_manager_->grid_map_, local_target_pt_).c_str());
+-      }
+-    }
++    local_target_pt_ = target_candidates.front().first;
++    local_target_vel_ = target_candidates.front().second;
++    const bool use_poly_init = have_new_target_ || use_polynomial_initialization;
++    const bool plan_and_refine_success = planner_manager_->reboundReplan(
++        start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, use_poly_init);
+ 
+     have_new_target_ = false;
+ 
+@@ -2526,7 +1704,6 @@ namespace ego_planner
+     force_wait_replan_reason_.clear();
+ 
+     const double max_vel = std::max(1e-3, planner_manager_->pp_.max_vel_);
+-    const double max_acc = std::max(1e-3, planner_manager_->pp_.max_acc_);
+     const double t_step = std::max(planning_horizen_ / 20.0 / max_vel, 0.01);
+     const double duration = planner_manager_->global_data_.global_duration_;
+ 
+@@ -2583,245 +1760,52 @@ namespace ego_planner
+     const Eigen::Vector3d requested_target =
+         target_found ? planner_manager_->global_data_.getPosition(requested_target_time) : end_pt_;
+ 
+-    const auto map = planner_manager_->grid_map_;
+-    const double local_target_safety_radius = std::max(0.0, target_safety_radius_);
+-    const double candidate_min_dist_from_start =
+-        std::max(0.25, planner_manager_->pp_.ctrl_pt_dist * 0.75);
+-    const double target_search_radius =
+-        std::max((map != nullptr) ? map->getResolution() : 0.05,
+-                 reference_path_target_search_radius_);
+-    const double target_search_step =
+-        std::max((map != nullptr) ? map->getResolution() : 0.05,
+-                 reference_path_target_search_step_);
+-    const double target_longitudinal_search =
+-        std::min(0.6, target_search_radius * 0.5);
+-    const double station_time_step = std::max(0.05, std::min(0.2, t_step));
+-    const double max_candidate_backtrack_dist =
+-        std::max(0.0, reference_path_target_backtrack_dist_);
+-    constexpr size_t kMaxTargetCandidates = 8;
+-
+-    auto computePathTangent = [&](double candidate_time) -> Eigen::Vector3d
+-    {
+-      const double clamped_time = std::clamp(candidate_time, 0.0, duration);
+-      Eigen::Vector3d tangent = planner_manager_->global_data_.getVelocity(clamped_time);
+-      tangent.z() = 0.0;
+-      if (tangent.head<2>().norm() > 1e-3)
+-        return tangent;
+-
+-      const double prev_t = std::max(0.0, clamped_time - station_time_step);
+-      const double next_t = std::min(duration, clamped_time + station_time_step);
+-      tangent = planner_manager_->global_data_.getPosition(next_t) -
+-                planner_manager_->global_data_.getPosition(prev_t);
+-      tangent.z() = 0.0;
+-      if (tangent.head<2>().norm() > 1e-3)
+-        return tangent;
+-
+-      tangent = requested_target - start_pt_;
+-      tangent.z() = 0.0;
+-      return tangent;
+-    };
+-
+-    auto computeAlongPathVelocity = [&](double candidate_time, bool force_stop) -> Eigen::Vector3d
+-    {
+-      if (force_stop)
+-        return Eigen::Vector3d::Zero();
+-
+-      const double vel_t = std::clamp(candidate_time, 0.0, duration);
+-      Eigen::Vector3d vel = planner_manager_->global_data_.getVelocity(vel_t);
+-      vel.z() = 0.0;
+-      const double vel_norm = vel.norm();
+-      if (vel_norm > max_vel)
+-      {
+-        vel = vel.normalized() * max_vel;
+-      }
+-      return vel;
+-    };
+-
+-    auto appendCandidate = [&](const Eigen::Vector3d &candidate_pt, const Eigen::Vector3d &candidate_vel)
+-    {
+-      for (const auto &existing_candidate : candidates)
+-      {
+-        if ((existing_candidate.first - candidate_pt).norm() < 0.15)
+-          return;
+-      }
+-
+-      candidates.emplace_back(candidate_pt, candidate_vel);
+-    };
+-
+-    auto holdCurrentPositionForReferenceBlock = [&](const std::string &reason)
++    const auto deterministic_map = planner_manager_->grid_map_;
++    if (!deterministic_map)
+     {
+-      local_target_pt_ = start_pt_;
+-      local_target_vel_.setZero();
+       force_wait_replan_ = true;
+-      force_wait_replan_reason_ = reason;
+-      planner_manager_->global_data_.last_progress_time_ = t_proj;
+-    };
+-
+-    const ReferenceGateAssessment gate_assessment =
+-        assessReferenceGateBlock(
+-            map, planner_manager_->global_data_, t_proj, requested_target_time,
+-            station_time_step, local_target_safety_radius,
+-            target_safety_z_below_, target_safety_z_above_,
+-            reference_path_gate_z_min_above_, reference_path_gate_z_max_above_,
+-            target_search_radius, target_search_step,
+-            reference_path_hard_block_min_samples_,
+-            reference_path_hard_block_min_length_);
+-    if (gate_assessment.severity == ReferenceGateSeverity::HARD_BLOCK)
+-    {
+-      reference_path_blocked_wait_active_ = true;
+-      reference_path_clear_count_ = 0;
+-      reference_path_blocked_wait_until_ =
+-          plannerNow() + rclcpp::Duration::from_seconds(
+-                             std::max(0.0, reference_path_blocked_hold_time_));
+-      holdCurrentPositionForReferenceBlock(
+-          "Reference path is blocked by local occupancy; waiting for the blockage to clear.");
+-
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Reference path hard-blocked by local occupancy before the horizon target, hold current position and retry. blocked=%s | requested=%s | samples=%d length=%.2f",
+-          formatPointState(map, gate_assessment.blocked_point).c_str(),
+-          formatPointState(map, requested_target).c_str(),
+-          gate_assessment.blocked_sample_count,
+-          gate_assessment.blocked_length);
++      force_wait_replan_reason_ = "Local grid map is unavailable.";
+       return;
+     }
+ 
+-    if (reference_path_blocked_wait_active_)
+-    {
+-      const auto clear_check_now = plannerNow();
+-      if ((reference_path_blocked_wait_until_ - clear_check_now).seconds() > 0.0)
+-      {
+-        holdCurrentPositionForReferenceBlock(
+-            "Reference path was blocked recently; holding before checking for a stable clear.");
++    const double validation_step = std::max(0.05, std::min(0.20, t_step));
++    for (double sample_time = t_proj;
++         sample_time <= requested_target_time + 1e-6;
++         sample_time += validation_step)
++    {
++      const double t = std::min(requested_target_time, sample_time);
++      const double previous_t = std::max(0.0, t - validation_step);
++      const double next_t = std::min(duration, t + validation_step);
++      const Eigen::Vector3d previous = planner_manager_->global_data_.getPosition(previous_t);
++      const Eigen::Vector3d next = planner_manager_->global_data_.getPosition(next_t);
++      const Eigen::Vector3d position = planner_manager_->global_data_.getPosition(t);
++      double yaw = 0.0;
++      if (!planarYaw(previous, next, yaw) ||
++          !deterministic_map->isFootprintFree(position, yaw))
++      {
++        force_wait_replan_ = true;
++        force_wait_replan_reason_ = "Reference path footprint is blocked before the local target.";
++        planner_manager_->global_data_.last_progress_time_ = t_proj;
+         return;
+       }
+ 
+-      reference_path_clear_count_++;
+-      const int required_clear_count = std::max(1, reference_path_clear_required_count_);
+-      if (reference_path_clear_count_ < required_clear_count)
+-      {
+-        holdCurrentPositionForReferenceBlock(
+-            "Reference path blockage is not observed now; waiting for stable clear confirmation.");
+-        RCLCPP_WARN_THROTTLE(
+-            node_->get_logger(), *node_->get_clock(), 1000,
+-            "[EGO] Reference path blockage not reobserved, confirming clear %d/%d before moving.",
+-            reference_path_clear_count_, required_clear_count);
+-        return;
+-      }
+-
+-      reference_path_blocked_wait_active_ = false;
+-      reference_path_clear_count_ = 0;
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Reference path blockage cleared stably, resume local planning.");
+-    }
+-
+-    if (gate_assessment.severity == ReferenceGateSeverity::SOFT_BLOCK)
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Reference path soft-blocked by local occupancy before the horizon target, keep local optimization active. blocked=%s | requested=%s | samples=%d length=%.2f elevated_blocked=%d lateral_passage=%d",
+-          formatPointState(map, gate_assessment.blocked_point).c_str(),
+-          formatPointState(map, requested_target).c_str(),
+-          gate_assessment.blocked_sample_count,
+-          gate_assessment.blocked_length,
+-          gate_assessment.elevated_band_blocked ? 1 : 0,
+-          gate_assessment.lateral_passage_found ? 1 : 0);
+-    }
+-
+-    const double stop_dist = (max_vel * max_vel) / (2.0 * max_acc);
+-    std::vector<double> station_times;
+-    station_times.push_back(requested_target_time);
+-
+-    double backtrack_dist = 0.0;
+-    Eigen::Vector3d last_station = requested_target;
+-    for (double t = requested_target_time - station_time_step;
+-         t >= t_proj - 1e-6 && backtrack_dist <= max_candidate_backtrack_dist;
+-         t -= station_time_step)
+-    {
+-      const double sample_t = std::max(t_proj, t);
+-      const Eigen::Vector3d station = planner_manager_->global_data_.getPosition(sample_t);
+-      backtrack_dist += (last_station - station).norm();
+-      last_station = station;
+-      if (backtrack_dist > max_candidate_backtrack_dist)
+-        break;
+-
+-      station_times.push_back(sample_t);
+-      if (sample_t <= t_proj + 1e-6)
+-        break;
+-    }
+-
+-    bool selected_target = false;
+-    double selected_target_time = requested_target_time;
+-    Eigen::Vector3d selected_base = requested_target;
+-    ReferenceProjection selected_projection;
+-
+-    for (double station_time : station_times)
+-    {
+-      const bool station_is_terminal = station_time >= duration - 1e-6;
+-      const Eigen::Vector3d base_target =
+-          station_is_terminal ? end_pt_ : planner_manager_->global_data_.getPosition(station_time);
+-
+-      ReferenceProjection projection;
+-      if (!projectReferencePointToFreeSpace(
+-              map, base_target, computePathTangent(station_time),
+-              local_target_safety_radius,
+-              target_safety_z_below_, target_safety_z_above_,
+-              target_search_radius, target_longitudinal_search,
+-              target_search_step, projection))
+-      {
+-        continue;
+-      }
+-
+-      const bool near_final_goal = (end_pt_ - base_target).norm() < stop_dist;
+-      if ((projection.point - start_pt_).norm() < candidate_min_dist_from_start &&
+-          !near_final_goal)
+-        continue;
+-
+-      const Eigen::Vector3d candidate_vel =
+-          computeAlongPathVelocity(station_time, near_final_goal);
+-      appendCandidate(projection.point, candidate_vel);
+-
+-      if (!selected_target)
+-      {
+-        selected_target = true;
+-        selected_target_time = station_time;
+-        selected_base = base_target;
+-        selected_projection = projection;
+-        local_target_pt_ = projection.point;
+-        local_target_vel_ = candidate_vel;
+-      }
+-
+-      if (candidates.size() >= kMaxTargetCandidates)
++      if (t >= requested_target_time - 1e-6)
+         break;
+     }
+ 
+-    if (!selected_target)
+-    {
+-      local_target_pt_ = requested_target;
+-      local_target_vel_.setZero();
+-      force_wait_replan_ = true;
+-      force_wait_replan_reason_ =
+-          "No admissible local target could be projected from the reference path in the current local map.";
+-      planner_manager_->global_data_.last_progress_time_ = t_proj;
+-      return;
+-    }
++    Eigen::Vector3d requested_velocity =
++        planner_manager_->global_data_.getVelocity(requested_target_time);
++    requested_velocity.z() = 0.0;
++    if (requested_target_time >= duration - 1e-6)
++      requested_velocity.setZero();
++    else if (requested_velocity.norm() > max_vel)
++      requested_velocity = requested_velocity.normalized() * max_vel;
+ 
+-    planner_manager_->global_data_.last_progress_time_ = selected_target_time;
+-
+-    if (selected_projection.shifted ||
+-        std::abs(selected_target_time - requested_target_time) > station_time_step * 0.5)
+-    {
+-      RCLCPP_WARN_THROTTLE(
+-          node_->get_logger(), *node_->get_clock(), 1000,
+-          "[EGO] Reference local target adjusted. requested=%s | base=%s | selected=%s | lateral=%.3f longitudinal=%.3f clearance=%.3f",
+-          formatPointState(map, requested_target).c_str(),
+-          formatPointState(map, selected_base).c_str(),
+-          formatPointState(map, local_target_pt_).c_str(),
+-          selected_projection.lateral_offset,
+-          selected_projection.longitudinal_offset,
+-          selected_projection.clearance);
+-    }
++    local_target_pt_ = requested_target;
++    local_target_vel_ = requested_velocity;
++    candidates.emplace_back(local_target_pt_, local_target_vel_);
++    planner_manager_->global_data_.last_progress_time_ = requested_target_time;
++    return;
+   }
+ 
+ } // namespace ego_planner
+diff --git a/planner/plan_manage/src/planner_manager.cpp b/planner/plan_manage/src/planner_manager.cpp
+index 2e8cab8..d8beb98 100644
+--- a/planner/plan_manage/src/planner_manager.cpp
++++ b/planner/plan_manage/src/planner_manager.cpp
+@@ -5,6 +5,7 @@
+ #include <iomanip>
+ #include <limits>
+ #include <sstream>
++#include <stdexcept>
+ #include <thread>
+ #include "visualization_msgs/msg/marker.hpp" // zx-todo
+ 
+@@ -12,17 +13,30 @@ namespace ego_planner
+ {
+   namespace
+   {
+-    double computeSeedReuseDistanceThreshold(const ego_planner::PlanParameters &pp)
++    bool planarYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to, double &yaw)
+     {
+-      return std::max(0.35, std::max(pp.ctrl_pt_dist * 2.0, std::max(0.0, pp.max_vel_) * 0.6));
++      const Eigen::Vector2d direction = (to - from).head<2>();
++      if (!direction.allFinite() || direction.norm() < 1e-6)
++        return false;
++      yaw = std::atan2(direction.y(), direction.x());
++      return true;
+     }
+ 
+-    double computeSeedReuseVelocityThreshold(const ego_planner::PlanParameters &pp)
++    bool controlPointYaw(const Eigen::MatrixXd &points, int index, double &yaw)
+     {
+-      return std::max(0.5, std::max(0.0, pp.max_vel_) * 0.5);
++      if (points.cols() < 2 || index < 0 || index >= points.cols())
++        return false;
++      for (int radius = 1; radius < points.cols(); ++radius)
++      {
++        const int previous = std::max(0, index - radius);
++        const int next = std::min(static_cast<int>(points.cols()) - 1, index + radius);
++        if (planarYaw(points.col(previous), points.col(next), yaw))
++          return true;
++      }
++      return false;
+     }
+ 
+-    std::string formatPointState(const GridMap::Ptr &map, const Eigen::Vector3d &pt)
++    std::string formatPointState(const GridMap::Ptr &map, const Eigen::Vector3d &pt, double yaw)
+     {
+       std::ostringstream oss;
+       oss << std::fixed << std::setprecision(2)
+@@ -34,42 +48,11 @@ namespace ego_planner
+         return oss.str();
+       }
+ 
+-      oss << " in_map=" << map->isInMap(pt)
+-          << " occ=" << map->getInflateOccupancy(pt);
++      const auto collision = map->checkFootprint(pt, yaw);
++      oss << " footprint_status=" << static_cast<int>(collision.status)
++          << " cylinder=" << collision.cylinder_index;
+       return oss.str();
+     }
+-
+-    Eigen::Vector3d clampPointToMapBounds(const GridMap::Ptr &map, const Eigen::Vector3d &pt, bool *was_clamped = nullptr)
+-    {
+-      if (was_clamped != nullptr)
+-      {
+-        *was_clamped = false;
+-      }
+-
+-      if (map == nullptr)
+-      {
+-        return pt;
+-      }
+-
+-      Eigen::Vector3d origin, size;
+-      map->getRegion(origin, size);
+-
+-      const Eigen::Vector3d min_bound = (origin.array() + 1e-3).matrix();
+-      const Eigen::Vector3d max_bound = ((origin + size).array() - 1e-3).matrix();
+-
+-      Eigen::Vector3d clamped = pt;
+-      for (int axis = 0; axis < 3; ++axis)
+-      {
+-        clamped(axis) = std::clamp(clamped(axis), min_bound(axis), max_bound(axis));
+-      }
+-
+-      if (was_clamped != nullptr)
+-      {
+-        *was_clamped = (clamped - pt).cwiseAbs().maxCoeff() > 1e-6;
+-      }
+-
+-      return clamped;
+-    }
+   } // namespace
+ 
+   EGOPlannerManager::EGOPlannerManager() {}
+@@ -84,6 +67,8 @@ namespace ego_planner
+     node->declare_parameter("manager/feasibility_tolerance", 0.0);
+     node->declare_parameter("manager/control_points_distance", -1.0);
+     node->declare_parameter("manager/planning_horizon", 5.0);
++    node->declare_parameter("manager/replan_start_tolerance", -1.0);
++    node->declare_parameter("manager/z_reference_tolerance", -1.0);
+     node->declare_parameter("manager/use_distinctive_trajs", false);
+     node->declare_parameter("manager/drone_id", -1);
+     node->declare_parameter("manager/verbose_replan_log", false);
+@@ -94,10 +79,20 @@ namespace ego_planner
+     node->get_parameter("manager/feasibility_tolerance", pp_.feasibility_tolerance_);
+     node->get_parameter("manager/control_points_distance", pp_.ctrl_pt_dist);
+     node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
++    node->get_parameter("manager/replan_start_tolerance", pp_.replan_start_tolerance_);
++    node->get_parameter("manager/z_reference_tolerance", pp_.z_reference_tolerance_);
+     node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
+     node->get_parameter("manager/drone_id", pp_.drone_id);
+     node->get_parameter("manager/verbose_replan_log", verbose_replan_log_);
+ 
++    if (!std::isfinite(pp_.replan_start_tolerance_) || pp_.replan_start_tolerance_ <= 0.0)
++      throw std::runtime_error("manager/replan_start_tolerance must be explicitly positive");
++    if (!std::isfinite(pp_.z_reference_tolerance_) || pp_.z_reference_tolerance_ <= 0.0)
++      throw std::runtime_error("manager/z_reference_tolerance must be explicitly positive");
++    if (pp_.use_distinctive_trajs)
++      throw std::runtime_error(
++          "manager/use_distinctive_trajs must be false for deterministic real-robot planning");
++
+     local_data_.traj_id_ = 0;
+     grid_map_.reset(new GridMap);
+     // grid_map_->initMap(nh);
+@@ -115,7 +110,7 @@ namespace ego_planner
+ 
+   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
+                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
+-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
++                                        Eigen::Vector3d local_target_vel, bool flag_polyInit)
+   {
+     static int count = 0;
+     if (verbose_replan_log_)
+@@ -134,22 +129,30 @@ namespace ego_planner
+       return false;
+     }
+ 
+-    // Keep the initial control points inside the active rolling map. Otherwise
+-    // getInflateOccupancy() returns -1 and the optimizer immediately treats the
+-    // trajectory head as invalid/occupied.
+-    const Eigen::Vector3d raw_start_pt = start_pt;
+-    bool start_pt_clamped = false;
+-    if (grid_map_ != nullptr && !grid_map_->isInMap(start_pt))
++    double route_yaw = 0.0;
++    if (!grid_map_ || !grid_map_->hasMapObservation() ||
++        !planarYaw(start_pt, local_target_pt, route_yaw))
+     {
+-      start_pt = clampPointToMapBounds(grid_map_, start_pt, &start_pt_clamped);
+-      if (start_pt_clamped)
+-      {
+-        RCLCPP_WARN(
+-            rclcpp::get_logger("planner_manager"),
+-            "[EGO] Replan start projected into local map. raw=%s | clamped=%s",
+-            formatPointState(grid_map_, raw_start_pt).c_str(),
+-            formatPointState(grid_map_, start_pt).c_str());
+-      }
++      RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                   "[EGO] Reject planning request without a map observation and planar direction.");
++      return false;
++    }
++
++    double start_yaw = route_yaw;
++    double target_yaw = route_yaw;
++    if (start_vel.head<2>().norm() >= 1e-3)
++      start_yaw = std::atan2(start_vel.y(), start_vel.x());
++    if (local_target_vel.head<2>().norm() >= 1e-3)
++      target_yaw = std::atan2(local_target_vel.y(), local_target_vel.x());
++
++    if (!grid_map_->isFootprintFree(start_pt, start_yaw) ||
++        !grid_map_->isFootprintFree(local_target_pt, target_yaw))
++    {
++      RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                   "[EGO] Reject occupied footprint. start=%s | target=%s",
++                   formatPointState(grid_map_, start_pt, start_yaw).c_str(),
++                   formatPointState(grid_map_, local_target_pt, target_yaw).c_str());
++      return false;
+     }
+ 
+     bspline_optimizer_->setLocalTargetPt(local_target_pt);
+@@ -164,61 +167,39 @@ namespace ego_planner
+     // terminal control points are less likely to start inside inflated voxels.
+     double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
+     vector<Eigen::Vector3d> point_set, start_end_derivatives;
+-    static bool flag_first_call = true, flag_force_polynomial = false;
+-    bool force_poly_from_seed_mismatch = false;
+-    bool flag_regenerate = false;
+-
+-    if (!flag_first_call && !flag_polyInit && !flag_force_polynomial)
++    if (have_planned_once_ && !flag_polyInit)
+     {
+       const bool have_active_local_traj =
+           local_data_.start_time_.seconds() > 1e-5 && local_data_.duration_ > 1e-3;
+ 
+       if (!have_active_local_traj)
+       {
+-        force_poly_from_seed_mismatch = true;
++        RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                     "[EGO] Deterministic trajectory reuse requested without an active trajectory.");
++        return false;
+       }
+-      else
++
++      const double seed_t_cur =
++          std::clamp((rclcpp::Clock().now() - local_data_.start_time_).seconds(), 0.0, local_data_.duration_);
++      const Eigen::Vector3d seed_pt = local_data_.position_traj_.evaluateDeBoorT(seed_t_cur);
++      const double seed_start_deviation = (seed_pt - start_pt).norm();
++      if (seed_start_deviation > pp_.replan_start_tolerance_ ||
++          !grid_map_->isFootprintFree(seed_pt, start_yaw))
+       {
+-        const double seed_t_cur =
+-            std::clamp((rclcpp::Clock().now() - local_data_.start_time_).seconds(), 0.0, local_data_.duration_);
+-        const Eigen::Vector3d seed_pt = local_data_.position_traj_.evaluateDeBoorT(seed_t_cur);
+-        const Eigen::Vector3d seed_vel = local_data_.velocity_traj_.evaluateDeBoorT(seed_t_cur);
+-        const double seed_start_deviation = (seed_pt - start_pt).norm();
+-        const double seed_vel_deviation = (seed_vel - start_vel).norm();
+-        const bool seed_in_map = (grid_map_ == nullptr) || grid_map_->isInMap(seed_pt);
+-        const bool seed_is_free = (grid_map_ == nullptr) || (grid_map_->getInflateOccupancy(seed_pt) == 0);
+-
+-        force_poly_from_seed_mismatch =
+-            !seed_in_map ||
+-            !seed_is_free ||
+-            seed_start_deviation > computeSeedReuseDistanceThreshold(pp_) ||
+-            seed_vel_deviation > computeSeedReuseVelocityThreshold(pp_);
+-
+-        if (force_poly_from_seed_mismatch)
+-        {
+-          RCLCPP_WARN(
+-              rclcpp::get_logger("planner_manager"),
+-              "[EGO] Rejecting previous trajectory as replan seed. seed=%s | requested_start=%s | pos_dev=%.3f vel_dev=%.3f",
+-              formatPointState(grid_map_, seed_pt).c_str(),
+-              formatPointState(grid_map_, start_pt).c_str(),
+-              seed_start_deviation,
+-              seed_vel_deviation);
+-        }
++        RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                     "[EGO] Reject deterministic replan seed. seed=%s | requested=%s | deviation=%.3f limit=%.3f",
++                     formatPointState(grid_map_, seed_pt, start_yaw).c_str(),
++                     formatPointState(grid_map_, start_pt, start_yaw).c_str(),
++                     seed_start_deviation, pp_.replan_start_tolerance_);
++        return false;
+       }
+     }
+ 
+-    do
+-    {
+-      point_set.clear();
+-      start_end_derivatives.clear();
+-      flag_regenerate = false;
++    point_set.clear();
++    start_end_derivatives.clear();
+ 
+-      // 这里如果正常进入if（通常为初次生成），则do部分只进行一次，即只清空一次点集；若进入else则有可能对异常情况重置flag_regenerate并再do一次
+-      if (flag_first_call || flag_polyInit || flag_force_polynomial || force_poly_from_seed_mismatch /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
+-      {
+-        flag_first_call = false;
+-        flag_force_polynomial = false;
+-        force_poly_from_seed_mismatch = false;
++    if (!have_planned_once_ || flag_polyInit) // Initial path generated from a min-snap traj by order.
++    {
+         // 用于存储生成的轨迹
+         PolynomialTraj gl_traj;
+ 
+@@ -226,26 +207,7 @@ namespace ego_planner
+         // 判断 速度的平方/加速度 是否大于dist，并决定如何计算时间
+         double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? sqrt(dist / pp_.max_acc_) : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
+ 
+-        if (!flag_randomPolyTraj)
+-        // false生成一段单一的多项式轨迹，true生成一个包含随机插入点的轨迹
+-        {
+-          gl_traj = PolynomialTraj::one_segment_traj_gen(start_pt, start_vel, start_acc, local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), time);
+-        }
+-        else
+-        {
+-          Eigen::Vector3d horizen_dir = ((start_pt - local_target_pt).cross(Eigen::Vector3d(0, 0, 1))).normalized();
+-          Eigen::Vector3d vertical_dir = ((start_pt - local_target_pt).cross(horizen_dir)).normalized();
+-          Eigen::Vector3d random_inserted_pt = (start_pt + local_target_pt) / 2 +
+-                                               (((double)rand()) / RAND_MAX - 0.5) * (start_pt - local_target_pt).norm() * horizen_dir * 0.8 * (-0.978 / (continous_failures_count_ + 0.989) + 0.989) +
+-                                               (((double)rand()) / RAND_MAX - 0.5) * (start_pt - local_target_pt).norm() * vertical_dir * 0.4 * (-0.978 / (continous_failures_count_ + 0.989) + 0.989);
+-          Eigen::MatrixXd pos(3, 3);
+-          pos.col(0) = start_pt;
+-          pos.col(1) = random_inserted_pt;
+-          pos.col(2) = local_target_pt;
+-          Eigen::VectorXd t(2);
+-          t(0) = t(1) = time / 2;
+-          gl_traj = PolynomialTraj::minSnapTraj(pos, start_vel, local_target_vel, start_acc, Eigen::Vector3d::Zero(), t);
+-        }
++        gl_traj = PolynomialTraj::one_segment_traj_gen(start_pt, start_vel, start_acc, local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), time);
+ 
+         double t;
+         bool flag_too_far;
+@@ -273,9 +235,9 @@ namespace ego_planner
+         start_end_derivatives.push_back(local_target_vel);
+         start_end_derivatives.push_back(gl_traj.evaluateAcc(0));
+         start_end_derivatives.push_back(gl_traj.evaluateAcc(t));
+-      }
+-      else // Initial path generated from previous trajectory.
+-      {
++    }
++    else // Initial path generated from previous trajectory.
++    {
+ 
+         double t;
+         double t_cur = (rclcpp::Clock().now() - local_data_.start_time_).seconds();
+@@ -294,16 +256,13 @@ namespace ego_planner
+ 
+         if (segment_point.size() < 2 || pseudo_arc_length.size() < 2 || pseudo_arc_length.back() <= 1e-6)
+         {
+-          force_poly_from_seed_mismatch = true;
+-          flag_regenerate = true;
+-
+-          RCLCPP_WARN(
++          RCLCPP_ERROR(
+               rclcpp::get_logger("planner_manager"),
+-              "[EGO] Previous trajectory tail is too short for safe reuse, switching to polynomial init. start=%s | local_target=%s | sampled_pts=%zu",
+-              formatPointState(grid_map_, start_pt).c_str(),
+-              formatPointState(grid_map_, local_target_pt).c_str(),
++              "[EGO] Previous trajectory tail is too short for deterministic reuse. start=%s | target=%s | sampled_pts=%zu",
++              formatPointState(grid_map_, start_pt, route_yaw).c_str(),
++              formatPointState(grid_map_, local_target_pt, route_yaw).c_str(),
+               segment_point.size());
+-          continue;
++          return false;
+         }
+ 
+         t -= ts;
+@@ -370,11 +329,11 @@ namespace ego_planner
+ 
+         if (point_set.size() > pp_.planning_horizen_ / pp_.ctrl_pt_dist * 3) // The initial path is unnormally too long!
+         {
+-          flag_force_polynomial = true;
+-          flag_regenerate = true;
++          RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                       "[EGO] Deterministic trajectory reuse generated an excessive control-point set.");
++          return false;
+         }
+-      }
+-    } while (flag_regenerate);
++    }
+ 
+     // 将轨迹变为B样条轨迹
+     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
+@@ -396,19 +355,22 @@ namespace ego_planner
+ 
+     if (grid_map_ != nullptr)
+     {
+-      bool ctrl_pt_problem = !grid_map_->isInMap(start_pt) || (grid_map_->getInflateOccupancy(start_pt) != 0);
++      bool ctrl_pt_problem = !grid_map_->isFootprintFree(start_pt, route_yaw);
+       std::ostringstream ctrl_pt_state;
+ 
+-      ctrl_pt_state << "start=" << formatPointState(grid_map_, start_pt)
+-                    << " | local_target=" << formatPointState(grid_map_, local_target_pt);
++      ctrl_pt_state << "start=" << formatPointState(grid_map_, start_pt, route_yaw)
++                    << " | local_target=" << formatPointState(grid_map_, local_target_pt, route_yaw);
+ 
+       for (int i = 0; i < debug_ctrl_pt_num; ++i)
+       {
+         const Eigen::Vector3d ctrl_pt = ctrl_pts.col(i);
+-        const bool ctrl_pt_in_map = grid_map_->isInMap(ctrl_pt);
+-        const int ctrl_pt_occ = grid_map_->getInflateOccupancy(ctrl_pt);
+-        ctrl_pt_problem = ctrl_pt_problem || !ctrl_pt_in_map || (ctrl_pt_occ != 0);
+-        ctrl_pt_state << " | cp" << i << "=" << formatPointState(grid_map_, ctrl_pt);
++        double ctrl_pt_yaw = 0.0;
++        const bool valid_yaw = controlPointYaw(ctrl_pts, i, ctrl_pt_yaw);
++        const bool ctrl_pt_free = valid_yaw && grid_map_->isFootprintFree(ctrl_pt, ctrl_pt_yaw);
++        ctrl_pt_problem = ctrl_pt_problem || !ctrl_pt_free;
++        ctrl_pt_state << " | cp" << i << "="
++                      << (valid_yaw ? formatPointState(grid_map_, ctrl_pt, ctrl_pt_yaw)
++                                    : std::string("invalid_yaw"));
+       }
+ 
+       if (ctrl_pt_problem)
+@@ -533,8 +495,52 @@ namespace ego_planner
+     // t_refine = ros::Time::now() - t_start;
+     t_refine = rclcpp::Clock().now() - t_start;
+ 
++    const double local_duration = pos.getTimeSum();
++    const double global_duration = global_data_.global_duration_;
++    if (!std::isfinite(local_duration) || local_duration <= 0.0 ||
++        !std::isfinite(global_duration) || global_duration <= 0.0)
++    {
++      RCLCPP_ERROR(rclcpp::get_logger("planner_manager"),
++                   "[EGO] Cannot validate trajectory against an invalid Z reference.");
++      return false;
++    }
++
++    for (double local_t = 0.0; local_t <= local_duration + 1e-6; local_t += 0.05)
++    {
++      const Eigen::Vector3d local_position =
++          pos.evaluateDeBoorT(std::min(local_duration, local_t));
++      double nearest_planar_distance = std::numeric_limits<double>::infinity();
++      double reference_z = 0.0;
++      for (double global_t = 0.0; global_t <= global_duration + 1e-6; global_t += 0.10)
++      {
++        const Eigen::Vector3d reference_position =
++            global_data_.getPosition(std::min(global_duration, global_t));
++        const double planar_distance =
++            (local_position - reference_position).head<2>().norm();
++        if (planar_distance < nearest_planar_distance)
++        {
++          nearest_planar_distance = planar_distance;
++          reference_z = reference_position.z();
++        }
++      }
++
++      if (!std::isfinite(nearest_planar_distance) ||
++          std::abs(local_position.z() - reference_z) > pp_.z_reference_tolerance_)
++      {
++        RCLCPP_ERROR(
++            rclcpp::get_logger("planner_manager"),
++            "[EGO] Reject trajectory outside Z reference corridor: local_z=%.3f reference_z=%.3f tolerance=%.3f.",
++            local_position.z(), reference_z, pp_.z_reference_tolerance_);
++        return false;
++      }
++
++      if (local_t >= local_duration - 1e-6)
++        break;
++    }
++
+     // save planned results
+     updateTrajInfo(pos, rclcpp::Clock().now());
++    have_planned_once_ = true;
+ 
+     static double sum_time = 0;
+     static int count_success = 0;
+diff --git a/planner/traj_utils/include/traj_utils/plan_container.hpp b/planner/traj_utils/include/traj_utils/plan_container.hpp
+index c2b5817..b32f81a 100644
+--- a/planner/traj_utils/include/traj_utils/plan_container.hpp
++++ b/planner/traj_utils/include/traj_utils/plan_container.hpp
+@@ -195,6 +195,8 @@ namespace ego_planner
+     double ctrl_pt_dist;                  // distance between adjacient B-spline control points
+     double feasibility_tolerance_;        // permitted ratio of vel/acc exceeding limits
+     double planning_horizen_;
++    double replan_start_tolerance_;
++    double z_reference_tolerance_;
+     bool use_distinctive_trajs;
+     int drone_id; // single drone: drone_id <= -1, swarm: drone_id >= 0
+ 
+@@ -230,4 +232,4 @@ namespace ego_planner
+ 
+ } // namespace ego_planner
+ 
+-#endif
+\ No newline at end of file
++#endif

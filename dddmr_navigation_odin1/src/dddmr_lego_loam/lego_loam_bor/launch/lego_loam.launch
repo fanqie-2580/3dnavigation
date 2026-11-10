@@ -1,0 +1,16 @@
+<launch>
+
+  <!--name argument is not required, because it will overwrite all node name in the exec-->
+  <node pkg="lego_loam_bor" exec="lego_loam" output="screen" respawn="false">
+    <param from="$(find-pkg-share lego_loam_bor)/config/loam_bag_mid360_config.yaml" />
+    <remap from="/lslidar_point_cloud" to="/livox/lidar"/>
+    <remap from="/odom" to="/utlidar/robot_odomf"/> 
+  </node>
+
+  <node pkg="rviz2" exec="rviz2" output="screen" respawn="false" args="-d $(find-pkg-share lego_loam_bor)/rviz/lego_loam.rviz">
+  </node>
+
+  <!--- TF -->
+  <node pkg="tf2_ros" exec="static_transform_publisher" name="sensor2baselink"  args="0.1870 0 0.0803 0 0.2268928 0 base_link livox_frame" />
+  <!-- <node pkg="tf2_ros" exec="static_transform_publisher" name="sensor2baselink"  args="0.1710 0 0.0908 0.0 0.2268928 0 base_link utlidar_lidar" />-->
+</launch>

@@ -1,0 +1,47 @@
+---
+description: After code changes, sync source-only and push to GitHub
+alwaysApply: true
+---
+
+# Push to GitHub after every modification
+
+Whenever you finish modifying project source (not just analysis), sync and push to the private monorepo.
+
+## Target
+
+- Account: `fanqie-2580`
+- Repo: https://github.com/fanqie-2580/3dnavigation (private)
+- Local upload git root: `/home/ll/3dnavigation_github_upload`
+- Remote: `origin` → `https://github.com/fanqie-2580/3dnavigation.git`
+- Branch: `main`
+
+## What to upload (source only)
+
+Include changed projects under the upload root, e.g.:
+
+- `dddmr_navigation` ← `/home/ll/dddmr_navigation` (Mid360)
+- `dddmr_navigation_odin1` ← `/home/ll/dddmr_navigation_odin1` (Odin1)
+- `ego-planner-swarm-ros2_version` ← `/home/ll/ego-planner-swarm-ros2_version` (Mid360)
+- `ego-planner-swarm-odin1` ← `/home/ll/ego-planner-swarm-odin1` (Odin1)
+- `FAST_LIO_LOCALIZATION_HUMANOID-humble` ← `/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble`
+- related packages already in the upload repo if edited
+
+Always exclude: `build/`, `install/`, `log/`, bags (`*.bag`/`*.db3`/`*.mcap`), maps (`*.pcd`/`*.ply`), models (`*.onnx`/`*.pt`/`*.pth`/`*.engine`), large media, test dump dirs.
+
+## Workflow after edits
+
+1. Rsync only the touched project(s) into `/home/ll/3dnavigation_github_upload/<name>` with the exclusions above (`--copy-links`).
+2. In the upload repo: `git status` / `git diff`, then commit with a concise message (why, not just what).
+3. Push to `origin main` using HTTPS + Personal Access Token for `fanqie-2580` (do not use G7-3208 SSH for this repo).
+4. Report the commit and repo URL to the user.
+
+## Auth
+
+- Do not store the PAT in git remotes or commit it.
+- If push auth fails, ask the user for a `repo`-scoped PAT (or open https://github.com/settings/tokens).
+- Never push secrets (`.env`, credentials, tokens).
+
+## Exceptions
+
+- Skip push only if the user says not to upload, or the change is analysis-only with no file edits.
+- Do not force-push unless the user explicitly requests it.

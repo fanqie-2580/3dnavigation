@@ -1,5 +1,9 @@
 # Codex 工作区说明
 
+> **推送到 GitHub（必读）**：源码改动后同步推送流程见  
+> [`docs/push_to_github.md`](./docs/push_to_github.md)。  
+> 上传根目录：`/home/ll/3dnavigation_github_upload`；远端：`https://github.com/fanqie-2580/3dnavigation`（HTTPS + PAT，不用 SSH）。
+
 这个工作区用于我的机器人导航、规划、定位相关项目联调。 请严格按照本文件理解项目结构、运行环境和修改规则。
 
 ## 0. 当前工作区包含的项目
@@ -8,36 +12,44 @@
 
 ```bash /home/ll/codex_robot_ws ```
 
-该目录下应该包含三个软链接项目：
+该目录下应包含 Mid360 三软链，以及 Odin1 分叉（物理独立，改一侧勿动另一侧）：
 
-```text dddmr_navigation -> /home/ll/dddmr_navigation ego-planner-swarm-ros2_version -> /home/ll/ego-planner-swarm-ros2_version FAST_LIO_LOCALIZATION_HUMANOID-humble -> 
-/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble ```
+```text
+dddmr_navigation -> /home/ll/dddmr_navigation
+ego-planner-swarm-ros2_version -> /home/ll/ego-planner-swarm-ros2_version
+FAST_LIO_LOCALIZATION_HUMANOID-humble -> /home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble
+dddmr_navigation_odin1 -> /home/ll/dddmr_navigation_odin1
+ego-planner-swarm-odin1 -> /home/ll/ego-planner-swarm-odin1
+```
+
+分叉说明见 [`docs/mid_odin_source_split.md`](./docs/mid_odin_source_split.md)。  
+**禁止**在同一 shell 同时 `source` Mid 与 Odin 的 `install/setup.bash`（包名相同会互相覆盖）。
 
 不要在 `/home/ll` 家目录直接进行全局分析或全局修改，因为家目录下还有很多无关项目，例如 autoware、unitree、ws_livox、ros_ws、bag 文件等。
 
-## 1. 三个项目的职责
+## 1. 项目职责
 
-### 1.1 dddmr_navigation
+### 1.1 dddmr_navigation（Mid360 全局规划）
 
-`dddmr_navigation` 是主要导航项目。主要用于全局规划。
+`dddmr_navigation` 是 Mid360 全局规划树。
 
 宿主机路径：
 
 ```bash /home/ll/dddmr_navigation ```
 
-Docker 内路径：
+Docker：`dddmr_dev`，容器内路径 `/root/dddmr_ws`。
 
-```bash /root/dddmr_ws ```
+- 修改代码：宿主机 `/home/ll/dddmr_navigation`
+- 编译/运行：优先 `dddmr_dev` 内
+- Odin1 **不要**改此树；Odin 用 `dddmr_navigation_odin1` + `dddmr_odin1`
 
-这个项目的代码在宿主机上，但是运行和编译主要发生在 Docker 容器中。
+### 1.1b dddmr_navigation_odin1（Odin1 全局规划）
 
-也就是说：
+宿主机：`/home/ll/dddmr_navigation_odin1`  
+Docker：`dddmr_odin1` → `/root/dddmr_ws`  
+入口：`dddmr_global_ego_odin1.launch.py`（Odin 专用 yaml/rviz/maps）
 
-- 修改代码时，直接修改宿主机的 `/home/ll/dddmr_navigation` - 验证、编译、运行时，优先在 Docker 容器内的 `/root/dddmr_ws` 执行 - 不要默认认为宿主机可以直接编译或运行 dddmr_navigation
-
-### 1.2 ego-planner-swarm-ros2_version
-
-`ego-planner-swarm-ros2_version` 是 EGO Planner 的 ROS 2 版本项目。主要用于局部规划
+### 1.2 ego-planner-swarm-ros2_version（Mid360 局部规划）
 
 宿主机路径：
 
@@ -48,6 +60,12 @@ Docker 内路径：
 主要关注：
 
 - 局部规划 - 轨迹生成 - swarm 多机逻辑 - odom / map / trajectory 相关 topic - launch 文件和参数文件
+
+### 1.2b ego-planner-swarm-odin1（Odin1 局部规划）
+
+宿主机：`/home/ll/ego-planner-swarm-odin1`  
+入口：`dddmr_reference_tracking_odin1.launch.py` + `odin1_navigation.rviz`  
+与 Mid EGO 树物理分离；调 Odin 参数只改此树。
 
 ### 1.3 FAST_LIO_LOCALIZATION_HUMANOID-humble
 
@@ -104,15 +122,20 @@ dddmr 使用的 Docker 镜像是：
 
 如果容器名不是 `dddmr_dev`，请通过 `docker ps` 查找实际容器名，不要猜。
 
+Odin1 全局规划容器固定名：`dddmr_odin1`（挂载 `/home/ll/dddmr_navigation_odin1`）。  
+进入：`docker exec -it dddmr_odin1 bash`。不要用 `dddmr_dev` 跑 Odin1。
+
 ## 3. 编译和验证命令
 
 ### 3.1 dddmr_navigation 编译方式
 
-dddmr_navigation 应该在 Docker 内编译。
-
-如果容器名是 `dddmr_dev`，使用：
+Mid360：`dddmr_dev` 内编译。
 
 ```bash docker exec -it dddmr_dev bash -lc ' cd /root/dddmr_ws && source /opt/ros/humble/setup.bash && colcon build --symlink-install ' ```
+
+Odin1：`dddmr_odin1` 内编译。
+
+```bash docker exec -it dddmr_odin1 bash -lc ' cd /root/dddmr_ws && source /opt/ros/humble/setup.bash && colcon build --symlink-install ' ```
 
 如果只改了某个 package，优先使用局部编译，例如：
 

@@ -3,6 +3,10 @@
 适用机型：**Unitree Go2 + Livox MID360**。  
 ROS：**Humble**。当前联调默认 **RMW = CycloneDDS**（宿主机与 `dddmr_dev` 一致）。
 
+> Mid360 / Odin1 已物理分叉。本手册只服务 Mid360（`dddmr_navigation` + `ego-planner-swarm-ros2_version` + `dddmr_dev`）。  
+> Odin1 见 `ws_odin_pvlio/scripts/11_start_odin1_nav.sh` 与 [`mid_odin_source_split.md`](./mid_odin_source_split.md)。  
+> Mid360 一键：`bash /home/ll/3dnavigation/scripts/11_start_mid360_nav.sh`
+
 | 阶段 | 组件 | 运行位置 |
 |------|------|----------|
 | 雷达驱动 | `livox_ros_driver2` | 宿主机 |

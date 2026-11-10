@@ -1,0 +1,1774 @@
+diff --git a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+index 0fae90c..872d120 100644
+--- a/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
++++ b/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+@@ -3,6 +3,7 @@
+ 
+ #include <Eigen/Eigen>
+ #include <algorithm>
++#include <cstdint>
+ #include <iostream>
+ #include <utility>
+ #include "nav_msgs/msg/path.hpp"
+@@ -22,6 +23,7 @@
+ #include "traj_utils/msg/multi_bsplines.hpp"
+ #include "geometry_msgs/msg/pose_stamped.hpp"
+ #include "traj_utils/msg/data_disp.hpp"
++#include "traj_utils/msg/trajectory_execution_state.hpp"
+ #include "ego_planner/planner_manager.h"
+ #include "traj_utils/planning_visualization.h"
+ 
+@@ -44,7 +46,8 @@ namespace ego_planner
+       EXEC_TRAJ,
+       EMERGENCY_STOP,
+       SEQUENTIAL_START,
+-      WAIT_REPLAN
++      WAIT_REPLAN,
++      WAIT_TRAJ_START
+     };
+     enum TARGET_TYPE
+     {
+@@ -99,6 +102,7 @@ namespace ego_planner
+     int max_replan_failures_;
+     int exec_interval_ms_;
+     int safety_interval_ms_;
++    double execution_state_timeout_;
+ 
+     /* planning data */
+     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
+@@ -118,6 +122,12 @@ namespace ego_planner
+     Eigen::Vector3d last_reference_path_start_;
+     Eigen::Vector3d last_reference_path_goal_;
+     double last_reference_path_length_{0.0};
++    bool have_execution_state_{false};
++    int64_t execution_traj_id_{-1};
++    uint8_t trajectory_execution_state_{traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY};
++    double trajectory_execution_time_{0.0};
++    bool trajectory_execution_frozen_{false};
++    rclcpp::Time execution_state_received_time_;
+ 
+     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
+     Eigen::Quaterniond odom_orient_;
+@@ -140,6 +150,7 @@ namespace ego_planner
+     rclcpp::Subscription<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_sub_;
+     rclcpp::Subscription<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_sub_;
+     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr trigger_sub_;
++    rclcpp::Subscription<traj_utils::msg::TrajectoryExecutionState>::SharedPtr execution_state_sub_;
+ 
+     // rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr replan_pub_;
+     // rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr new_pub_;
+@@ -179,6 +190,7 @@ namespace ego_planner
+                                        const Eigen::Vector3d &accepted_goal,
+                                        double accepted_length,
+                                        const rclcpp::Time &now);
++    bool getSynchronizedExecutionTime(double &execution_time, uint8_t *execution_state = nullptr) const;
+ 
+     void readGivenWps();
+     void planNextWaypoint(const Eigen::Vector3d next_wp);
+@@ -193,6 +205,8 @@ namespace ego_planner
+     void odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg);
+     void swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg);
+     void BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg);
++    void executionStateCallback(
++        const std::shared_ptr<const traj_utils::msg::TrajectoryExecutionState> &msg);
+ 
+     bool checkCollision();
+     void publishSwarmTrajs(bool startup_pub);
+diff --git a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+index df3cbfc..0776a98 100644
+--- a/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
++++ b/planner/plan_manage/launch/dddmr_reference_tracking.launch.py
+@@ -47,20 +47,30 @@ def generate_launch_description():
+     max_replan_failures = LaunchConfiguration('max_replan_failures')
+     exec_interval_ms = LaunchConfiguration('exec_interval_ms')
+     safety_interval_ms = LaunchConfiguration('safety_interval_ms')
++    execution_state_timeout = LaunchConfiguration('execution_state_timeout')
+     odom_z_offset = LaunchConfiguration('odom_z_offset')
+     grid_map_odom_z_offset = LaunchConfiguration('grid_map_odom_z_offset')
+     frame_id = LaunchConfiguration('frame_id')
+     base_frame = LaunchConfiguration('base_frame')
+     cmd_topic = LaunchConfiguration('cmd_topic')
+-    prefer_forward_motion = LaunchConfiguration('prefer_forward_motion')
+-    use_goal_path_orientation = LaunchConfiguration('use_goal_path_orientation')
+-    goal_yaw_switch_distance = LaunchConfiguration('goal_yaw_switch_distance')
+-    goal_yaw_switch_speed = LaunchConfiguration('goal_yaw_switch_speed')
+-    yaw_rate_limit = LaunchConfiguration('yaw_rate_limit')
+-    yaw_target_rate_limit = LaunchConfiguration('yaw_target_rate_limit')
+-    yaw_target_speed_threshold = LaunchConfiguration('yaw_target_speed_threshold')
+-    yaw_error_deadband = LaunchConfiguration('yaw_error_deadband')
+-    reverse_speed_limit = LaunchConfiguration('reverse_speed_limit')
++    kp_pos_x = LaunchConfiguration('kp_pos_x')
++    kp_pos_y = LaunchConfiguration('kp_pos_y')
++    kp_yaw = LaunchConfiguration('kp_yaw')
++    max_position_correction = LaunchConfiguration('max_position_correction')
++    max_tracking_error = LaunchConfiguration('max_tracking_error')
++    finish_distance = LaunchConfiguration('finish_distance')
++    yaw_lookahead_time = LaunchConfiguration('yaw_lookahead_time')
++    min_yaw_displacement = LaunchConfiguration('min_yaw_displacement')
++    align_enter_threshold = LaunchConfiguration('align_enter_threshold')
++    align_exit_threshold = LaunchConfiguration('align_exit_threshold')
++    align_confirm_cycles = LaunchConfiguration('align_confirm_cycles')
++    max_reverse_vx = LaunchConfiguration('max_reverse_vx')
++    max_vy = LaunchConfiguration('max_vy')
++    max_wz = LaunchConfiguration('max_wz')
++    max_awz = LaunchConfiguration('max_awz')
++    odom_timeout = LaunchConfiguration('odom_timeout')
++    max_control_dt = LaunchConfiguration('max_control_dt')
++    max_initial_position_error = LaunchConfiguration('max_initial_position_error')
+     cmd_interval_ms = LaunchConfiguration('cmd_interval_ms')
+     use_rviz = LaunchConfiguration('use_rviz')
+     enable_depth_fusion_input = LaunchConfiguration('enable_depth_fusion_input')
+@@ -106,6 +116,7 @@ def generate_launch_description():
+         remappings=[
+             ('odom_world', odom_topic),
+             ('planning/bspline', ['drone_', drone_id, '_planning/bspline']),
++            ('planning/trajectory_execution_state', ['drone_', drone_id, '_planning/trajectory_execution_state']),
+             ('planning/data_display', ['drone_', drone_id, '_planning/data_display']),
+             ('planning/broadcast_bspline_from_planner', '/broadcast_bspline'),
+             ('planning/broadcast_bspline_to_planner', '/broadcast_bspline'),
+@@ -160,6 +171,7 @@ def generate_launch_description():
+             {'fsm/max_replan_failures': ParameterValue(max_replan_failures, value_type=int)},
+             {'fsm/exec_interval_ms': ParameterValue(exec_interval_ms, value_type=int)},
+             {'fsm/safety_interval_ms': ParameterValue(safety_interval_ms, value_type=int)},
++            {'fsm/execution_state_timeout': ParameterValue(execution_state_timeout, value_type=float)},
+             {'fsm/waypoint_num': 0},
+             {'grid_map/resolution': ParameterValue(resolution, value_type=float)},
+             {'grid_map/map_size_x': ParameterValue(map_size_x, value_type=float)},
+@@ -237,29 +249,37 @@ def generate_launch_description():
+         output='screen',
+         remappings=[
+             ('position_cmd', ['drone_', drone_id, '_planning/pos_cmd']),
+-            ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
++            ('planning/bspline', ['drone_', drone_id, '_planning/bspline']),
++            ('planning/trajectory_execution_state', ['drone_', drone_id, '_planning/trajectory_execution_state'])
+         ],
+         parameters=[
+-            {'traj_server/time_forward': 1.0},
+-            {'traj_server/frame_id': frame_id},
+             {'traj_server/world_frame': frame_id},
+             {'traj_server/base_frame': base_frame},
+             {'traj_server/odometry_topic': odom_topic},
+-            {'traj_server/goal_path_topic': reference_path_topic},
+             {'traj_server/cmd_topic': cmd_topic},
+             {'traj_server/control_point_topic': '/control_point_state_'},
+-            {'traj_server/kp_yaw': 1.5},
+-            {'traj_server/ki_yaw': 0.0},
+-            {'traj_server/kd_yaw': 0.0},
+-            {'traj_server/prefer_forward_motion': ParameterValue(prefer_forward_motion, value_type=bool)},
+-            {'traj_server/use_goal_path_orientation': ParameterValue(use_goal_path_orientation, value_type=bool)},
+-            {'traj_server/goal_yaw_switch_distance': ParameterValue(goal_yaw_switch_distance, value_type=float)},
+-            {'traj_server/goal_yaw_switch_speed': ParameterValue(goal_yaw_switch_speed, value_type=float)},
+-            {'traj_server/yaw_rate_limit': ParameterValue(yaw_rate_limit, value_type=float)},
+-            {'traj_server/yaw_target_rate_limit': ParameterValue(yaw_target_rate_limit, value_type=float)},
+-            {'traj_server/yaw_target_speed_threshold': ParameterValue(yaw_target_speed_threshold, value_type=float)},
+-            {'traj_server/yaw_error_deadband': ParameterValue(yaw_error_deadband, value_type=float)},
+-            {'traj_server/reverse_speed_limit': ParameterValue(reverse_speed_limit, value_type=float)},
++            {'traj_server/execution_state_topic': 'planning/trajectory_execution_state'},
++            {'traj_server/kp_pos_x': ParameterValue(kp_pos_x, value_type=float)},
++            {'traj_server/kp_pos_y': ParameterValue(kp_pos_y, value_type=float)},
++            {'traj_server/kp_yaw': ParameterValue(kp_yaw, value_type=float)},
++            {'traj_server/max_position_correction': ParameterValue(max_position_correction, value_type=float)},
++            {'traj_server/max_tracking_error': ParameterValue(max_tracking_error, value_type=float)},
++            {'traj_server/finish_distance': ParameterValue(finish_distance, value_type=float)},
++            {'traj_server/yaw_lookahead_time': ParameterValue(yaw_lookahead_time, value_type=float)},
++            {'traj_server/min_yaw_displacement': ParameterValue(min_yaw_displacement, value_type=float)},
++            {'traj_server/align_enter_threshold': ParameterValue(align_enter_threshold, value_type=float)},
++            {'traj_server/align_exit_threshold': ParameterValue(align_exit_threshold, value_type=float)},
++            {'traj_server/align_confirm_cycles': ParameterValue(align_confirm_cycles, value_type=int)},
++            {'traj_server/max_vx': ParameterValue(max_vel, value_type=float)},
++            {'traj_server/max_reverse_vx': ParameterValue(max_reverse_vx, value_type=float)},
++            {'traj_server/max_vy': ParameterValue(max_vy, value_type=float)},
++            {'traj_server/max_wz': ParameterValue(max_wz, value_type=float)},
++            {'traj_server/max_ax': ParameterValue(max_acc, value_type=float)},
++            {'traj_server/max_ay': ParameterValue(max_acc, value_type=float)},
++            {'traj_server/max_awz': ParameterValue(max_awz, value_type=float)},
++            {'traj_server/odom_timeout': ParameterValue(odom_timeout, value_type=float)},
++            {'traj_server/max_control_dt': ParameterValue(max_control_dt, value_type=float)},
++            {'traj_server/max_initial_position_error': ParameterValue(max_initial_position_error, value_type=float)},
+             {'traj_server/cmd_interval_ms': ParameterValue(cmd_interval_ms, value_type=int)}
+         ]
+     )
+@@ -411,6 +431,10 @@ def generate_launch_description():
+             'safety_interval_ms',
+             default_value='100',
+             description='Safety collision-check period in milliseconds; 100 ms matches the original 3d-navi safety rhythm'),
++        DeclareLaunchArgument(
++            'execution_state_timeout',
++            default_value='0.30',
++            description='Maximum accepted age of controller execution-state feedback'),
+         DeclareLaunchArgument(
+             'odom_z_offset',
+             default_value='0.0',
+@@ -431,46 +455,28 @@ def generate_launch_description():
+             'cmd_topic',
+             default_value='/cmd_vel',
+             description='Velocity topic published by EGO to the robot'),
+-        DeclareLaunchArgument(
+-            'prefer_forward_motion',
+-            default_value='false',
+-            description='Prefer turning in place over backing up during normal trajectory tracking'),
+-        DeclareLaunchArgument(
+-            'use_goal_path_orientation',
+-            default_value='false',
+-            description='Use the terminal orientation carried by /global_path when very close to the goal'),
+-        DeclareLaunchArgument(
+-            'goal_yaw_switch_distance',
+-            default_value='0.3',
+-            description='Distance threshold for switching yaw control from trajectory heading to terminal goal heading'),
+-        DeclareLaunchArgument(
+-            'goal_yaw_switch_speed',
+-            default_value='0.15',
+-            description='Only switch to the terminal goal heading when the planned translational speed is below this value'),
+-        DeclareLaunchArgument(
+-            'yaw_rate_limit',
+-            default_value='0.6',
+-            description='Maximum angular.z command emitted by traj_server'),
+-        DeclareLaunchArgument(
+-            'yaw_target_rate_limit',
+-            default_value='0.8',
+-            description='Maximum rate at which traj_server may rotate the internal trajectory-facing yaw target'),
+-        DeclareLaunchArgument(
+-            'yaw_target_speed_threshold',
+-            default_value='0.2',
+-            description='Minimum planned XY speed before trajectory velocity may update the yaw target'),
+-        DeclareLaunchArgument(
+-            'yaw_error_deadband',
+-            default_value='0.05',
+-            description='Yaw error below this value is treated as zero to suppress low-speed dithering'),
+-        DeclareLaunchArgument(
+-            'reverse_speed_limit',
+-            default_value='0.2',
+-            description='Maximum allowed backward body-frame speed when reverse motion is unavoidable'),
++        DeclareLaunchArgument('kp_pos_x', default_value='0.8', description='World-frame X position feedback gain'),
++        DeclareLaunchArgument('kp_pos_y', default_value='1.0', description='World-frame Y position feedback gain'),
++        DeclareLaunchArgument('kp_yaw', default_value='1.5', description='Yaw proportional feedback gain'),
++        DeclareLaunchArgument('max_position_correction', default_value='0.25', description='Maximum XY speed contributed by position feedback'),
++        DeclareLaunchArgument('max_tracking_error', default_value='0.8', description='Planar tracking error that triggers an explicit controller fault'),
++        DeclareLaunchArgument('finish_distance', default_value='0.12', description='Planar error required before holding the end of a local trajectory'),
++        DeclareLaunchArgument('yaw_lookahead_time', default_value='0.5', description='Trajectory lookahead used to derive desired planar heading'),
++        DeclareLaunchArgument('min_yaw_displacement', default_value='0.03', description='Minimum XY displacement accepted as a valid heading vector'),
++        DeclareLaunchArgument('align_enter_threshold', default_value='0.65', description='Yaw error that enters frozen heading alignment'),
++        DeclareLaunchArgument('align_exit_threshold', default_value='0.30', description='Yaw error required to leave heading alignment'),
++        DeclareLaunchArgument('align_confirm_cycles', default_value='5', description='Consecutive aligned control cycles required before translation'),
++        DeclareLaunchArgument('max_reverse_vx', default_value='0.10', description='Maximum allowed reverse body-frame speed'),
++        DeclareLaunchArgument('max_vy', default_value='0.35', description='Maximum lateral body-frame speed'),
++        DeclareLaunchArgument('max_wz', default_value='0.6', description='Maximum yaw-rate command'),
++        DeclareLaunchArgument('max_awz', default_value='1.5', description='Maximum yaw acceleration used by command slew limiting'),
++        DeclareLaunchArgument('odom_timeout', default_value='0.30', description='Odometry timeout that triggers FAULT_STOP'),
++        DeclareLaunchArgument('max_control_dt', default_value='0.15', description='Maximum valid steady-clock control interval'),
++        DeclareLaunchArgument('max_initial_position_error', default_value='0.8', description='Maximum allowed XY gap between a new trajectory and odometry'),
+         DeclareLaunchArgument(
+             'cmd_interval_ms',
+-            default_value='100',
+-            description='Command publish period for traj_server in milliseconds; 100 ms matches the original 3d-navi tracking cadence'),
++            default_value='20',
++            description='Command and execution-state publish period in milliseconds'),
+         DeclareLaunchArgument(
+             'use_rviz',
+             default_value='false',
+diff --git a/planner/plan_manage/src/ego_replan_fsm.cpp b/planner/plan_manage/src/ego_replan_fsm.cpp
+index fae27de..e1eb60c 100644
+--- a/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -8,6 +8,7 @@
+ #include <iomanip>
+ #include <limits>
+ #include <sstream>
++#include <stdexcept>
+ 
+ namespace ego_planner
+ {
+@@ -603,6 +604,12 @@ namespace ego_planner
+     have_target_ = false;
+     have_odom_ = false;
+     have_recv_pre_agent_ = false;
++    have_execution_state_ = false;
++    execution_traj_id_ = -1;
++    trajectory_execution_state_ = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
++    trajectory_execution_time_ = 0.0;
++    trajectory_execution_frozen_ = false;
++    execution_state_received_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+ 
+     node_->declare_parameter("fsm/flight_type", -1);
+     node_->declare_parameter("fsm/thresh_replan_time", -1.0);
+@@ -643,6 +650,7 @@ namespace ego_planner
+     node_->declare_parameter("fsm/max_replan_failures", 5);
+     node_->declare_parameter("fsm/exec_interval_ms", 200);
+     node_->declare_parameter("fsm/safety_interval_ms", 100);
++    node_->declare_parameter("fsm/execution_state_timeout", 0.30);
+ 
+     node_->get_parameter("fsm/flight_type", target_type_);
+     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
+@@ -683,6 +691,10 @@ namespace ego_planner
+     node_->get_parameter("fsm/max_replan_failures", max_replan_failures_);
+     node_->get_parameter("fsm/exec_interval_ms", exec_interval_ms_);
+     node_->get_parameter("fsm/safety_interval_ms", safety_interval_ms_);
++    node_->get_parameter("fsm/execution_state_timeout", execution_state_timeout_);
++
++    if (execution_state_timeout_ <= 0.0)
++      throw std::runtime_error("fsm/execution_state_timeout must be positive");
+ 
+     if (odom_world_frame_.empty())
+     {
+@@ -772,7 +784,7 @@ namespace ego_planner
+           });
+     }
+ 
+-    // ros2 ÖÐtopicÃû×ÖÖÐ²»ÄÜ³öÏÖ¸ººÅ£¬µ¥»úidÊÇ-1ÐèÒª´¦Àí
++    // ros2 ï¿½ï¿½topicï¿½ï¿½ï¿½ï¿½ï¿½Ð²ï¿½ï¿½Ü³ï¿½ï¿½Ö¸ï¿½ï¿½Å£ï¿½ï¿½ï¿½ï¿½ï¿½idï¿½ï¿½-1ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½
+     // string pub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id) + string("_planning/swarm_trajs");
+     string pub_topic_name;
+     if (planner_manager_->pp_.drone_id <= -1)
+@@ -797,6 +809,12 @@ namespace ego_planner
+ 
+     bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/bspline", 10);
+     data_disp_pub_ = node_->create_publisher<traj_utils::msg::DataDisp>("planning/data_display", 100);
++    execution_state_sub_ = node_->create_subscription<traj_utils::msg::TrajectoryExecutionState>(
++        "planning/trajectory_execution_state", 20,
++        [this](const std::shared_ptr<const traj_utils::msg::TrajectoryExecutionState> &msg)
++        {
++          this->executionStateCallback(msg);
++        });
+ 
+     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
+     {
+@@ -868,7 +886,7 @@ namespace ego_planner
+       wps_[i](2) = waypoints_[i][2];
+     }
+ 
+-    // ÓÃ visualization_->displayGoalPoint() ·½·¨¶Ôwaypoint½øÐÐ¿ÉÊÓ»¯
++    // ï¿½ï¿½ visualization_->displayGoalPoint() ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½waypointï¿½ï¿½ï¿½Ð¿ï¿½ï¿½Ó»ï¿½
+     for (size_t i = 0; i < (size_t)waypoint_num_; i++)
+     {
+       visualization_->displayGoalPoint(wps_[i], Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, i);
+@@ -903,8 +921,9 @@ namespace ego_planner
+       replan_failure_count_ = 0;
+       stop_sent_in_wait_replan_ = false;
+ 
+-      /*** FSM×´Ì¬×ª»» ***/
+-      if (exec_state_ == WAIT_TARGET || exec_state_ == INIT || exec_state_ == WAIT_REPLAN)
++      /*** FSM×´Ì¬×ªï¿½ï¿½ ***/
++      if (exec_state_ == WAIT_TARGET || exec_state_ == INIT || exec_state_ == WAIT_REPLAN ||
++          exec_state_ == WAIT_TRAJ_START)
+         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
+       else if (exec_state_ == EXEC_TRAJ)
+       {
+@@ -1167,6 +1186,7 @@ namespace ego_planner
+     rememberAcceptedReferencePath(waypoints, end_pt_, candidate_length, now);
+ 
+     if (exec_state_ == WAIT_TARGET || exec_state_ == INIT || exec_state_ == WAIT_REPLAN ||
++        exec_state_ == WAIT_TRAJ_START ||
+         exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ)
+       changeFSMExecState(GEN_NEW_TRAJ, "REF_PATH");
+     else if (exec_state_ == EXEC_TRAJ || exec_state_ == EMERGENCY_STOP)
+@@ -1310,7 +1330,7 @@ namespace ego_planner
+       return;
+ 
+     // if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25)
+-    rclcpp::Clock clock(RCL_SYSTEM_TIME);  // È·±£Ê¹ÓÃµ±Ç°½ÚµãµÄÊ±¼äÔ´
++    rclcpp::Clock clock(RCL_SYSTEM_TIME);  // È·ï¿½ï¿½Ê¹ï¿½Ãµï¿½Ç°ï¿½Úµï¿½ï¿½Ê±ï¿½ï¿½Ô´
+     auto msg_time = rclcpp::Time(msg->start_time, clock.get_clock_type());
+     // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", rclcpp::Clock().now().get_clock_type());
+     // RCLCPP_INFO(node_->get_logger(), "Start time clock type: %d", rclcpp::Time(msg->start_time).get_clock_type());
+@@ -1323,7 +1343,7 @@ namespace ego_planner
+       return;
+     }
+ 
+-    // Â·¾¶»º³åÇø³õÊ¼»¯
++    // Â·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼ï¿½ï¿½
+     if (planner_manager_->swarm_trajs_buf_.size() <= id)
+     {
+       for (size_t i = planner_manager_->swarm_trajs_buf_.size(); i <= id; i++)
+@@ -1361,7 +1381,7 @@ namespace ego_planner
+ 
+     planner_manager_->swarm_trajs_buf_[id].drone_id = id;
+ 
+-    // ¼ÆËãÂ·¾¶³ÖÐøÊ±¼ä
++    // ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½
+     if (msg->order % 2)
+     {
+       double cutback = (double)msg->order / 2 + 1.5;
+@@ -1373,7 +1393,7 @@ namespace ego_planner
+       planner_manager_->swarm_trajs_buf_[id].duration_ = (msg->knots[msg->knots.size() - floor(cutback)] + msg->knots[msg->knots.size() - ceil(cutback)]) / 2;
+     }
+ 
+-    // Éú³Ébspline²¢´æ´¢
++    // ï¿½ï¿½ï¿½ï¿½bsplineï¿½ï¿½ï¿½æ´¢
+     UniformBspline pos_traj(pos_pts, msg->order, msg->knots[1] - msg->knots[0]);
+     pos_traj.setKnot(knots);
+     planner_manager_->swarm_trajs_buf_[id].position_traj_ = pos_traj;
+@@ -1417,7 +1437,7 @@ namespace ego_planner
+     planner_manager_->swarm_trajs_buf_.clear();
+     planner_manager_->swarm_trajs_buf_.resize(msg->traj.size());
+ 
+-    // ´¦ÀíÃ¿ÌõÂ·¾¶
++    // ï¿½ï¿½ï¿½ï¿½Ã¿ï¿½ï¿½Â·ï¿½ï¿½
+     for (size_t i = 0; i < msg->traj.size(); i++)
+     {
+ 
+@@ -1431,7 +1451,7 @@ namespace ego_planner
+         continue;
+       }
+ 
+-      // ´æ´¢Â·¾¶¿ØÖÆµãºÍ½Úµã
++      // ï¿½æ´¢Â·ï¿½ï¿½ï¿½ï¿½ï¿½Æµï¿½Í½Úµï¿½
+       Eigen::MatrixXd pos_pts(3, msg->traj[i].pos_pts.size());
+       Eigen::VectorXd knots(msg->traj[i].knots.size());
+       for (size_t j = 0; j < msg->traj[i].knots.size(); ++j)
+@@ -1447,7 +1467,7 @@ namespace ego_planner
+ 
+       planner_manager_->swarm_trajs_buf_[i].drone_id = i;
+ 
+-      // ¼ÆËãÂ·¾¶³ÖÐøÊ±¼ä
++      // ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½
+       if (msg->traj[i].order % 2)
+       {
+         double cutback = (double)msg->traj[i].order / 2 + 1.5;
+@@ -1480,7 +1500,7 @@ namespace ego_planner
+     else
+       continously_called_times_ = 1;
+ 
+-    static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START", "WAIT_REPLAN"};
++    static string state_str[9] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START", "WAIT_REPLAN", "WAIT_TRAJ_START"};
+     int pre_s = int(exec_state_);
+     exec_state_ = new_state;
+     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+@@ -1493,7 +1513,7 @@ namespace ego_planner
+ 
+   void EGOReplanFSM::printFSMExecState()
+   {
+-    static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START", "WAIT_REPLAN"};
++    static string state_str[9] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START", "WAIT_REPLAN", "WAIT_TRAJ_START"};
+ 
+     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
+   }
+@@ -1506,6 +1526,67 @@ namespace ego_planner
+     return rclcpp::Clock(RCL_SYSTEM_TIME).now();
+   }
+ 
++  void EGOReplanFSM::executionStateCallback(
++      const std::shared_ptr<const traj_utils::msg::TrajectoryExecutionState> &msg)
++  {
++    if (!msg || !std::isfinite(msg->exec_time) || msg->exec_time < -1e-6)
++    {
++      RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                            "[EGO] Reject invalid trajectory execution state.");
++      return;
++    }
++
++    execution_traj_id_ = msg->traj_id;
++    trajectory_execution_state_ = msg->state;
++    trajectory_execution_time_ = msg->exec_time;
++    trajectory_execution_frozen_ = msg->frozen;
++    execution_state_received_time_ = plannerNow();
++    have_execution_state_ = true;
++
++    if (planner_manager_ && execution_traj_id_ == planner_manager_->local_data_.traj_id_)
++    {
++      planner_manager_->local_data_.start_time_ =
++          execution_state_received_time_ -
++          rclcpp::Duration::from_seconds(trajectory_execution_time_);
++    }
++
++    if (msg->state == traj_utils::msg::TrajectoryExecutionState::FAULT_STOP)
++    {
++      RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                            "[EGO] Trajectory controller fault for trajectory %ld: %s",
++                            static_cast<long>(msg->traj_id), msg->fault_reason.c_str());
++    }
++  }
++
++  bool EGOReplanFSM::getSynchronizedExecutionTime(double &execution_time,
++                                                   uint8_t *execution_state) const
++  {
++    if (!have_execution_state_ || !planner_manager_)
++      return false;
++
++    const auto &local = planner_manager_->local_data_;
++    if (execution_traj_id_ != local.traj_id_)
++      return false;
++
++    const double state_age = (plannerNow() - execution_state_received_time_).seconds();
++    if (!std::isfinite(state_age) || state_age < 0.0 || state_age > execution_state_timeout_)
++      return false;
++
++    if (trajectory_execution_state_ != traj_utils::msg::TrajectoryExecutionState::ALIGN_HEADING &&
++        trajectory_execution_state_ != traj_utils::msg::TrajectoryExecutionState::TRACK_TRAJECTORY &&
++        trajectory_execution_state_ != traj_utils::msg::TrajectoryExecutionState::HOLD_FINAL)
++      return false;
++
++    if (!std::isfinite(trajectory_execution_time_) || trajectory_execution_time_ < -1e-6 ||
++        trajectory_execution_time_ > local.duration_ + 1e-3)
++      return false;
++
++    execution_time = std::clamp(trajectory_execution_time_, 0.0, local.duration_);
++    if (execution_state != nullptr)
++      *execution_state = trajectory_execution_state_;
++    return true;
++  }
++
+   bool EGOReplanFSM::replanIntervalElapsed(const rclcpp::Time &now, double interval) const
+   {
+     if (!has_last_replan_request_ || interval <= 1e-3)
+@@ -1563,7 +1644,8 @@ namespace ego_planner
+     }
+ 
+     const bool active_target =
+-        exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ || exec_state_ == EXEC_TRAJ;
++        exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ ||
++        exec_state_ == WAIT_TRAJ_START || exec_state_ == EXEC_TRAJ;
+     if (!active_target)
+       return true;
+ 
+@@ -1654,7 +1736,7 @@ namespace ego_planner
+           bool success = planFromGlobalTraj(3);
+           if (success)
+           {
+-            changeFSMExecState(EXEC_TRAJ, "FSM");
++            changeFSMExecState(WAIT_TRAJ_START, "FSM");
+             resetReplanTracking(now);
+ 
+             publishSwarmTrajs(true);
+@@ -1693,7 +1775,7 @@ namespace ego_planner
+       bool success = planFromGlobalTraj(3);
+       if (success)
+       {
+-        changeFSMExecState(EXEC_TRAJ, "FSM");
++        changeFSMExecState(WAIT_TRAJ_START, "FSM");
+         flag_escape_emergency_ = true;
+         resetReplanTracking(now);
+         publishSwarmTrajs(false);
+@@ -1723,7 +1805,7 @@ namespace ego_planner
+     {
+       if (planFromCurrentTraj(1))
+       {
+-        changeFSMExecState(EXEC_TRAJ, "FSM");
++        changeFSMExecState(WAIT_TRAJ_START, "FSM");
+         resetReplanTracking(now);
+         publishSwarmTrajs(false);
+       }
+@@ -1764,16 +1846,59 @@ namespace ego_planner
+       break;
+     }
+ 
++    case WAIT_TRAJ_START:
++    {
++      double controller_time = 0.0;
++      uint8_t controller_state = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
++      if (getSynchronizedExecutionTime(controller_time, &controller_state))
++      {
++        changeFSMExecState(EXEC_TRAJ, "EXEC_SYNC");
++        break;
++      }
++
++      if (have_execution_state_ &&
++          execution_traj_id_ == planner_manager_->local_data_.traj_id_ &&
++          trajectory_execution_state_ == traj_utils::msg::TrajectoryExecutionState::FAULT_STOP)
++      {
++        RCLCPP_ERROR_THROTTLE(
++            node_->get_logger(), *node_->get_clock(), 1000,
++            "[EGO] Controller rejected trajectory %d; stop and wait for a new planning attempt.",
++            planner_manager_->local_data_.traj_id_);
++        stop_sent_in_wait_replan_ = false;
++        markReplanAttempt(now);
++        changeFSMExecState(WAIT_REPLAN, "EXEC_SYNC");
++        break;
++      }
++
++      RCLCPP_WARN_THROTTLE(
++          node_->get_logger(), *node_->get_clock(), 1000,
++          "[EGO] Waiting for controller acknowledgement of trajectory %d.",
++          planner_manager_->local_data_.traj_id_);
++      break;
++    }
++
+     case EXEC_TRAJ:
+     {
+       /* determine if need to replan */
+       LocalTrajData *info = &planner_manager_->local_data_;
+-      rclcpp::Time time_now = plannerNow();
+-      double t_cur = (time_now - info->start_time_).seconds();
+-      t_cur = std::min(info->duration_, t_cur);
++      double t_cur = 0.0;
++      uint8_t controller_state = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
++      if (!getSynchronizedExecutionTime(t_cur, &controller_state))
++      {
++        changeFSMExecState(WAIT_TRAJ_START, "EXEC_SYNC");
++        break;
++      }
++
++      if (controller_state == traj_utils::msg::TrajectoryExecutionState::ALIGN_HEADING ||
++          trajectory_execution_frozen_)
++      {
++        break;
++      }
+ 
+       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
+-      const bool local_traj_finished = t_cur > info->duration_ - 1e-2;
++      const bool local_traj_finished =
++          controller_state == traj_utils::msg::TrajectoryExecutionState::HOLD_FINAL ||
++          t_cur > info->duration_ - 1e-2;
+       const bool reached_goal = hasReachedGoal(odom_pos_);
+       const bool near_goal_region = (end_pt_ - odom_pos_).norm() <= std::max(no_replan_thresh_, goal_reached_dist_ + 0.1);
+ 
+@@ -1835,8 +1960,11 @@ namespace ego_planner
+         break;
+       }
+ 
+-      callEmergencyStop(odom_pos_);
+-      stop_sent_in_wait_replan_ = true;
++      if (!stop_sent_in_wait_replan_)
++      {
++        callEmergencyStop(odom_pos_);
++        stop_sent_in_wait_replan_ = true;
++      }
+ 
+       if (reference_path_blocked_wait_active_ &&
+           (reference_path_blocked_wait_until_ - now).seconds() > 0.0)
+@@ -1917,9 +2045,15 @@ namespace ego_planner
+ 
+     LocalTrajData *info = &planner_manager_->local_data_;
+     auto map = planner_manager_->grid_map_;
+-    auto time_now = plannerNow();
+-    double t_cur = (time_now - info->start_time_).seconds();
+-    t_cur = std::min(info->duration_, t_cur);
++    double t_cur = 0.0;
++    uint8_t controller_state = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
++    if (!getSynchronizedExecutionTime(t_cur, &controller_state) ||
++        controller_state != traj_utils::msg::TrajectoryExecutionState::TRACK_TRAJECTORY)
++    {
++      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                           "[EGO] Replan requested without synchronized tracking state.");
++      return false;
++    }
+ 
+     const Eigen::Vector3d traj_start_pt = info->position_traj_.evaluateDeBoorT(t_cur);
+     const Eigen::Vector3d traj_start_vel = info->velocity_traj_.evaluateDeBoorT(t_cur);
+@@ -2108,7 +2242,7 @@ namespace ego_planner
+     LocalTrajData *info = &planner_manager_->local_data_;
+     auto map = planner_manager_->grid_map_;
+     
+-    if (exec_state_ != EXEC_TRAJ || info->start_time_.seconds() < 1e-5)
++    if (exec_state_ != EXEC_TRAJ)
+       return;
+ 
+     const auto now = plannerNow();
+@@ -2125,9 +2259,12 @@ namespace ego_planner
+ 
+     /* ---------- check trajectory ---------- */
+     constexpr double time_step = 0.01;
+-    // double t_cur = (ros::Time::now() - info->start_time_).toSec();
+-    double t_cur = (now - info->start_time_).seconds();
+-    t_cur = std::min(info->duration_, t_cur);
++    double t_cur = 0.0;
++    uint8_t controller_state = traj_utils::msg::TrajectoryExecutionState::WAIT_TRAJECTORY;
++    if (!getSynchronizedExecutionTime(t_cur, &controller_state))
++      return;
++    if (controller_state != traj_utils::msg::TrajectoryExecutionState::TRACK_TRAJECTORY)
++      return;
+ 
+     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
+     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
+@@ -2167,7 +2304,7 @@ namespace ego_planner
+ 
+         if (replan_success) // Make a chance
+         {
+-          changeFSMExecState(EXEC_TRAJ, "SAFETY");
++          changeFSMExecState(WAIT_TRAJ_START, "SAFETY");
+           resetReplanTracking(now);
+           publishSwarmTrajs(false);
+           return;
+diff --git a/planner/plan_manage/src/traj_server.cpp b/planner/plan_manage/src/traj_server.cpp
+index 98295fd..13d2963 100644
+--- a/planner/plan_manage/src/traj_server.cpp
++++ b/planner/plan_manage/src/traj_server.cpp
+@@ -1,12 +1,12 @@
+ #include "bspline_opt/uniform_bspline.h"
++#include "geometry_msgs/msg/pose_stamped.hpp"
+ #include "geometry_msgs/msg/twist.hpp"
+ #include "nav_msgs/msg/odometry.hpp"
+-#include "nav_msgs/msg/path.hpp"
+ #include "quadrotor_msgs/msg/position_command.hpp"
+ #include "traj_utils/msg/bspline.hpp"
++#include "traj_utils/msg/trajectory_execution_state.hpp"
+ 
+ #include <rclcpp/rclcpp.hpp>
+-#include <tf2/LinearMath/Matrix3x3.h>
+ #include <tf2/LinearMath/Quaternion.h>
+ #include <tf2/utils.h>
+ #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+@@ -14,477 +14,658 @@
+ #include <tf2_ros/transform_listener.h>
+ 
+ #include <Eigen/Core>
+-#include <Eigen/Dense>
+-#include <Eigen/Geometry>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <cstdint>
++#include <limits>
+ #include <memory>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+-rclcpp::Node::SharedPtr traj_server_node_;
+-std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+-std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+-
+-rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub_;
+-rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+-rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr control_point_state_pub_;
+-
+-quadrotor_msgs::msg::PositionCommand cmd_;
+-nav_msgs::msg::Odometry control_point_state_;
+-
+-geometry_msgs::msg::Pose odom_in_world_pose_;
+-
+-double pos_gain[3] = {0.0, 0.0, 0.0};
+-double vel_gain[3] = {0.0, 0.0, 0.0};
+-
+-std::string cmd_frame_id_ = "map";
+-std::string world_frame_ = "map";
+-std::string base_frame_ = "base_link";
+-std::string odom_topic_ = "odom_world";
+-std::string goal_path_topic_ = "/global_path";
+-std::string cmd_topic_ = "/cmd_vel";
+-std::string control_point_topic_ = "/control_point_state_";
+-
+-bool receive_traj_ = false;
+-bool have_odom_ = false;
+-bool have_goal_path_ = false;
+-bool have_goal_path_orientation_ = false;
+-
+-std::vector<ego_planner::UniformBspline> traj_;
+-double traj_duration_ = 0.0;
+-rclcpp::Time start_time_;
+-int traj_id_ = 0;
+-
+-double last_yaw_ = 0.0;
+-double last_yaw_dot_ = 0.0;
+-double time_forward_ = 1.0;
+-rclcpp::Time last_cmd_time_;
+-bool have_last_cmd_time_ = false;
+-
+-double kp_yaw_ = 1.5;
+-double ki_yaw_ = 0.0;
+-double kd_yaw_ = 0.0;
+-double yaw_error_integral_ = 0.0;
+-double last_yaw_error_ = 0.0;
+-double yaw_rate_limit_ = 0.6;
+-double yaw_target_rate_limit_ = 0.8;
+-double yaw_target_speed_threshold_ = 0.2;
+-double yaw_error_deadband_ = 0.05;
+-bool use_goal_path_orientation_ = false;
+-bool prefer_forward_motion_ = true;
+-double goal_yaw_switch_distance_ = 0.3;
+-double goal_yaw_switch_speed_ = 0.15;
+-double reverse_speed_limit_ = 0.05;
+-int cmd_interval_ms_ = 100;
+-
+-Eigen::Vector3d end_pt_ = Eigen::Vector3d::Zero();
+-Eigen::Vector3d end_euler_ = Eigen::Vector3d::Zero();
+-
++namespace
++{
+ using ego_planner::UniformBspline;
+-
+-double limitSpeed(const double input, const double upper, const double lower)
++using ExecutionState = traj_utils::msg::TrajectoryExecutionState;
++using SteadyClock = std::chrono::steady_clock;
++
++rclcpp::Node::SharedPtr node;
++std::shared_ptr<tf2_ros::Buffer> tf_buffer;
++std::shared_ptr<tf2_ros::TransformListener> tf_listener;
++
++rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
++rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub;
++rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr control_point_state_pub;
++rclcpp::Publisher<ExecutionState>::SharedPtr execution_state_pub;
++
++std::string world_frame = "map";
++std::string base_frame = "base_link";
++std::string odom_topic = "odom_world";
++std::string cmd_topic = "/cmd_vel";
++std::string control_point_topic = "/control_point_state_";
++std::string execution_state_topic = "planning/trajectory_execution_state";
++
++double kp_pos_x = 0.8;
++double kp_pos_y = 1.0;
++double kp_yaw = 1.5;
++double max_position_correction = 0.25;
++double max_tracking_error = 0.8;
++double finish_distance = 0.12;
++double yaw_lookahead_time = 0.5;
++double min_yaw_displacement = 0.03;
++double align_enter_threshold = 0.65;
++double align_exit_threshold = 0.30;
++int align_confirm_cycles = 5;
++double max_vx = 0.8;
++double max_reverse_vx = 0.10;
++double max_vy = 0.35;
++double max_wz = 0.6;
++double max_ax = 0.8;
++double max_ay = 0.8;
++double max_awz = 1.5;
++double odom_timeout = 0.30;
++double max_control_dt = 0.15;
++double max_initial_position_error = 0.8;
++int cmd_interval_ms = 20;
++
++std::vector<UniformBspline> trajectory;
++double trajectory_duration = 0.0;
++int64_t trajectory_id = -1;
++double execution_time = 0.0;
++uint8_t controller_state = ExecutionState::WAIT_TRAJECTORY;
++std::string fault_reason;
++bool have_trajectory = false;
++bool trajectory_is_stationary = false;
++double last_desired_yaw = 0.0;
++int aligned_cycle_count = 0;
++
++Eigen::Vector3d odom_position = Eigen::Vector3d::Zero();
++double odom_yaw = 0.0;
++bool have_odom = false;
++SteadyClock::time_point last_odom_steady;
++SteadyClock::time_point last_control_steady;
++bool have_last_control_time = false;
++
++geometry_msgs::msg::Twist last_cmd_vel;
++
++double clamp(double value, double lower, double upper)
+ {
+-  return std::min(std::max(input, lower), upper);
++  return std::min(std::max(value, lower), upper);
+ }
+ 
+ double normalizeAngle(double angle)
+ {
+-  constexpr double PI = 3.1415926;
+-  while (angle > PI)
+-  {
+-    angle -= 2.0 * PI;
+-  }
+-  while (angle < -PI)
+-  {
+-    angle += 2.0 * PI;
+-  }
++  constexpr double kPi = 3.14159265358979323846;
++  while (angle > kPi)
++    angle -= 2.0 * kPi;
++  while (angle < -kPi)
++    angle += 2.0 * kPi;
+   return angle;
+ }
+ 
+-double shortestAngularDistance(double from, double to)
++double rateLimit(double target, double previous, double max_rate, double dt)
+ {
+-  return normalizeAngle(to - from);
++  const double max_step = std::max(0.0, max_rate) * std::max(0.0, dt);
++  return previous + clamp(target - previous, -max_step, max_step);
+ }
+ 
+-void bsplineCallback(const traj_utils::msg::Bspline::ConstSharedPtr msg)
++Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double limit)
+ {
+-  Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
+-  Eigen::VectorXd knots(msg->knots.size());
+-
+-  for (size_t i = 0; i < msg->knots.size(); ++i)
+-  {
+-    knots(i) = msg->knots[i];
+-  }
++  const double bounded_limit = std::max(0.0, limit);
++  const double norm = value.norm();
++  if (norm <= bounded_limit || norm < 1e-9)
++    return value;
++  return value * (bounded_limit / norm);
++}
+ 
+-  for (size_t i = 0; i < msg->pos_pts.size(); ++i)
++void setControllerState(uint8_t new_state, const std::string &reason = std::string())
++{
++  if (controller_state != new_state || fault_reason != reason)
+   {
+-    pos_pts(0, i) = msg->pos_pts[i].x;
+-    pos_pts(1, i) = msg->pos_pts[i].y;
+-    pos_pts(2, i) = msg->pos_pts[i].z;
++    RCLCPP_INFO(node->get_logger(), "Trajectory controller state %u -> %u%s%s",
++                static_cast<unsigned>(controller_state), static_cast<unsigned>(new_state),
++                reason.empty() ? "" : ": ", reason.c_str());
+   }
++  controller_state = new_state;
++  fault_reason = reason;
++  if (new_state != ExecutionState::ALIGN_HEADING)
++    aligned_cycle_count = 0;
++}
+ 
+-  UniformBspline pos_traj(pos_pts, msg->order, 0.1);
+-  pos_traj.setKnot(knots);
++void enterFault(const std::string &reason)
++{
++  setControllerState(ExecutionState::FAULT_STOP, reason);
++}
+ 
+-  start_time_ = rclcpp::Time(msg->start_time);
+-  traj_id_ = msg->traj_id;
++void publishExecutionState(const rclcpp::Time &stamp)
++{
++  ExecutionState msg;
++  msg.traj_id = trajectory_id;
++  msg.state = controller_state;
++  msg.exec_time = execution_time;
++  msg.frozen = controller_state == ExecutionState::ALIGN_HEADING;
++  msg.stamp = stamp;
++  msg.fault_reason = fault_reason;
++  execution_state_pub->publish(msg);
++}
+ 
+-  traj_.clear();
+-  traj_.push_back(pos_traj);
+-  traj_.push_back(traj_[0].getDerivative());
+-  traj_.push_back(traj_[1].getDerivative());
++void publishZeroCommand()
++{
++  geometry_msgs::msg::Twist cmd;
++  cmd_vel_pub->publish(cmd);
++  last_cmd_vel = cmd;
++}
+ 
+-  traj_duration_ = traj_[0].getTimeSum();
+-  receive_traj_ = true;
++bool finitePoint(const geometry_msgs::msg::Point &point)
++{
++  return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+ }
+ 
+-void goalPathCallback(const nav_msgs::msg::Path::ConstSharedPtr msg)
++bool validateTrajectoryMessage(const traj_utils::msg::Bspline &msg, std::string &reason)
+ {
+-  if (msg->poses.empty())
++  if (msg.order < 1)
+   {
+-    return;
++    reason = "trajectory order must be positive";
++    return false;
+   }
++  if (msg.pos_pts.size() < static_cast<size_t>(msg.order + 1))
++  {
++    reason = "trajectory has too few control points";
++    return false;
++  }
++  if (msg.knots.size() != msg.pos_pts.size() + static_cast<size_t>(msg.order) + 1)
++  {
++    reason = "knot count does not match control point count and spline order";
++    return false;
++  }
++  for (const auto &point : msg.pos_pts)
++  {
++    if (!finitePoint(point))
++    {
++      reason = "trajectory contains a non-finite control point";
++      return false;
++    }
++  }
++  for (size_t i = 0; i < msg.knots.size(); ++i)
++  {
++    if (!std::isfinite(msg.knots[i]))
++    {
++      reason = "trajectory contains a non-finite knot";
++      return false;
++    }
++    if (i > 0 && msg.knots[i] + 1e-9 < msg.knots[i - 1])
++    {
++      reason = "trajectory knots are not monotonic";
++      return false;
++    }
++  }
++  return true;
++}
+ 
+-  const auto &goal_pose = msg->poses.back().pose;
+-  end_pt_ << goal_pose.position.x, goal_pose.position.y, goal_pose.position.z;
+-
+-  const double quat_norm =
+-      std::sqrt(goal_pose.orientation.x * goal_pose.orientation.x +
+-                goal_pose.orientation.y * goal_pose.orientation.y +
+-                goal_pose.orientation.z * goal_pose.orientation.z +
+-                goal_pose.orientation.w * goal_pose.orientation.w);
++bool desiredYawAt(double sample_time, double &yaw)
++{
++  if (!have_trajectory || trajectory_is_stationary)
++    return false;
++
++  const double t = clamp(sample_time, 0.0, trajectory_duration);
++  const double forward_t = std::min(trajectory_duration, t + yaw_lookahead_time);
++  const double backward_t = std::max(0.0, t - yaw_lookahead_time);
++  const Eigen::Vector3d current = trajectory[0].evaluateDeBoorT(t);
++
++  Eigen::Vector2d direction =
++      (trajectory[0].evaluateDeBoorT(forward_t) - current).head<2>();
++  if (direction.norm() < min_yaw_displacement)
++    direction = (current - trajectory[0].evaluateDeBoorT(backward_t)).head<2>();
++  if (direction.norm() < min_yaw_displacement)
++  {
++    const Eigen::Vector2d velocity = trajectory[1].evaluateDeBoorT(t).head<2>();
++    if (velocity.norm() < 1e-3)
++      return false;
++    direction = velocity;
++  }
+ 
+-  have_goal_path_orientation_ = quat_norm > 1e-6;
++  yaw = std::atan2(direction.y(), direction.x());
++  return true;
++}
+ 
+-  if (have_goal_path_orientation_)
++bool trajectoryHasPlanarMotion(double &initial_yaw)
++{
++  const Eigen::Vector2d start = trajectory[0].evaluateDeBoorT(0.0).head<2>();
++  const int samples = std::max(10, static_cast<int>(std::ceil(trajectory_duration / 0.05)));
++  for (int i = 1; i <= samples; ++i)
+   {
+-    tf2::Quaternion end_q(goal_pose.orientation.x, goal_pose.orientation.y,
+-                          goal_pose.orientation.z, goal_pose.orientation.w);
+-    double roll = 0.0, pitch = 0.0, yaw = 0.0;
+-    tf2::Matrix3x3(end_q).getRPY(roll, pitch, yaw);
+-    end_euler_ << roll, pitch, yaw;
++    const double t = trajectory_duration * static_cast<double>(i) / static_cast<double>(samples);
++    const Eigen::Vector2d delta = trajectory[0].evaluateDeBoorT(t).head<2>() - start;
++    if (delta.norm() >= min_yaw_displacement)
++    {
++      initial_yaw = std::atan2(delta.y(), delta.x());
++      return true;
++    }
+   }
++  return false;
++}
+ 
+-  have_goal_path_ = true;
++void publishDesiredState(const rclcpp::Time &stamp, const Eigen::Vector3d &position,
++                         const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration,
++                         double desired_yaw, double desired_yaw_rate)
++{
++  tf2::Quaternion orientation;
++  orientation.setRPY(0.0, 0.0, desired_yaw);
++
++  nav_msgs::msg::Odometry control_point;
++  control_point.header.stamp = stamp;
++  control_point.header.frame_id = world_frame;
++  control_point.child_frame_id = base_frame;
++  control_point.pose.pose.position.x = position.x();
++  control_point.pose.pose.position.y = position.y();
++  control_point.pose.pose.position.z = position.z();
++  control_point.pose.pose.orientation = tf2::toMsg(orientation);
++  control_point_state_pub->publish(control_point);
++
++  quadrotor_msgs::msg::PositionCommand position_command;
++  position_command.header.stamp = stamp;
++  position_command.header.frame_id = world_frame;
++  position_command.trajectory_flag =
++      quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
++  position_command.trajectory_id = trajectory_id;
++  position_command.position.x = position.x();
++  position_command.position.y = position.y();
++  position_command.position.z = position.z();
++  position_command.velocity.x = velocity.x();
++  position_command.velocity.y = velocity.y();
++  position_command.velocity.z = velocity.z();
++  position_command.acceleration.x = acceleration.x();
++  position_command.acceleration.y = acceleration.y();
++  position_command.acceleration.z = acceleration.z();
++  position_command.yaw = desired_yaw;
++  position_command.yaw_dot = desired_yaw_rate;
++  pos_cmd_pub->publish(position_command);
+ }
+ 
+ void odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+ {
+   geometry_msgs::msg::PoseStamped pose_in;
+-  geometry_msgs::msg::PoseStamped pose_in_world;
+-
++  geometry_msgs::msg::PoseStamped pose_world;
+   pose_in.header = msg->header;
+   pose_in.pose = msg->pose.pose;
+ 
+   try
+   {
+-    if (msg->header.frame_id.empty() || msg->header.frame_id == world_frame_)
++    if (msg->header.frame_id.empty() || msg->header.frame_id == world_frame)
+     {
+-      pose_in_world = pose_in;
+-      if (pose_in_world.header.frame_id.empty())
+-      {
+-        pose_in_world.header.frame_id = world_frame_;
+-      }
++      pose_world = pose_in;
++      pose_world.header.frame_id = world_frame;
+     }
+     else
+     {
+-      const auto transform =
+-          tf_buffer_->lookupTransform(world_frame_, msg->header.frame_id, tf2::TimePointZero);
+-      tf2::doTransform(pose_in, pose_in_world, transform);
++      const auto transform = tf_buffer->lookupTransform(
++          world_frame, msg->header.frame_id, rclcpp::Time(msg->header.stamp),
++          rclcpp::Duration::from_seconds(0.05));
++      tf2::doTransform(pose_in, pose_world, transform);
+     }
+-
+-    odom_in_world_pose_ = pose_in_world.pose;
+-    have_odom_ = true;
+   }
+   catch (const tf2::TransformException &ex)
+   {
+-    RCLCPP_WARN_THROTTLE(
+-        traj_server_node_->get_logger(), *traj_server_node_->get_clock(), 2000,
+-        "Failed to transform odom from %s to %s: %s",
+-        msg->header.frame_id.c_str(), world_frame_.c_str(), ex.what());
++    RCLCPP_ERROR_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
++                          "Odometry transform %s -> %s failed: %s",
++                          msg->header.frame_id.c_str(), world_frame.c_str(), ex.what());
++    return;
+   }
+-}
+-
+-std::pair<double, double> calculateYaw(double t_cur, double planned_speed)
+-{
+-  std::pair<double, double> yaw_and_rate(0.0, 0.0);
+ 
+-  if (!have_odom_)
++  const auto &q = pose_world.pose.orientation;
++  const double q_norm = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
++  if (!std::isfinite(q_norm) || q_norm < 1e-6)
+   {
+-    return yaw_and_rate;
++    RCLCPP_ERROR_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
++                          "Odometry contains an invalid orientation quaternion");
++    return;
+   }
+ 
+-  const double yaw_robot = tf2::getYaw(odom_in_world_pose_.orientation);
+-  const double yaw_control_point = tf2::getYaw(control_point_state_.pose.pose.orientation);
+-  const Eigen::Vector3d current_pos(
+-      odom_in_world_pose_.position.x,
+-      odom_in_world_pose_.position.y,
+-      odom_in_world_pose_.position.z);
+-
+-  const bool use_goal_yaw =
+-      use_goal_path_orientation_ &&
+-      have_goal_path_ &&
+-      have_goal_path_orientation_ &&
+-      (end_pt_ - current_pos).norm() < goal_yaw_switch_distance_ &&
+-      planned_speed < goal_yaw_switch_speed_;
+-
+-  const double target_yaw =
+-      use_goal_yaw
+-          ? end_euler_(2)
+-          : yaw_control_point;
+-
+-  double yaw_diff = shortestAngularDistance(yaw_robot, target_yaw);
+-  if (std::abs(yaw_diff) < std::max(0.0, yaw_error_deadband_))
+-    yaw_diff = 0.0;
+-
+-  const double dt = std::max(t_cur + 1e-6, 1e-3);
+-  yaw_error_integral_ += yaw_diff * dt;
+-  const double yaw_error_derivative = (yaw_diff - last_yaw_error_) / dt;
+-
+-  double yaw_rate =
+-      kp_yaw_ * yaw_diff + ki_yaw_ * yaw_error_integral_ + kd_yaw_ * yaw_error_derivative;
+-  const double yaw_rate_limit = std::max(0.0, yaw_rate_limit_);
+-  yaw_rate = limitSpeed(yaw_rate, yaw_rate_limit, -yaw_rate_limit);
+-
+-  last_yaw_error_ = yaw_diff;
+-
+-  yaw_and_rate.first = yaw_diff;
+-  yaw_and_rate.second = yaw_rate;
+-  return yaw_and_rate;
++  odom_position << pose_world.pose.position.x, pose_world.pose.position.y,
++      pose_world.pose.position.z;
++  odom_yaw = tf2::getYaw(pose_world.pose.orientation);
++  have_odom = true;
++  last_odom_steady = SteadyClock::now();
+ }
+ 
+-void cmdCallback()
++void bsplineCallback(const traj_utils::msg::Bspline::ConstSharedPtr msg)
+ {
+-  if (!receive_traj_ || !have_odom_)
++  if (have_trajectory && msg->traj_id <= trajectory_id)
++  {
++    RCLCPP_WARN(node->get_logger(), "Discard stale trajectory id=%ld, active id=%ld",
++                static_cast<long>(msg->traj_id), static_cast<long>(trajectory_id));
++    return;
++  }
++
++  std::string validation_error;
++  if (!validateTrajectoryMessage(*msg, validation_error))
+   {
++    trajectory_id = msg->traj_id;
++    have_trajectory = false;
++    enterFault(validation_error);
++    return;
++  }
++  if (!have_odom)
++  {
++    trajectory_id = msg->traj_id;
++    have_trajectory = false;
++    enterFault("trajectory received before valid odometry");
+     return;
+   }
+ 
+-  const rclcpp::Time time_now = traj_server_node_->now();
+-  double t_cur = (time_now - start_time_).seconds();
+-  double cmd_dt = std::max(0.01, static_cast<double>(cmd_interval_ms_) / 1000.0);
+-  if (have_last_cmd_time_)
++  Eigen::MatrixXd control_points(3, msg->pos_pts.size());
++  Eigen::VectorXd knots(msg->knots.size());
++  for (size_t i = 0; i < msg->pos_pts.size(); ++i)
+   {
+-    cmd_dt = std::max(1e-3, (time_now - last_cmd_time_).seconds());
++    control_points(0, i) = msg->pos_pts[i].x;
++    control_points(1, i) = msg->pos_pts[i].y;
++    control_points(2, i) = msg->pos_pts[i].z;
+   }
+-  last_cmd_time_ = time_now;
+-  have_last_cmd_time_ = true;
++  for (size_t i = 0; i < msg->knots.size(); ++i)
++    knots(i) = msg->knots[i];
+ 
+-  Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+-  Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+-  Eigen::Vector3d acc = Eigen::Vector3d::Zero();
++  UniformBspline position_trajectory(control_points, msg->order, 0.1);
++  position_trajectory.setKnot(knots);
++  const double duration = position_trajectory.getTimeSum();
++  if (!std::isfinite(duration) || duration <= 1e-4)
++  {
++    trajectory_id = msg->traj_id;
++    have_trajectory = false;
++    enterFault("trajectory duration is invalid");
++    return;
++  }
+ 
+-  if (t_cur < traj_duration_ && t_cur >= 0.0)
++  const Eigen::Vector3d first_position = position_trajectory.evaluateDeBoorT(0.0);
++  const double initial_error = (first_position.head<2>() - odom_position.head<2>()).norm();
++  if (initial_error > max_initial_position_error)
+   {
+-    pos = traj_[0].evaluateDeBoorT(t_cur);
+-    vel = traj_[1].evaluateDeBoorT(t_cur);
+-    acc = traj_[2].evaluateDeBoorT(t_cur);
++    trajectory_id = msg->traj_id;
++    have_trajectory = false;
++    enterFault("trajectory start is too far from current odometry");
++    return;
+   }
+-  else if (t_cur >= traj_duration_)
++
++  trajectory.clear();
++  trajectory.push_back(position_trajectory);
++  trajectory.push_back(trajectory[0].getDerivative());
++  trajectory.push_back(trajectory[1].getDerivative());
++  trajectory_duration = duration;
++  trajectory_id = msg->traj_id;
++  execution_time = 0.0;
++  have_trajectory = true;
++  aligned_cycle_count = 0;
++
++  trajectory_is_stationary = !trajectoryHasPlanarMotion(last_desired_yaw);
++  if (trajectory_is_stationary)
+   {
+-    pos = traj_[0].evaluateDeBoorT(traj_duration_);
+-    vel.setZero();
+-    acc.setZero();
++    setControllerState(ExecutionState::HOLD_FINAL);
+   }
+   else
+   {
+-    RCLCPP_WARN_THROTTLE(
+-        traj_server_node_->get_logger(), *traj_server_node_->get_clock(), 2000,
+-        "[Traj server]: invalid trajectory time.");
++    const double yaw_error = normalizeAngle(last_desired_yaw - odom_yaw);
++    setControllerState(std::abs(yaw_error) > align_enter_threshold
++                           ? ExecutionState::ALIGN_HEADING
++                           : ExecutionState::TRACK_TRAJECTORY);
++  }
++
++  have_last_control_time = false;
++  RCLCPP_INFO(node->get_logger(), "Accepted trajectory id=%ld duration=%.3f start_error=%.3f",
++              static_cast<long>(trajectory_id), trajectory_duration, initial_error);
++}
++
++void controlCallback()
++{
++  const auto steady_now = SteadyClock::now();
++  const rclcpp::Time ros_now = node->now();
++  double dt = static_cast<double>(cmd_interval_ms) / 1000.0;
++  if (have_last_control_time)
++    dt = std::chrono::duration<double>(steady_now - last_control_steady).count();
++  last_control_steady = steady_now;
++  have_last_control_time = true;
++
++  if (!std::isfinite(dt) || dt <= 0.0 || dt > max_control_dt)
++  {
++    enterFault("control loop timing violation");
++  }
++  if (controller_state == ExecutionState::WAIT_TRAJECTORY && !have_trajectory)
++  {
++    publishZeroCommand();
++    publishExecutionState(ros_now);
++    return;
++  }
++  if (!have_odom ||
++      std::chrono::duration<double>(steady_now - last_odom_steady).count() > odom_timeout)
++  {
++    enterFault("odometry timeout");
++  }
++
++  if (controller_state == ExecutionState::WAIT_TRAJECTORY ||
++      controller_state == ExecutionState::HOLD_FINAL ||
++      controller_state == ExecutionState::FAULT_STOP)
++  {
++    publishZeroCommand();
++    publishExecutionState(ros_now);
++    return;
++  }
++
++  if (!have_trajectory)
++  {
++    enterFault("controller state requires a trajectory but none is active");
++    publishZeroCommand();
++    publishExecutionState(ros_now);
+     return;
+   }
+ 
+-  double yaw_estimate_from_traj = last_yaw_;
+-  if (vel.head<2>().norm() > std::max(0.0, yaw_target_speed_threshold_))
++  double desired_yaw = last_desired_yaw;
++  if (!desiredYawAt(execution_time, desired_yaw))
+   {
+-    yaw_estimate_from_traj = std::atan2(vel(1), vel(0) + 1e-6);
++    enterFault("moving trajectory has no valid planar heading");
++    publishZeroCommand();
++    publishExecutionState(ros_now);
++    return;
+   }
++  last_desired_yaw = desired_yaw;
++  const double yaw_error = normalizeAngle(desired_yaw - odom_yaw);
+ 
+-  const double max_yaw_target_step = std::max(0.0, yaw_target_rate_limit_) * cmd_dt;
+-  if (max_yaw_target_step > 1e-6)
++  if (controller_state == ExecutionState::TRACK_TRAJECTORY &&
++      std::abs(yaw_error) > align_enter_threshold)
+   {
+-    const double yaw_delta = shortestAngularDistance(last_yaw_, yaw_estimate_from_traj);
+-    yaw_estimate_from_traj =
+-        normalizeAngle(last_yaw_ + limitSpeed(yaw_delta, max_yaw_target_step, -max_yaw_target_step));
++    setControllerState(ExecutionState::ALIGN_HEADING);
+   }
+-  else
++
++  if (controller_state == ExecutionState::ALIGN_HEADING)
+   {
+-    yaw_estimate_from_traj = normalizeAngle(yaw_estimate_from_traj);
++    if (std::abs(yaw_error) < align_exit_threshold)
++      aligned_cycle_count++;
++    else
++      aligned_cycle_count = 0;
++
++    geometry_msgs::msg::Twist cmd;
++    cmd.angular.z = rateLimit(clamp(kp_yaw * yaw_error, -max_wz, max_wz),
++                              last_cmd_vel.angular.z, max_awz, dt);
++    cmd_vel_pub->publish(cmd);
++    last_cmd_vel = cmd;
++
++    const Eigen::Vector3d position = trajectory[0].evaluateDeBoorT(execution_time);
++    publishDesiredState(ros_now, position, Eigen::Vector3d::Zero(),
++                        Eigen::Vector3d::Zero(), desired_yaw, cmd.angular.z);
++
++    if (aligned_cycle_count >= align_confirm_cycles)
++      setControllerState(ExecutionState::TRACK_TRAJECTORY);
++
++    publishExecutionState(ros_now);
++    return;
+   }
+ 
+-  tf2::Quaternion control_point_q;
+-  control_point_q.setRPY(0.0, 0.0, yaw_estimate_from_traj);
+-
+-  control_point_state_.header.stamp = time_now;
+-  control_point_state_.header.frame_id = world_frame_;
+-  control_point_state_.child_frame_id = base_frame_;
+-  control_point_state_.pose.pose.position.x = pos(0);
+-  control_point_state_.pose.pose.position.y = pos(1);
+-  control_point_state_.pose.pose.position.z = pos(2);
+-  control_point_state_.pose.pose.orientation = tf2::toMsg(control_point_q);
+-  control_point_state_pub_->publish(control_point_state_);
+-
+-  const auto yaw_and_rate = calculateYaw(std::max(t_cur, 1e-3), vel.head<2>().norm());
+-
+-  cmd_.header.stamp = time_now;
+-  cmd_.header.frame_id = cmd_frame_id_;
+-  cmd_.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
+-  cmd_.trajectory_id = traj_id_;
+-  cmd_.position.x = pos(0);
+-  cmd_.position.y = pos(1);
+-  cmd_.position.z = pos(2);
+-  cmd_.velocity.x = vel(0);
+-  cmd_.velocity.y = vel(1);
+-  cmd_.velocity.z = vel(2);
+-  cmd_.acceleration.x = acc(0);
+-  cmd_.acceleration.y = acc(1);
+-  cmd_.acceleration.z = acc(2);
+-  cmd_.yaw = yaw_estimate_from_traj;
+-  cmd_.yaw_dot = yaw_and_rate.second;
+-
+-  last_yaw_ = cmd_.yaw;
+-  last_yaw_dot_ = cmd_.yaw_dot;
+-  pos_cmd_pub_->publish(cmd_);
+-
+-  geometry_msgs::msg::Twist vel_world;
+-  vel_world.angular.z = yaw_and_rate.second;
+-  if (std::abs(yaw_and_rate.first) < 0.785)
++  execution_time = std::min(trajectory_duration, execution_time + dt);
++  const Eigen::Vector3d desired_position = trajectory[0].evaluateDeBoorT(execution_time);
++  Eigen::Vector3d desired_velocity = trajectory[1].evaluateDeBoorT(execution_time);
++  Eigen::Vector3d desired_acceleration = trajectory[2].evaluateDeBoorT(execution_time);
++  if (execution_time >= trajectory_duration - 1e-6)
+   {
+-    vel_world.linear.x = vel(0);
+-    vel_world.linear.y = vel(1);
++    desired_velocity.setZero();
++    desired_acceleration.setZero();
+   }
++  const Eigen::Vector2d position_error =
++      desired_position.head<2>() - odom_position.head<2>();
+ 
+-  Eigen::Quaterniond base_ori_world(
+-      odom_in_world_pose_.orientation.w,
+-      odom_in_world_pose_.orientation.x,
+-      odom_in_world_pose_.orientation.y,
+-      odom_in_world_pose_.orientation.z);
+-  const Eigen::Matrix3d world_to_body = base_ori_world.toRotationMatrix().transpose();
+-
+-  const Eigen::Vector3d linear_world(vel_world.linear.x, vel_world.linear.y, vel_world.linear.z);
+-  const Eigen::Vector3d angular_world(vel_world.angular.x, vel_world.angular.y, vel_world.angular.z);
+-  const Eigen::Vector3d linear_body = world_to_body * linear_world;
+-  const Eigen::Vector3d angular_body = world_to_body * angular_world;
+-
+-  geometry_msgs::msg::Twist cmd_vel_msg;
+-  cmd_vel_msg.linear.x = linear_body.x();
+-  cmd_vel_msg.linear.y = linear_body.y();
+-  cmd_vel_msg.linear.z = 0.0;
+-  cmd_vel_msg.angular.x = 0.0;
+-  cmd_vel_msg.angular.y = 0.0;
+-  cmd_vel_msg.angular.z = angular_body.z();
+-
+-  const Eigen::Vector3d current_pos(
+-      odom_in_world_pose_.position.x,
+-      odom_in_world_pose_.position.y,
+-      odom_in_world_pose_.position.z);
+-  const bool goal_yaw_phase =
+-      use_goal_path_orientation_ &&
+-      have_goal_path_ &&
+-      have_goal_path_orientation_ &&
+-      (end_pt_ - current_pos).norm() < goal_yaw_switch_distance_ &&
+-      vel.head<2>().norm() < goal_yaw_switch_speed_;
+-
+-  if (prefer_forward_motion_ && !goal_yaw_phase && cmd_vel_msg.linear.x < 0.0)
++  if (position_error.norm() > max_tracking_error)
+   {
+-    cmd_vel_msg.linear.x = 0.0;
++    enterFault("planar tracking error exceeded the configured limit");
++    publishZeroCommand();
++    publishExecutionState(ros_now);
++    return;
+   }
+-  else if (cmd_vel_msg.linear.x < -reverse_speed_limit_)
++
++  Eigen::Vector2d correction(kp_pos_x * position_error.x(),
++                             kp_pos_y * position_error.y());
++  correction = clampNorm(correction, max_position_correction);
++  const Eigen::Vector2d velocity_world = desired_velocity.head<2>() + correction;
++
++  const double c = std::cos(odom_yaw);
++  const double s = std::sin(odom_yaw);
++  const double target_vx = clamp(c * velocity_world.x() + s * velocity_world.y(),
++                                 -max_reverse_vx, max_vx);
++  const double target_vy = clamp(-s * velocity_world.x() + c * velocity_world.y(),
++                                 -max_vy, max_vy);
++  const double target_wz = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
++
++  geometry_msgs::msg::Twist cmd;
++  cmd.linear.x = rateLimit(target_vx, last_cmd_vel.linear.x, max_ax, dt);
++  cmd.linear.y = rateLimit(target_vy, last_cmd_vel.linear.y, max_ay, dt);
++  cmd.angular.z = rateLimit(target_wz, last_cmd_vel.angular.z, max_awz, dt);
++  cmd_vel_pub->publish(cmd);
++  last_cmd_vel = cmd;
++
++  publishDesiredState(ros_now, desired_position, desired_velocity, desired_acceleration,
++                      desired_yaw, cmd.angular.z);
++
++  if (execution_time >= trajectory_duration - 1e-6 &&
++      position_error.norm() <= finish_distance)
+   {
+-    cmd_vel_msg.linear.x = -reverse_speed_limit_;
++    setControllerState(ExecutionState::HOLD_FINAL);
++    publishZeroCommand();
+   }
+ 
+-  cmd_vel_pub_->publish(cmd_vel_msg);
++  publishExecutionState(ros_now);
++}
++
++bool loadAndValidateParameters()
++{
++  node->declare_parameter("traj_server/world_frame", world_frame);
++  node->declare_parameter("traj_server/base_frame", base_frame);
++  node->declare_parameter("traj_server/odometry_topic", odom_topic);
++  node->declare_parameter("traj_server/cmd_topic", cmd_topic);
++  node->declare_parameter("traj_server/control_point_topic", control_point_topic);
++  node->declare_parameter("traj_server/execution_state_topic", execution_state_topic);
++  node->declare_parameter("traj_server/kp_pos_x", kp_pos_x);
++  node->declare_parameter("traj_server/kp_pos_y", kp_pos_y);
++  node->declare_parameter("traj_server/kp_yaw", kp_yaw);
++  node->declare_parameter("traj_server/max_position_correction", max_position_correction);
++  node->declare_parameter("traj_server/max_tracking_error", max_tracking_error);
++  node->declare_parameter("traj_server/finish_distance", finish_distance);
++  node->declare_parameter("traj_server/yaw_lookahead_time", yaw_lookahead_time);
++  node->declare_parameter("traj_server/min_yaw_displacement", min_yaw_displacement);
++  node->declare_parameter("traj_server/align_enter_threshold", align_enter_threshold);
++  node->declare_parameter("traj_server/align_exit_threshold", align_exit_threshold);
++  node->declare_parameter("traj_server/align_confirm_cycles", align_confirm_cycles);
++  node->declare_parameter("traj_server/max_vx", max_vx);
++  node->declare_parameter("traj_server/max_reverse_vx", max_reverse_vx);
++  node->declare_parameter("traj_server/max_vy", max_vy);
++  node->declare_parameter("traj_server/max_wz", max_wz);
++  node->declare_parameter("traj_server/max_ax", max_ax);
++  node->declare_parameter("traj_server/max_ay", max_ay);
++  node->declare_parameter("traj_server/max_awz", max_awz);
++  node->declare_parameter("traj_server/odom_timeout", odom_timeout);
++  node->declare_parameter("traj_server/max_control_dt", max_control_dt);
++  node->declare_parameter("traj_server/max_initial_position_error", max_initial_position_error);
++  node->declare_parameter("traj_server/cmd_interval_ms", cmd_interval_ms);
++
++  node->get_parameter("traj_server/world_frame", world_frame);
++  node->get_parameter("traj_server/base_frame", base_frame);
++  node->get_parameter("traj_server/odometry_topic", odom_topic);
++  node->get_parameter("traj_server/cmd_topic", cmd_topic);
++  node->get_parameter("traj_server/control_point_topic", control_point_topic);
++  node->get_parameter("traj_server/execution_state_topic", execution_state_topic);
++  node->get_parameter("traj_server/kp_pos_x", kp_pos_x);
++  node->get_parameter("traj_server/kp_pos_y", kp_pos_y);
++  node->get_parameter("traj_server/kp_yaw", kp_yaw);
++  node->get_parameter("traj_server/max_position_correction", max_position_correction);
++  node->get_parameter("traj_server/max_tracking_error", max_tracking_error);
++  node->get_parameter("traj_server/finish_distance", finish_distance);
++  node->get_parameter("traj_server/yaw_lookahead_time", yaw_lookahead_time);
++  node->get_parameter("traj_server/min_yaw_displacement", min_yaw_displacement);
++  node->get_parameter("traj_server/align_enter_threshold", align_enter_threshold);
++  node->get_parameter("traj_server/align_exit_threshold", align_exit_threshold);
++  node->get_parameter("traj_server/align_confirm_cycles", align_confirm_cycles);
++  node->get_parameter("traj_server/max_vx", max_vx);
++  node->get_parameter("traj_server/max_reverse_vx", max_reverse_vx);
++  node->get_parameter("traj_server/max_vy", max_vy);
++  node->get_parameter("traj_server/max_wz", max_wz);
++  node->get_parameter("traj_server/max_ax", max_ax);
++  node->get_parameter("traj_server/max_ay", max_ay);
++  node->get_parameter("traj_server/max_awz", max_awz);
++  node->get_parameter("traj_server/odom_timeout", odom_timeout);
++  node->get_parameter("traj_server/max_control_dt", max_control_dt);
++  node->get_parameter("traj_server/max_initial_position_error", max_initial_position_error);
++  node->get_parameter("traj_server/cmd_interval_ms", cmd_interval_ms);
++
++  const bool valid =
++      !world_frame.empty() && !base_frame.empty() && !odom_topic.empty() &&
++      !cmd_topic.empty() && !execution_state_topic.empty() && kp_pos_x >= 0.0 &&
++      kp_pos_y >= 0.0 && kp_yaw > 0.0 && max_position_correction > 0.0 &&
++      max_tracking_error > finish_distance && finish_distance > 0.0 &&
++      yaw_lookahead_time > 0.0 && min_yaw_displacement > 0.0 &&
++      align_enter_threshold > align_exit_threshold && align_exit_threshold > 0.0 &&
++      align_confirm_cycles > 0 && max_vx > 0.0 && max_reverse_vx >= 0.0 &&
++      max_vy > 0.0 && max_wz > 0.0 && max_ax > 0.0 && max_ay > 0.0 &&
++      max_awz > 0.0 && odom_timeout > 0.0 && max_control_dt > 0.0 &&
++      max_initial_position_error > 0.0 && cmd_interval_ms >= 10;
++  if (!valid)
++    RCLCPP_FATAL(node->get_logger(), "Invalid trajectory controller parameters");
++  return valid;
+ }
++} // namespace
+ 
+ int main(int argc, char **argv)
+ {
+   rclcpp::init(argc, argv);
+-  traj_server_node_ = rclcpp::Node::make_shared("traj_server");
+-
+-  traj_server_node_->declare_parameter("traj_server/frame_id", std::string("map"));
+-  traj_server_node_->declare_parameter("traj_server/world_frame", std::string("map"));
+-  traj_server_node_->declare_parameter("traj_server/base_frame", std::string("base_link"));
+-  traj_server_node_->declare_parameter("traj_server/odometry_topic", std::string("odom_world"));
+-  traj_server_node_->declare_parameter("traj_server/goal_path_topic", std::string("/global_path"));
+-  traj_server_node_->declare_parameter("traj_server/cmd_topic", std::string("/cmd_vel"));
+-  traj_server_node_->declare_parameter("traj_server/control_point_topic", std::string("/control_point_state_"));
+-  traj_server_node_->declare_parameter("traj_server/time_forward", 1.0);
+-  traj_server_node_->declare_parameter("traj_server/kp_yaw", 1.5);
+-  traj_server_node_->declare_parameter("traj_server/ki_yaw", 0.0);
+-  traj_server_node_->declare_parameter("traj_server/kd_yaw", 0.0);
+-  traj_server_node_->declare_parameter("traj_server/yaw_rate_limit", 0.6);
+-  traj_server_node_->declare_parameter("traj_server/yaw_target_rate_limit", 0.8);
+-  traj_server_node_->declare_parameter("traj_server/yaw_target_speed_threshold", 0.2);
+-  traj_server_node_->declare_parameter("traj_server/yaw_error_deadband", 0.05);
+-  traj_server_node_->declare_parameter("traj_server/use_goal_path_orientation", false);
+-  traj_server_node_->declare_parameter("traj_server/prefer_forward_motion", true);
+-  traj_server_node_->declare_parameter("traj_server/goal_yaw_switch_distance", 0.3);
+-  traj_server_node_->declare_parameter("traj_server/goal_yaw_switch_speed", 0.15);
+-  traj_server_node_->declare_parameter("traj_server/reverse_speed_limit", 0.05);
+-  traj_server_node_->declare_parameter("traj_server/cmd_interval_ms", 100);
+-
+-  traj_server_node_->get_parameter("traj_server/frame_id", cmd_frame_id_);
+-  traj_server_node_->get_parameter("traj_server/world_frame", world_frame_);
+-  traj_server_node_->get_parameter("traj_server/base_frame", base_frame_);
+-  traj_server_node_->get_parameter("traj_server/odometry_topic", odom_topic_);
+-  traj_server_node_->get_parameter("traj_server/goal_path_topic", goal_path_topic_);
+-  traj_server_node_->get_parameter("traj_server/cmd_topic", cmd_topic_);
+-  traj_server_node_->get_parameter("traj_server/control_point_topic", control_point_topic_);
+-  traj_server_node_->get_parameter("traj_server/time_forward", time_forward_);
+-  traj_server_node_->get_parameter("traj_server/kp_yaw", kp_yaw_);
+-  traj_server_node_->get_parameter("traj_server/ki_yaw", ki_yaw_);
+-  traj_server_node_->get_parameter("traj_server/kd_yaw", kd_yaw_);
+-  traj_server_node_->get_parameter("traj_server/yaw_rate_limit", yaw_rate_limit_);
+-  traj_server_node_->get_parameter("traj_server/yaw_target_rate_limit", yaw_target_rate_limit_);
+-  traj_server_node_->get_parameter("traj_server/yaw_target_speed_threshold", yaw_target_speed_threshold_);
+-  traj_server_node_->get_parameter("traj_server/yaw_error_deadband", yaw_error_deadband_);
+-  traj_server_node_->get_parameter("traj_server/use_goal_path_orientation", use_goal_path_orientation_);
+-  traj_server_node_->get_parameter("traj_server/prefer_forward_motion", prefer_forward_motion_);
+-  traj_server_node_->get_parameter("traj_server/goal_yaw_switch_distance", goal_yaw_switch_distance_);
+-  traj_server_node_->get_parameter("traj_server/goal_yaw_switch_speed", goal_yaw_switch_speed_);
+-  traj_server_node_->get_parameter("traj_server/reverse_speed_limit", reverse_speed_limit_);
+-  traj_server_node_->get_parameter("traj_server/cmd_interval_ms", cmd_interval_ms_);
+-
+-  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(traj_server_node_->get_clock());
+-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+-
+-  auto bspline_sub = traj_server_node_->create_subscription<traj_utils::msg::Bspline>(
++  node = rclcpp::Node::make_shared("traj_server");
++
++  if (!loadAndValidateParameters())
++  {
++    rclcpp::shutdown();
++    return 1;
++  }
++
++  tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
++  tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
++
++  auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
+       "planning/bspline", 10, bsplineCallback);
+-  auto odom_sub = traj_server_node_->create_subscription<nav_msgs::msg::Odometry>(
+-      odom_topic_, 10, odometryCallback);
+-  auto goal_path_sub = traj_server_node_->create_subscription<nav_msgs::msg::Path>(
+-      goal_path_topic_, 1, goalPathCallback);
++  auto odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
++      odom_topic, 20, odometryCallback);
+ 
+-  pos_cmd_pub_ = traj_server_node_->create_publisher<quadrotor_msgs::msg::PositionCommand>(
++  pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
+       "position_cmd", 50);
+-  cmd_vel_pub_ =
+-      traj_server_node_->create_publisher<geometry_msgs::msg::Twist>(cmd_topic_, 50);
+-  control_point_state_pub_ =
+-      traj_server_node_->create_publisher<nav_msgs::msg::Odometry>(control_point_topic_, 10);
+-
+-  auto cmd_timer = traj_server_node_->create_wall_timer(
+-      std::chrono::milliseconds(std::max(10, cmd_interval_ms_)), cmdCallback);
+-
+-  cmd_.kx[0] = pos_gain[0];
+-  cmd_.kx[1] = pos_gain[1];
+-  cmd_.kx[2] = pos_gain[2];
+-  cmd_.kv[0] = vel_gain[0];
+-  cmd_.kv[1] = vel_gain[1];
+-  cmd_.kv[2] = vel_gain[2];
+-
+-  rclcpp::sleep_for(std::chrono::seconds(1));
+-
+-  RCLCPP_WARN(
+-      traj_server_node_->get_logger(),
+-      "[Traj server]: ready. odom=%s goal_path=%s cmd_vel=%s world_frame=%s base_frame=%s",
+-      odom_topic_.c_str(), goal_path_topic_.c_str(), cmd_topic_.c_str(),
+-      world_frame_.c_str(), base_frame_.c_str());
+-
+-  rclcpp::spin(traj_server_node_);
++  cmd_vel_pub = node->create_publisher<geometry_msgs::msg::Twist>(cmd_topic, 50);
++  control_point_state_pub = node->create_publisher<nav_msgs::msg::Odometry>(
++      control_point_topic, 20);
++  execution_state_pub = node->create_publisher<ExecutionState>(execution_state_topic, 20);
++
++  auto control_timer = node->create_wall_timer(
++      std::chrono::milliseconds(cmd_interval_ms), controlCallback);
++
++  RCLCPP_WARN(node->get_logger(),
++              "Trajectory controller ready: odom=%s cmd=%s state=%s rate=%.1f Hz world=%s base=%s",
++              odom_topic.c_str(), cmd_topic.c_str(), execution_state_topic.c_str(),
++              1000.0 / static_cast<double>(cmd_interval_ms), world_frame.c_str(),
++              base_frame.c_str());
++
++  rclcpp::spin(node);
++  publishZeroCommand();
+   rclcpp::shutdown();
+   return 0;
+ }
+diff --git a/planner/traj_utils/CMakeLists.txt b/planner/traj_utils/CMakeLists.txt
+index c77ef6e..73ac790 100644
+--- a/planner/traj_utils/CMakeLists.txt
++++ b/planner/traj_utils/CMakeLists.txt
+@@ -27,10 +27,13 @@ rosidl_generate_interfaces(traj_utils
+   "msg/Bspline.msg"
+   "msg/DataDisp.msg"
+   "msg/MultiBsplines.msg"
++  "msg/TrajectoryExecutionState.msg"
+ 
+-  DEPENDENCIES std_msgs geometry_msgs rclcpp builtin_interfaces
++  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
+ )
+ 
++ament_export_dependencies(rosidl_default_runtime)
++
+ if(BUILD_TESTING)
+   find_package(ament_lint_auto REQUIRED)
+   # the following line skips the linter which checks for copyrights
+diff --git a/planner/traj_utils/msg/TrajectoryExecutionState.msg b/planner/traj_utils/msg/TrajectoryExecutionState.msg
+new file mode 100644
+index 0000000..3124b27
+--- /dev/null
++++ b/planner/traj_utils/msg/TrajectoryExecutionState.msg
+@@ -0,0 +1,12 @@
++uint8 WAIT_TRAJECTORY=0
++uint8 ALIGN_HEADING=1
++uint8 TRACK_TRAJECTORY=2
++uint8 HOLD_FINAL=3
++uint8 FAULT_STOP=4
++
++int64 traj_id
++uint8 state
++float64 exec_time
++bool frozen
++builtin_interfaces/Time stamp
++string fault_reason
+diff --git a/planner/traj_utils/package.xml b/planner/traj_utils/package.xml
+index 54dc121..18c16ba 100644
+--- a/planner/traj_utils/package.xml
++++ b/planner/traj_utils/package.xml
+@@ -14,7 +14,8 @@
+   <depend>geometry_msgs</depend>
+   <depend>visualization_msgs</depend>
+   <depend>builtin_interfaces</depend>
+-  <depend>rosidl_default_generators</depend>
++  <buildtool_depend>rosidl_default_generators</buildtool_depend>
++  <exec_depend>rosidl_default_runtime</exec_depend>
+   <depend>PCL</depend>
+   <depend>Eigen3</depend>
+ 

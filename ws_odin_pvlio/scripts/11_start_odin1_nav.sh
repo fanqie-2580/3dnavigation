@@ -69,32 +69,27 @@ sleep 8
 python3 "$ODIN_NAV/scripts/odin1_reset_odom2map_identity.py" \
   > /tmp/odin1_reset_o2m.log 2>&1 || true
 
-# 3) DDDMR docker
-if ! docker ps --format '{{.Names}}' | grep -qx dddmr_dev; then
-  docker start dddmr_dev || docker run -d --name dddmr_dev \
+# 3) DDDMR docker — Odin1 fork only (never dddmr_dev / Mid360 tree)
+if ! docker ps --format '{{.Names}}' | grep -qx dddmr_odin1; then
+  docker start dddmr_odin1 || docker run -d --name dddmr_odin1 \
     --network host --runtime nvidia --privileged \
     -v /dev:/dev \
     -v /etc/localtime:/etc/localtime:ro \
-    -v /home/ll/dddmr_navigation:/root/dddmr_ws \
+    -v /home/ll/dddmr_navigation_odin1:/root/dddmr_ws \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e DISPLAY=$DISPLAY \
     dddmr:l4t_r36 sleep infinity
   sleep 2
 fi
 
-docker exec dddmr_dev bash -lc '
+docker exec dddmr_odin1 bash -lc '
   export DISPLAY=:1 QT_X11_NO_MITSHM=1
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   unset CYCLONEDDS_URI
   export ROS_LOCALHOST_ONLY=0
   source /opt/ros/humble/setup.bash
-  export AMENT_PREFIX_PATH="$(ls -d /root/dddmr_ws/install/*/ | paste -sd: -):/opt/ros/humble"
-  export LD_LIBRARY_PATH="$(find /root/dddmr_ws/install -type d -name lib | paste -sd: -):$LD_LIBRARY_PATH"
-  DEST=$(ros2 pkg prefix p2p_move_base)/share/p2p_move_base/launch
-  SRC_L=/root/dddmr_ws/src/dddmr_p2p_move_base/launch/dddmr_global_ego_odin1.launch.py
-  if [ "$(readlink -f "$SRC_L")" != "$(readlink -f "$DEST/dddmr_global_ego_odin1.launch.py" 2>/dev/null || true)" ]; then
-    cp -f "$SRC_L" "$DEST/" || true
-  fi
+  cd /root/dddmr_ws
+  [ -f install/setup.bash ] && source install/setup.bash
   pkill -f dddmr_global_ego_odin1 2>/dev/null || true
   pkill -f "global_planner_node|mcl_feature|pcl_publisher" 2>/dev/null || true
   sleep 1
@@ -109,10 +104,10 @@ docker exec dddmr_dev bash -lc '
   echo DOCKER_NAV_STARTED
 '
 
-# 4) EGO local planner (keep set +u — colcon setup uses unset vars)
+# 4) EGO local planner — Odin1 fork only
 set +u
-source /home/ll/ego-planner-swarm-ros2_version/install/setup.bash
-nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
+source /home/ll/ego-planner-swarm-odin1/install/setup.bash
+nohup ros2 launch ego_planner dddmr_reference_tracking_odin1.launch.py \
   use_rviz:=true \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
@@ -121,7 +116,8 @@ nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
 sleep 6
 
 echo
-echo "Odin1 nav started (loc + dddmr + ego)."
+echo "Odin1 nav started (loc + dddmr_odin1 + ego-odin1)."
+echo "  Trees: /home/ll/dddmr_navigation_odin1 , /home/ll/ego-planner-swarm-odin1"
 echo "  Loc RViz: give 2D Pose Estimate if reloc looks off"
 echo "  DDDMR goal: Publish Point -> /clicked_point"
 echo "Logs: /tmp/odin1_localization.log /tmp/ego_odin1_local.log /tmp/dddmr_odin1_nav.log"
