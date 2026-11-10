@@ -59,14 +59,24 @@ def segment(
     if pts.size == 0:
         raise RuntimeError("empty point cloud after downsample")
 
-    # Drop very high points (ceiling) before plane fit
-    if max_height > 0:
-        z0 = float(np.percentile(pts[:, 2], 5))
-        keep = pts[:, 2] <= (z0 + max_height)
-        cloud = cloud.select_by_index(np.where(keep)[0].tolist())
-        pts = np.asarray(cloud.points)
+    # Fit ground only on the lower band. A loose max_height (e.g. p5+3m) still
+    # keeps the ceiling, and RANSAC then prefers the larger ceiling plane.
+    z0 = float(np.percentile(pts[:, 2], 5))
+    z_med = float(np.median(pts[:, 2]))
+    ground_band = max_height if max_height > 0 else 1.2
+    # Never let the fit band reach above the cloud median when floor/ceiling coexist.
+    z_fit_max = min(z0 + ground_band, z_med - 0.05) if z_med > z0 + 0.3 else (z0 + ground_band)
+    fit_idx = np.where(pts[:, 2] <= z_fit_max)[0]
+    if len(fit_idx) < max(100, int(0.02 * len(pts))):
+        # Fallback: lowest 35% by z
+        fit_idx = np.argsort(pts[:, 2])[: max(100, int(0.35 * len(pts)))]
+    fit_cloud = cloud.select_by_index(fit_idx.tolist())
+    print(
+        f"[seg] ground-fit band z<= {z_fit_max:.2f} "
+        f"(p5={z0:.2f}, median={z_med:.2f}, n_fit={len(fit_idx)}/{len(pts)})"
+    )
 
-    plane_model, inliers = cloud.segment_plane(
+    plane_model, fit_inliers = fit_cloud.segment_plane(
         distance_threshold=distance,
         ransac_n=ransac_n,
         num_iterations=num_iterations,
@@ -78,13 +88,26 @@ def segment(
             f"dominant plane tilt {angle:.1f} deg > max_angle {max_angle_deg:.1f} deg; "
             "map may be badly tilted or indoor walls dominate — try larger distance or check map leveling"
         )
-    if len(inliers) < max(100, int(0.05 * len(pts))):
+    if len(fit_inliers) < max(100, int(0.05 * len(fit_idx))):
         raise RuntimeError(
-            f"too few ground inliers ({len(inliers)}/{len(pts)}); increase distance_threshold"
+            f"too few ground inliers ({len(fit_inliers)}/{len(fit_idx)}); increase distance_threshold"
         )
 
-    ground = cloud.select_by_index(inliers)
-    obstacle = cloud.select_by_index(inliers, invert=True)
+    # Classify the full cloud by distance to the fitted (low) plane.
+    denom = np.sqrt(a * a + b * b + c * c) + 1e-12
+    signed = (a * pts[:, 0] + b * pts[:, 1] + c * pts[:, 2] + d) / denom
+    ground_idx = np.where(np.abs(signed) <= distance)[0]
+    # Guard: reject a "ground" that sits in the upper half of the map.
+    ground_z_mean = float(np.mean(pts[ground_idx, 2])) if len(ground_idx) else 1e9
+    if ground_z_mean > z_med:
+        raise RuntimeError(
+            f"fitted plane mean z={ground_z_mean:.2f} is above map median {z_med:.2f} "
+            "(looks like ceiling); tighten --max-height / check map leveling"
+        )
+    print(f"[seg] plane angle={angle:.1f}deg mean_ground_z={ground_z_mean:.2f}")
+
+    ground = cloud.select_by_index(ground_idx.tolist())
+    obstacle = cloud.select_by_index(ground_idx.tolist(), invert=True)
 
     # Distance of each obstacle point to the fitted plane (signed)
     if len(obstacle.points) > 0 and min_obstacle_height > 0:

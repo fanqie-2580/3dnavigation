@@ -24,7 +24,8 @@ OUT_DIR="${OUT_DIR:-$WS/maps}"
 VOXEL="${VOXEL:-0.05}"
 DISTANCE="${DISTANCE:-0.08}"
 MAX_ANGLE="${MAX_ANGLE:-25}"
-MAX_HEIGHT="${MAX_HEIGHT:-3.0}"
+# Keep fit band near the floor; 3.0 still includes indoor ceilings and RANSAC may pick them.
+MAX_HEIGHT="${MAX_HEIGHT:-1.2}"
 MIN_OBS_H="${MIN_OBSTACLE_HEIGHT:-0.12}"
 
 echo "[seg] input=$INPUT"
