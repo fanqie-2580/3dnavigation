@@ -802,6 +802,8 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit2", (int)US);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<double>("preprocess.blind2", 0.01);
+        this->declare_parameter<double>("preprocess.conf_min", -1.0);
+        this->declare_parameter<double>("preprocess.conf_min2", 30.0);
 
         this->declare_parameter<double>("mapping.cube_side_length", 200.0);
         this->declare_parameter<float>("mapping.det_range", 300.0f);
@@ -856,6 +858,8 @@ public:
         this->get_parameter_or("preprocess.timestamp_unit2", p_pre->time_unit[1], (int)US);
         this->get_parameter_or("preprocess.blind", p_pre->blind[0], 0.01);
         this->get_parameter_or("preprocess.blind2", p_pre->blind[1], 0.01);
+        this->get_parameter_or("preprocess.conf_min", p_pre->conf_min[0], -1.0);
+        this->get_parameter_or("preprocess.conf_min2", p_pre->conf_min[1], 30.0);
 
         this->get_parameter_or("mapping.cube_side_length", cube_len, 200.0);
         this->get_parameter_or("mapping.det_range", DET_RANGE, 300.0f);

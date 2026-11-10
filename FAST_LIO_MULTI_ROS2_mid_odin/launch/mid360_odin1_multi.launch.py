@@ -151,7 +151,7 @@ def generate_launch_description():
                     'voxel_size': float(
                         context.launch_configurations.get('odin_voxel', '0.08')
                     ),
-                    'max_points': 20000,
+                    'max_points': 12000,
                     'min_confidence': 30.0,
                     'restamp_from_odom': True,
                     'one_cloud_per_odom': True,
@@ -159,8 +159,9 @@ def generate_launch_description():
                     'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'odin_odom_topic': '/odin1/odometry',
                     'odin_odom_max_dt': 1.0,
-                    'mid_restamp_max_dt': 0.15,
-                    'max_cloud_age_sec': 0.35,
+                    # Looser gates: dock TCP + restamp leaves residual lag vs Mid.
+                    'mid_restamp_max_dt': 0.40,
+                    'max_cloud_age_sec': 1.50,
                     'fallback_period': 0.1,
                     'ground_only': True,
                     'ground_topic': '/odin1/cloud_ground',
@@ -168,8 +169,9 @@ def generate_launch_description():
                     'publish_full_topic': '/odin1/cloud_raw_ds_full',
                     'ground_distance': 0.08,
                     'ground_max_angle_deg': 25.0,
-                    'ground_ransac_iters': 60,
-                    'ground_min_inliers': 80,
+                    # RANSAC was ~2 cores and added visible Odin lag; keep light.
+                    'ground_ransac_iters': 20,
+                    'ground_min_inliers': 60,
                     'ground_fit_z_span': 1.5,
                     'ground_z_band': 0.20,
                 }],
@@ -326,9 +328,12 @@ def generate_launch_description():
                         'cloud_already_in_odom': True if use_ct else False,
                         'publish_in_parent_frame': (not use_ct),
                         'wait_align_for_parent': True,
-                        'align_mode': 'extrinsic',
-                        'align_delay_sec': 3.0,
-                        'odom_pair_max_dt': 0.25,
+                        # Mid IEKF map is gravity-aligned (floors level). Baking
+                        # extrinsic Ry(-13°) into map←odin_map here re-tilts the
+                        # already-level Odin cloud. Use yaw/xy lock only.
+                        'align_mode': 'yaw',
+                        'align_delay_sec': 2.0,
+                        'odom_pair_max_dt': 0.50,
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
@@ -390,8 +395,8 @@ def generate_launch_description():
                         'accum_skip_sec': 2.0,
                         'accum_gyr_gate': 0.35,
                         'accum_gyr_cooldown_sec': 1.0,
-                        # Residual dock lag ~1–2s ⇒ Odin voxel accum stays off until lag drops.
-                        'max_scan_age_sec': 0.25,
+                        # Allow residual dock TCP lag so fuse does not starve.
+                        'max_scan_age_sec': 1.50,
                         'max_range': 25.0,
                         'stride': 1,
                         'accum_period': 0.5,

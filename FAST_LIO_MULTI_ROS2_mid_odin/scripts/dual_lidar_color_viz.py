@@ -148,8 +148,6 @@ class DualLidarColorViz(Node):
         self.declare_parameter('max_accum_points', 400000)
         self.declare_parameter('accum_publish_period', 0.5)
         self.declare_parameter('accum_skip_sec', 3.0)
-        # Drop Mid ghost/flyers farther than this from the latest Mid body (meters).
-        self.declare_parameter('max_range', 25.0)
         self.declare_parameter('odom_buffer_sec', 2.0)
         self.declare_parameter('max_odom_cloud_dt', 0.15)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
@@ -178,8 +176,6 @@ class DualLidarColorViz(Node):
         self.odin_blind2 = float(self.get_parameter('odin_blind').value) ** 2
         self.odin_z_min = float(self.get_parameter('odin_z_min').value)
         self.odin_z_max = float(self.get_parameter('odin_z_max').value)
-        self.max_range = float(self.get_parameter('max_range').value)
-        self._mid_body_xy = None  # latest Mid translation in map
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
         period = float(self.get_parameter('accum_publish_period').value)
@@ -275,16 +271,9 @@ class DualLidarColorViz(Node):
         fused = np.vstack(parts) if len(parts) > 1 else parts[0]
         self.pub_fused.publish(make_cloud(self._header(stamp), fused))
 
-    def _filter_range(self, arr: np.ndarray) -> np.ndarray:
-        if arr.size == 0 or self.max_range <= 0.0 or self._mid_body_xy is None:
-            return arr
-        d = np.linalg.norm(arr - self._mid_body_xy.reshape(1, 3), axis=1)
-        return arr[d <= self.max_range]
-
     def on_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
         T = se3_from_pose(msg.pose.pose)
-        self._mid_body_xy = T[:3, 3].copy()
         self._odom_buf.append((t, T))
         cutoff = t - self.odom_buffer_sec
         while self._odom_buf and self._odom_buf[0][0] < cutoff:
@@ -347,7 +336,6 @@ class DualLidarColorViz(Node):
     def on_mid(self, msg: PointCloud2) -> None:
         # Bundle/tight-coupling tags Odin as intensity>=100; keep Mid-only for accum.
         arr = self._xyz_stride(msg, self.mid_stride, intensity_max=100.0)
-        arr = self._filter_range(arr)
         self._latest_mid = arr
         self.pub_mid.publish(
             make_cloud(self._header(msg.header.stamp, msg.header.frame_id), arr)

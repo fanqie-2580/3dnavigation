@@ -77,7 +77,9 @@
       #   T_go2IMU_midL (Unitree official) t=[0.187,0,0.0803] Ry(+13°)
       #   T_base_go2IMU (URDF) t=[-0.02557,0,0.04232] R=I
       #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
-      extrinsic_L2_gravity_frame: false
+      # Mid map is gravity-aligned; pose Odin into map with Mid yaw+pos only
+      # (do not re-apply mount Ry(-13°) as a map-frame tilt).
+      extrinsic_L2_gravity_frame: true
       extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
       # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
       # Keep CAD translation. (ICP -10.15° was pre-unproject; under-pitched ~3.6°.)
