@@ -125,6 +125,9 @@ namespace ego_planner
 
     inline int getOrder(void) { return order_; }
     inline double getSwarmClearance(void) { return swarm_clearance_; }
+    // True when the latest initControlPoints() hit an A* failure on a colliding seed.
+    // Match SCAN intent: do not keep optimizing a wall-crossing polynomial without rebound guides.
+    inline bool initControlPointsFailed(void) const { return init_control_points_failed_; }
 
   private:
     GridMap::Ptr grid_map_;
@@ -182,6 +185,7 @@ namespace ego_planner
     double min_ellip_dist_;
 
     ControlPoints cps_;
+    bool init_control_points_failed_{false};
 
     /* cost function */
     /* calculate each part of cost function with control points q as input */

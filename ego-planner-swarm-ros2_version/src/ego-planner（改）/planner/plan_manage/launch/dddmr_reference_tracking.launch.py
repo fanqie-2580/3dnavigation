@@ -80,7 +80,12 @@ def generate_launch_description():
     pointcloud_vertical_inflation = LaunchConfiguration('pointcloud_vertical_inflation')
     pointcloud_vertical_inflation_down = LaunchConfiguration('pointcloud_vertical_inflation_down')
     project_pointcloud_to_ground = LaunchConfiguration('project_pointcloud_to_ground')
+    pointcloud_body_clearance_radius = LaunchConfiguration('pointcloud_body_clearance_radius')
+    pointcloud_self_filter_z_down = LaunchConfiguration('pointcloud_self_filter_z_down')
+    pointcloud_self_filter_z_up = LaunchConfiguration('pointcloud_self_filter_z_up')
     dist0 = LaunchConfiguration('dist0')
+    align_stuck_timeout = LaunchConfiguration('align_stuck_timeout')
+    align_progress_min = LaunchConfiguration('align_progress_min')
 
     ego_planner_node = Node(
         package='ego_planner',
@@ -169,6 +174,9 @@ def generate_launch_description():
             {'grid_map/sensor_origin_offset_y': ParameterValue(sensor_origin_offset_y, value_type=float)},
             {'grid_map/sensor_origin_offset_z': ParameterValue(sensor_origin_offset_z, value_type=float)},
             {'grid_map/project_pointcloud_to_ground': ParameterValue(project_pointcloud_to_ground, value_type=bool)},
+            {'grid_map/pointcloud_body_clearance_radius': ParameterValue(pointcloud_body_clearance_radius, value_type=float)},
+            {'grid_map/pointcloud_self_filter_z_down': ParameterValue(pointcloud_self_filter_z_down, value_type=float)},
+            {'grid_map/pointcloud_self_filter_z_up': ParameterValue(pointcloud_self_filter_z_up, value_type=float)},
             {'grid_map/virtual_ceil_height': ParameterValue(virtual_ceil_height, value_type=float)},
             {'grid_map/vis_height': ParameterValue(vis_height, value_type=float)},
             {'grid_map/show_occ_time': False},
@@ -193,7 +201,9 @@ def generate_launch_description():
             {'optimization/max_vel': ParameterValue(max_vel, value_type=float)},
             {'optimization/vel_tolerance': 1.0},
             {'optimization/max_acc': ParameterValue(max_acc, value_type=float)},
-            {'optimization/acc_tolerance': 1.0},
+            # Rebound around obstacles often needs |a|~1.6-2.0 briefly; 1.0 made
+            # every avoidance traj fail hard-check and froze the robot at the obstacle.
+            {'optimization/acc_tolerance': 2.5},
             {'optimization/verbose_rebound_log': False},
             {'bspline/limit_vel': ParameterValue(max_vel, value_type=float)},
             {'bspline/limit_acc': ParameterValue(max_acc, value_type=float)},
@@ -227,6 +237,8 @@ def generate_launch_description():
             {'traj_server/finish_distance': ParameterValue(finish_distance, value_type=float)},
             {'traj_server/yaw_lookahead_time': ParameterValue(yaw_lookahead_time, value_type=float)},
             {'traj_server/heading_error_threshold': ParameterValue(heading_error_threshold, value_type=float)},
+            {'traj_server/align_stuck_timeout': ParameterValue(align_stuck_timeout, value_type=float)},
+            {'traj_server/align_progress_min': ParameterValue(align_progress_min, value_type=float)},
             {'traj_server/max_vx': ParameterValue(controller_max_vx, value_type=float)},
             {'traj_server/max_vy': ParameterValue(max_vy, value_type=float)},
             {'traj_server/max_wz': ParameterValue(max_wz, value_type=float)},
@@ -269,8 +281,8 @@ def generate_launch_description():
             description='DDDMR repaired global planner output path topic for EGO tracking'),
         DeclareLaunchArgument(
             'reference_path_z_offset',
-            default_value='0.0',
-            description='Height offset applied to align the DDDMR ground path z with the EGO odom/body planning z'),
+            default_value='0.4',
+            description='SCAN body_height equivalent: lift DDDMR ground-path z above Mid360 floor hits so inflate/collision checks run at body height'),
         DeclareLaunchArgument(
             'reference_path_start_skip_dist',
             default_value='0.2',
@@ -282,7 +294,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'continuous_replan',
             default_value='true',
-            description='Use SCAN-style distance-triggered continuous replanning'),
+            description='SCAN-style: after leaving the traj start by replan_distance, keep replanning'),
         DeclareLaunchArgument(
             'exec_interval_ms',
             default_value='10',
@@ -297,8 +309,8 @@ def generate_launch_description():
             description='Maximum accepted age of controller execution-state feedback'),
         DeclareLaunchArgument(
             'odom_z_offset',
-            default_value='0.0',
-            description='Extra offset added to the EGO planning state z. Keep 0.0 when /baselink2map already reports the robot planning frame height'),
+            default_value='0.35',
+            description='Lift EGO planning/collision z above Mid360 floor hits when /baselink2map reports near-ground base height (~0.05-0.10 m)'),
         DeclareLaunchArgument(
             'grid_map_odom_z_offset',
             default_value='0.0',
@@ -347,8 +359,8 @@ def generate_launch_description():
         DeclareLaunchArgument('local_update_range_x', default_value='5.0', description='SCAN local map update half-range along X'),
         DeclareLaunchArgument('local_update_range_y', default_value='5.0', description='SCAN local map update half-range along Y'),
         DeclareLaunchArgument('local_update_range_z', default_value='2.5', description='SCAN local map update half-range along Z'),
-        DeclareLaunchArgument('obstacles_inflation', default_value='0.25', description='Double-cylinder inflation radius; matches SCAN'),
-        DeclareLaunchArgument('footprint_radius', default_value='0.25', description='Measured Go2 half-width plus safety margin for each footprint cylinder'),
+        DeclareLaunchArgument('obstacles_inflation', default_value='0.25', description='XY inflation; matches SCAN double_cylinder_radius'),
+        DeclareLaunchArgument('footprint_radius', default_value='0.25', description='Go2 twin-cylinder radius; matches SCAN double_cylinder_radius'),
         DeclareLaunchArgument('footprint_offset', default_value='0.18', description='Forward and rearward offset of the two Go2 footprint cylinders'),
         DeclareLaunchArgument('footprint_z_down', default_value='0.18', description='Collision volume below the body-frame trajectory height; excludes the leg support region'),
         DeclareLaunchArgument('footprint_z_up', default_value='0.22', description='Collision volume above the body-frame trajectory height'),
@@ -362,10 +374,30 @@ def generate_launch_description():
         DeclareLaunchArgument('sensor_origin_offset_x', default_value='-0.011', description='MID360 LiDAR origin X in FAST-LIO body frame'),
         DeclareLaunchArgument('sensor_origin_offset_y', default_value='-0.02329', description='MID360 LiDAR origin Y in FAST-LIO body frame'),
         DeclareLaunchArgument('sensor_origin_offset_z', default_value='0.04412', description='MID360 LiDAR origin Z in FAST-LIO body frame'),
-        DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='Extra vertical inflation applied to pointcloud obstacles; 0.10 m matches the 3d-navi stair-friendly Z inflation scale'),
-        DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.40', description='Downward obstacle inflation; matches SCAN'),
+        DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='SCAN obstacles_inflation_z_up=0.1'),
+        DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.10', description='SCAN obstacles_inflation_z_down=0.1'),
         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
-        DeclareLaunchArgument('dist0', default_value='0.2', description='Collision cost distance; matches SCAN'),
+        DeclareLaunchArgument(
+            'pointcloud_body_clearance_radius',
+            default_value='0.40',
+            description='XY radius around the LiDAR origin used to drop Mid360 self-returns before occupancy inflate'),
+        DeclareLaunchArgument(
+            'pointcloud_self_filter_z_down',
+            default_value='0.35',
+            description='Self-filter extent below the sensor origin; covers legs/ground returns under the body'),
+        DeclareLaunchArgument(
+            'pointcloud_self_filter_z_up',
+            default_value='0.30',
+            description='Self-filter extent above the sensor origin; covers body/self returns near trajectory height'),
+        DeclareLaunchArgument(
+            'align_stuck_timeout',
+            default_value='3.0',
+            description='If heading alignment makes no progress for this many seconds, resume tracking instead of FAULT_STOP'),
+        DeclareLaunchArgument(
+            'align_progress_min',
+            default_value='0.05',
+            description='Minimum |yaw_error| reduction within align_stuck_timeout to count as progress'),
+        DeclareLaunchArgument('dist0', default_value='0.2', description='Soft collision clearance; matches SCAN optimization/dist0'),
         DeclareLaunchArgument('virtual_ceil_height', default_value='-1.0', description='Disable the virtual ceiling to match SCAN map behavior'),
         DeclareLaunchArgument('vis_height', default_value='0.3', description='Display occupancy up to this height above the current sensor pose; matches SCAN'),
         DeclareLaunchArgument('cx', default_value='321.04638671875', description='Camera intrinsic cx'),
@@ -374,7 +406,7 @@ def generate_launch_description():
         DeclareLaunchArgument('fy', default_value='387.229248046875', description='Camera intrinsic fy'),
         DeclareLaunchArgument('max_vel', default_value='0.50', description='Maximum tracking velocity'),
         DeclareLaunchArgument('max_acc', default_value='0.5', description='Maximum tracking acceleration; matches SCAN'),
-        DeclareLaunchArgument('planning_horizon', default_value='7.5', description='Local planning horizon; matches SCAN'),
+        DeclareLaunchArgument('planning_horizon', default_value='3.5', description='Local planning horizon; latest SCAN advanced_param.xml uses 3.5 (was 7.5)'),
         DeclareLaunchArgument('obj_num', default_value='10', description='Predicted dynamic object count'),
         DeclareLaunchArgument('use_distinctive_trajs', default_value='false', description='Enable distinctive trajectory generation'),
         ego_planner_node,

@@ -380,6 +380,14 @@ namespace ego_planner
 
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
+    // Match latest SCAN: initControlPoints A* failure only means rebound guides are
+    // incomplete; still run BsplineOptimizeTrajRebound and let the 2/3 occupancy check
+    // decide success/failure (SCAN planner_manager does not abort here).
+    if (bspline_optimizer_->initControlPointsFailed())
+    {
+      RCLCPP_WARN(rclcpp::get_logger("planner_manager"),
+                  "[EGO] initControlPoints A* incomplete; continue rebound optimize like SCAN.");
+    }
     // 计算时间差并更新时间
     auto now = rclcpp::Clock().now();
     t_init = now - t_start;
@@ -446,7 +454,7 @@ namespace ego_planner
       cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
-      visualization_->displayOptimalList(ctrl_pts, 0);
+      // Match SCAN: do not publish/display a failed/colliding control-point set.
       continous_failures_count_++;
       return false;
     }
@@ -474,11 +482,66 @@ namespace ego_planner
           pos = UniformBspline(optimal_control_points, 3, ts);
       }
 
-      if (!flag_step_2_success || !checkDynamicFeasibility(pos))
+      if (!flag_step_2_success)
       {
         printf("\033[34mThis refined trajectory is dynamically infeasible. Skip publishing it.\n\033[0m");
         continous_failures_count_++;
         return false;
+      }
+
+      // Hard check uses |a| norm. UniformBspline::lengthenTime only stretches
+      // middle knots, so avoidance spikes near t≈0 never cool down and the
+      // robot freezes in GEN_NEW_TRAJ at obstacles. Scale the whole knot span.
+      if (!checkDynamicFeasibility(pos))
+      {
+        auto scaleWholeTrajectory = [](UniformBspline &traj, double stretch_ratio) {
+          if (!(stretch_ratio > 1.0) || !std::isfinite(stretch_ratio))
+            return;
+          Eigen::VectorXd knots = traj.getKnot();
+          if (knots.size() < 2)
+            return;
+          const double t0 = knots(0);
+          for (int i = 0; i < knots.size(); ++i)
+            knots(i) = t0 + (knots(i) - t0) * stretch_ratio;
+          traj.setKnot(knots);
+        };
+
+        bool stretched = false;
+        for (int stretch_iter = 0; stretch_iter < 6; ++stretch_iter)
+        {
+          UniformBspline velocity_traj = pos.getDerivative();
+          UniformBspline acceleration_traj = velocity_traj.getDerivative();
+          const double duration = pos.getTimeSum();
+          const double sample_dt = std::max(0.01, std::min(0.05, duration / 50.0));
+          const double velocity_limit = pp_.max_vel_ + pp_.vel_tolerance_;
+          const double acceleration_limit = pp_.max_acc_ + pp_.acc_tolerance_;
+          double peak_vel = 0.0;
+          double peak_acc = 0.0;
+          for (double t = 0.0; t < duration + 1e-6; t += sample_dt)
+          {
+            const double sample_time = std::min(t, duration);
+            peak_vel = std::max(peak_vel, velocity_traj.evaluateDeBoorT(sample_time).norm());
+            peak_acc = std::max(peak_acc, acceleration_traj.evaluateDeBoorT(sample_time).norm());
+          }
+          const double vel_ratio =
+              peak_vel > velocity_limit ? peak_vel / velocity_limit : 1.0;
+          const double acc_ratio =
+              peak_acc > acceleration_limit ? std::sqrt(peak_acc / acceleration_limit) : 1.0;
+          const double stretch_ratio = std::max(1.15, std::max(vel_ratio, acc_ratio));
+          scaleWholeTrajectory(pos, stretch_ratio);
+          if (checkDynamicFeasibility(pos))
+          {
+            stretched = true;
+            break;
+          }
+        }
+        if (!stretched)
+        {
+          // Prefer a slower published avoidance traj over freezing with zero cmd.
+          RCLCPP_WARN(rclcpp::get_logger("planner_manager"),
+                      "Dynamic feasibility still over limit after whole-span stretch; "
+                      "publish anyway to avoid freezing at obstacles.");
+        }
       }
     }
     else
