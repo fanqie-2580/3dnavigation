@@ -27,7 +27,7 @@ import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 
@@ -260,6 +260,28 @@ class OdinMidTimedProject(Node):
         fid = (msg.header.frame_id or '').strip().lower()
         return fid in ('odom', 'map', 'odin_odom', 'odin_map')
 
+    def _read_confidence(self, msg: PointCloud2, base: int, off: int) -> float:
+        """Odin cloud_raw packs confidence as UINT16 (see host_sdk_sample.h).
+
+        Reading it as float32 keeps only ~1/4 of valid FOV points (random holes /
+        '一段一段'). Honor the PointField datatype.
+        """
+        f = next((pf for pf in msg.fields if pf.name == 'confidence'), None)
+        if f is None:
+            return 1e9
+        o = base + off
+        if f.datatype == PointField.FLOAT32:
+            return float(struct.unpack_from('<f', msg.data, o)[0])
+        if f.datatype == PointField.UINT16:
+            return float(struct.unpack_from('<H', msg.data, o)[0])
+        if f.datatype == PointField.UINT8:
+            return float(msg.data[o])
+        if f.datatype == PointField.UINT32:
+            return float(struct.unpack_from('<I', msg.data, o)[0])
+        if f.datatype == PointField.INT16:
+            return float(struct.unpack_from('<h', msg.data, o)[0])
+        return float(struct.unpack_from('<f', msg.data, o)[0])
+
     def _xyz(self, msg: PointCloud2) -> np.ndarray:
         offs = {f.name: f.offset for f in msg.fields}
         if not all(k in offs for k in ('x', 'y', 'z')):
@@ -276,10 +298,7 @@ class OdinMidTimedProject(Node):
             if x * x + y * y + z * z <= self.blind2:
                 continue
             if has_conf and self.min_conf > 0:
-                try:
-                    conf = struct.unpack_from('f', msg.data, b + offs['confidence'])[0]
-                except Exception:
-                    conf = float(msg.data[b + offs['confidence']])
+                conf = self._read_confidence(msg, b, offs['confidence'])
                 if conf < self.min_conf:
                     continue
             if (k % self.stride) == 0:

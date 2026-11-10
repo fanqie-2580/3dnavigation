@@ -28,11 +28,7 @@
 
   <!-- PCL -->
   <depend>pcl_conversions</depend>
-  <depend>pcl_ros</depend>
-
-  <!-- Odin downsample bridge -->
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>sensor_msgs_py</exec_depend>
+  <depend>sensor_msgs_py</depend>
   <exec_depend>python3-numpy</exec_depend>
 
   <!-- Export build type -->

@@ -138,6 +138,8 @@ class MidOdinFrameFuse(Node):
         self.declare_parameter('accum_gyr_cooldown_sec', 1.0)
         self.declare_parameter('stride', 1)
         self.declare_parameter('accum_period', 0.5)
+        # Drop Mid ghost points farther than this from latest Mid body (meters).
+        self.declare_parameter('max_range', 25.0)
 
         self.map_frame = str(self.get_parameter('map_frame').value)
         self.odin_frame = str(self.get_parameter('odin_frame').value)
@@ -148,10 +150,12 @@ class MidOdinFrameFuse(Node):
         self.accum_gyr_gate = float(self.get_parameter('accum_gyr_gate').value)
         self.max_scan_age_sec = float(self.get_parameter('max_scan_age_sec').value)
         self.accum_gyr_cooldown_sec = float(self.get_parameter('accum_gyr_cooldown_sec').value)
+        self.max_range = float(self.get_parameter('max_range').value)
         self._mid_gyr_norm = 0.0
         self._prev_mid_yaw: Optional[float] = None
         self._prev_mid_t: Optional[float] = None
         self._gyr_block_until = 0.0
+        self._mid_body = None  # latest Mid translation in map
         voxel = float(self.get_parameter('voxel_size').value)
         max_n = int(self.get_parameter('max_accum_points').value)
 
@@ -238,12 +242,21 @@ class MidOdinFrameFuse(Node):
         R, t = T[:3, :3], T[:3, 3]
         return (pts @ R.T) + t
 
+    def _filter_range(self, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if arr is None or arr.size == 0 or self.max_range <= 0.0 or self._mid_body is None:
+            return arr
+        d = np.linalg.norm(arr - self._mid_body.reshape(1, 3), axis=1)
+        out = arr[d <= self.max_range]
+        return out
+
     def on_mid_scan(self, msg: PointCloud2) -> None:
-        self._mid_scan = xyz_from_msg(msg, self.stride)
+        self._mid_scan = self._filter_range(xyz_from_msg(msg, self.stride))
         self._stamp_scan = msg.header.stamp
         self._publish_scan()
 
     def on_mid_odom(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
+        self._mid_body = np.array([p.x, p.y, p.z], dtype=np.float64)
         # FAST_LIO /Odometry often has empty twist — estimate yaw rate from pose.
         q = msg.pose.pose.orientation
         # yaw from quaternion (ZXY body)
@@ -289,7 +302,7 @@ class MidOdinFrameFuse(Node):
             self._dirty_odin = True
 
     def on_mid_accum(self, msg: PointCloud2) -> None:
-        self._mid_accum = xyz_from_msg(msg, 1)
+        self._mid_accum = self._filter_range(xyz_from_msg(msg, 1))
 
     def on_odin_accum_ext(self, msg: PointCloud2) -> None:
         # Ignore our own republish echo if DDS loops; size check is enough for now.
