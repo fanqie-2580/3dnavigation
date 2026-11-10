@@ -375,7 +375,7 @@ def generate_launch_description():
         DeclareLaunchArgument('sensor_origin_offset_y', default_value='-0.02329', description='MID360 LiDAR origin Y in FAST-LIO body frame'),
         DeclareLaunchArgument('sensor_origin_offset_z', default_value='0.04412', description='MID360 LiDAR origin Z in FAST-LIO body frame'),
         DeclareLaunchArgument('pointcloud_vertical_inflation', default_value='0.10', description='SCAN obstacles_inflation_z_up=0.1'),
-        DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.10', description='SCAN obstacles_inflation_z_down=0.1'),
+        DeclareLaunchArgument('pointcloud_vertical_inflation_down', default_value='0.40', description='SCAN obstacles_inflation_z_down=0.4; covers body-height checks from Mid360 hits'),
         DeclareLaunchArgument('project_pointcloud_to_ground', default_value='false', description='Keep false so stairs remain traversable in the 3D local map'),
         DeclareLaunchArgument(
             'pointcloud_body_clearance_radius',
