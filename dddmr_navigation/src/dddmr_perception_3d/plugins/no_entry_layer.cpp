@@ -298,7 +298,8 @@ void NoEntryLayer::resetdGraph(){
 }
 
 double NoEntryLayer::get_dGraphValue(const unsigned int index){
-  //@ Missing entry means unmarked/free (max clearance), not lethal 0.
+  if (dGraph_.graph_.find(index) == dGraph_.graph_.end())
+    return 0.0;
   return dGraph_.getValue(index);
 }
 

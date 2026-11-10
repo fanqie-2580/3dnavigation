@@ -1,8 +1,5 @@
 # Go2 + MID360：建图 → 导航命令手册
 
-> **推送到 GitHub**：见 [`push_to_github.md`](./push_to_github.md)  
->（`/home/ll/3dnavigation_github_upload` + HTTPS PAT → `fanqie-2580/3dnavigation`）。
-
 适用机型：**Unitree Go2 + Livox MID360**。  
 ROS：**Humble**。当前联调默认 **RMW = CycloneDDS**（宿主机与 `dddmr_dev` 一致）。
 
@@ -25,14 +22,11 @@ ROS：**Humble**。当前联调默认 **RMW = CycloneDDS**（宿主机与 `dddmr
 /home/ll/unitree_ros2
 ```
 
-当前联调定位地图（已验证）：
+默认定位地图：
 
 ```text
-/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/odin1_odom_map.pcd
+/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/ct_lio_map.pcd
 ```
-
-> **定位 → 导航最短命令清单**见同目录  
-> [`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md)（已按 2026-11-02 在跑进程核对）。
 
 Go2 MID360 `body→base` 外参（当前联调）：
 
@@ -182,11 +176,10 @@ nohup ros2 launch livox_ros_driver2 msg_MID360_launch.py \
 source /home/ll/ws_livox/install/setup.bash
 source /home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/install/setup.bash
 
-MAP=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/odin1_odom_map.pcd
+MAP=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/data/ct_lio_map.pcd
 
 ros2 launch open3d_loc localization_3d_go2.launch.py \
   map_file:=$MAP \
-  fastlio_config_file:=mid360.yaml \
   body_to_base_qy:=-0.1132032138 \
   body_to_base_qw:=0.9935718557 \
   localization_rviz:=true \
@@ -198,7 +191,6 @@ ros2 launch open3d_loc localization_3d_go2.launch.py \
 ```bash
 nohup ros2 launch open3d_loc localization_3d_go2.launch.py \
   map_file:=$MAP \
-  fastlio_config_file:=mid360.yaml \
   body_to_base_qy:=-0.1132032138 \
   body_to_base_qw:=0.9935718557 \
   localization_rviz:=true \
@@ -224,12 +216,9 @@ source /root/dddmr_ws/install/setup.bash
 cd /root/dddmr_ws
 
 ros2 launch p2p_move_base dddmr_global_ego_docker.launch.py \
-  config_file:=/root/dddmr_ws/src/dddmr_p2p_move_base/config/p2p_move_base_localization_static_map.yaml \
-  map_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd \
-  ground_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_ground_map.pcd \
   odom_topic:=/baselink2map \
   lidar_topic:=/livox/lidar_pointcloud2 \
-  use_rviz:=false \
+  use_rviz:=true \
   publish_sensor_tf:=true \
   publish_base_footprint_tf:=true
 ```
@@ -246,9 +235,6 @@ docker exec -d dddmr_dev bash -lc '
   source /root/dddmr_ws/install/setup.bash
   cd /root/dddmr_ws
   nohup ros2 launch p2p_move_base dddmr_global_ego_docker.launch.py \
-    config_file:=/root/dddmr_ws/src/dddmr_p2p_move_base/config/p2p_move_base_localization_static_map.yaml \
-    map_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_obstacle_map.pcd \
-    ground_dir:=/root/dddmr_ws/src/dddmr_global_planner/data/segmentation_ground_map.pcd \
     odom_topic:=/baselink2map \
     lidar_topic:=/livox/lidar_pointcloud2 \
     use_rviz:=false \
@@ -276,8 +262,7 @@ ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   use_rviz:=true \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
-  reference_path_topic:=/ego_repaired_global_path \
-  reference_path_z_offset:=0.4
+  reference_path_topic:=/ego_repaired_global_path
 ```
 
 后台：
@@ -288,7 +273,6 @@ nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
   reference_path_topic:=/ego_repaired_global_path \
-  reference_path_z_offset:=0.4 \
   > /tmp/ego_local_planner.log 2>&1 &
 ```
 
@@ -513,4 +497,5 @@ docker exec -it dddmr_dev bash -lc '
 # 然后在 DDDMR RViz → Publish Point
 ```
 
-详细命令见第 3 节与 [`go2_localization_to_navigation.md`](./go2_localization_to_navigation.md)；关闭见第 5–6 节。
+详细命令见第 3 节；关闭见第 5–6 节。
+```

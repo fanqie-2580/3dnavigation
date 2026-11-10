@@ -1,9 +1,0 @@
-global_localization_node:
-  ros__parameters:
-    # Mid360 vs Odin1 indoor map: ICP@0.3m prefers ~-95deg over +66/+85.
-    # open3d_loc ignores /initialpose once fitness>0.99, so seed must be correct at startup.
-    initialpose: [0.45, -0.04, -0.04, 0.0, 0.0, -95.0]
-    kf_baselink2map:
-      x: [0.001, 0.002]
-      y: [0.001, 0.005]
-      z: [0.00001, 0.04]

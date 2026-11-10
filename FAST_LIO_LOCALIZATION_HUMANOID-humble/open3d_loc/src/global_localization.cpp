@@ -1216,9 +1216,7 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
               << mat_odom2map_ << std::endl;
     std::cout << "confidence_loc_th_: " << confidence_loc_th_ << " current confidence: " << loc_fitness_ << std::endl;
 
-    // Always accept /initialpose (RViz 2D Pose Estimate). Previous guard
-    // ignored corrections once fitness>0.99, which trapped wrong local minima.
-    if (true)
+    if (!(loc_initialized_ && loc_fitness_ > 0.99))
     {
         std::cout << "initpose:x y z, x y z w\n"
                   << initialpose->pose.pose.position.x << " "

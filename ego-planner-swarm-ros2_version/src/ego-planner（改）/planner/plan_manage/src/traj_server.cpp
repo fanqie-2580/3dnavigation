@@ -53,15 +53,10 @@ double kp_yaw = 1.5;
 double finish_distance = 0.12;
 double yaw_lookahead_time = 0.5;
 double heading_error_threshold = 0.8;
-double align_stuck_timeout = 3.0;
-double align_progress_min = 0.05;
 double max_vx = 0.8;
 double max_vy = 0.35;
 double max_wz = 0.6;
 int cmd_interval_ms = 20;
-double align_watch_abs_error = -1.0;
-SteadyClock::time_point align_watch_steady;
-bool force_track_after_align_stuck = false;
 
 std::vector<UniformBspline> trajectory;
 double trajectory_duration = 0.0;
@@ -384,8 +379,6 @@ void bsplineCallback(const traj_utils::msg::Bspline::ConstSharedPtr msg)
   }
 
   have_last_control_time = false;
-  align_watch_abs_error = -1.0;
-  force_track_after_align_stuck = false;
   RCLCPP_INFO(node->get_logger(), "Accepted trajectory id=%ld duration=%.3f",
               static_cast<long>(trajectory_id), trajectory_duration);
 }
@@ -429,26 +422,21 @@ void controlCallback()
     return;
   }
 
-  const Eigen::Vector3d final_position =
-      trajectory[0].evaluateDeBoorT(trajectory_duration);
-  const double remaining_to_end =
-      (final_position.head<2>() - odom_position.head<2>()).norm();
-  const bool near_trajectory_end =
-      execution_time >= trajectory_duration - 1e-3 ||
-      remaining_to_end <= std::max(finish_distance, 0.25);
-
-  if (controller_state == ExecutionState::HOLD_FINAL || near_trajectory_end)
+  if (controller_state == ExecutionState::HOLD_FINAL)
   {
-    if (remaining_to_end <= finish_distance ||
-        controller_state == ExecutionState::HOLD_FINAL)
+    const Eigen::Vector3d final_position =
+        trajectory[0].evaluateDeBoorT(trajectory_duration);
+    const Eigen::Vector2d final_error =
+        final_position.head<2>() - odom_position.head<2>();
+    if (final_error.norm() <= finish_distance)
     {
-      setControllerState(ExecutionState::HOLD_FINAL);
       publishZeroCommand();
       publishDesiredState(ros_now, final_position, Eigen::Vector3d::Zero(),
                           Eigen::Vector3d::Zero(), odom_yaw, 0.0);
       publishExecutionState(ros_now);
       return;
     }
+    setControllerState(ExecutionState::TRACK_TRAJECTORY);
   }
 
   double desired_yaw = last_desired_yaw;
@@ -462,72 +450,24 @@ void controlCallback()
   last_desired_yaw = desired_yaw;
   const double yaw_error = normalizeAngle(desired_yaw - odom_yaw);
 
-  const double abs_yaw_error = std::abs(yaw_error);
-  // If odom yaw is frozen (common when LIO/sport yaw stall), ALIGN_HEADING would
-  // otherwise loop forever: 3s spin-only -> brief track -> ALIGN again. Latch
-  // TRACK for the rest of this trajectory once align is proven stuck.
-  if (force_track_after_align_stuck && abs_yaw_error <= heading_error_threshold)
-    force_track_after_align_stuck = false;
-
-  // Near the goal, lookahead yaw becomes noisy / nearly opposite and causes
-  // continuous spinning. Never enter ALIGN on the final approach.
-  const bool want_align =
-      abs_yaw_error > heading_error_threshold && !force_track_after_align_stuck &&
-      !near_trajectory_end;
-
-  if (want_align)
+  if (std::abs(yaw_error) > heading_error_threshold)
     setControllerState(ExecutionState::ALIGN_HEADING);
   else
-  {
-    align_watch_abs_error = -1.0;
     setControllerState(ExecutionState::TRACK_TRAJECTORY);
-  }
 
-  if (want_align)
+  if (std::abs(yaw_error) > heading_error_threshold)
   {
-    if (align_stuck_timeout > 0.0)
-    {
-      if (align_watch_abs_error < 0.0)
-      {
-        align_watch_abs_error = abs_yaw_error;
-        align_watch_steady = steady_now;
-      }
-      else
-      {
-        const double progressed = align_watch_abs_error - abs_yaw_error;
-        const double waited =
-            std::chrono::duration<double>(steady_now - align_watch_steady).count();
-        if (progressed >= align_progress_min)
-        {
-          align_watch_abs_error = abs_yaw_error;
-          align_watch_steady = steady_now;
-        }
-        else if (waited >= align_stuck_timeout)
-        {
-          RCLCPP_WARN(node->get_logger(),
-                      "heading align stuck: odometry yaw not converging while rotating; "
-                      "force TRACK for this trajectory (err=%.3f)",
-                      abs_yaw_error);
-          align_watch_abs_error = -1.0;
-          force_track_after_align_stuck = true;
-          setControllerState(ExecutionState::TRACK_TRAJECTORY);
-        }
-      }
-    }
+    geometry_msgs::msg::Twist cmd;
+    cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
+    cmd_vel_pub->publish(cmd);
+    last_cmd_vel = cmd;
 
-    if (!force_track_after_align_stuck)
-    {
-      geometry_msgs::msg::Twist cmd;
-      cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
-      cmd_vel_pub->publish(cmd);
-      last_cmd_vel = cmd;
+    const Eigen::Vector3d position = trajectory[0].evaluateDeBoorT(execution_time);
+    publishDesiredState(ros_now, position, Eigen::Vector3d::Zero(),
+                        Eigen::Vector3d::Zero(), desired_yaw, cmd.angular.z);
 
-      const Eigen::Vector3d position = trajectory[0].evaluateDeBoorT(execution_time);
-      publishDesiredState(ros_now, position, Eigen::Vector3d::Zero(),
-                          Eigen::Vector3d::Zero(), desired_yaw, cmd.angular.z);
-      publishExecutionState(ros_now);
-      return;
-    }
+    publishExecutionState(ros_now);
+    return;
   }
 
   execution_time = std::min(trajectory_duration, execution_time + dt);
@@ -552,9 +492,7 @@ void controlCallback()
   geometry_msgs::msg::Twist cmd;
   cmd.linear.x = clamp(c * velocity_world.x() + s * velocity_world.y(), -max_vx, max_vx);
   cmd.linear.y = clamp(-s * velocity_world.x() + c * velocity_world.y(), -max_vy, max_vy);
-  cmd.angular.z = near_trajectory_end
-                      ? 0.0
-                      : clamp(kp_yaw * yaw_error, -max_wz, max_wz);
+  cmd.angular.z = clamp(kp_yaw * yaw_error, -max_wz, max_wz);
 
   if (execution_time >= trajectory_duration - 1e-6 &&
       position_error.norm() <= finish_distance)
@@ -562,7 +500,7 @@ void controlCallback()
     setControllerState(ExecutionState::HOLD_FINAL);
     publishZeroCommand();
     publishDesiredState(ros_now, desired_position, Eigen::Vector3d::Zero(),
-                        Eigen::Vector3d::Zero(), odom_yaw, 0.0);
+                        Eigen::Vector3d::Zero(), desired_yaw, 0.0);
     publishExecutionState(ros_now);
     return;
   }
@@ -590,8 +528,6 @@ bool loadAndValidateParameters()
   node->declare_parameter("traj_server/finish_distance", finish_distance);
   node->declare_parameter("traj_server/yaw_lookahead_time", yaw_lookahead_time);
   node->declare_parameter("traj_server/heading_error_threshold", heading_error_threshold);
-  node->declare_parameter("traj_server/align_stuck_timeout", align_stuck_timeout);
-  node->declare_parameter("traj_server/align_progress_min", align_progress_min);
   node->declare_parameter("traj_server/max_vx", max_vx);
   node->declare_parameter("traj_server/max_vy", max_vy);
   node->declare_parameter("traj_server/max_wz", max_wz);
@@ -609,8 +545,6 @@ bool loadAndValidateParameters()
   node->get_parameter("traj_server/finish_distance", finish_distance);
   node->get_parameter("traj_server/yaw_lookahead_time", yaw_lookahead_time);
   node->get_parameter("traj_server/heading_error_threshold", heading_error_threshold);
-  node->get_parameter("traj_server/align_stuck_timeout", align_stuck_timeout);
-  node->get_parameter("traj_server/align_progress_min", align_progress_min);
   node->get_parameter("traj_server/max_vx", max_vx);
   node->get_parameter("traj_server/max_vy", max_vy);
   node->get_parameter("traj_server/max_wz", max_wz);
@@ -621,7 +555,6 @@ bool loadAndValidateParameters()
       !cmd_topic.empty() && !execution_state_topic.empty() && kp_pos_x >= 0.0 &&
       kp_pos_y >= 0.0 && kp_yaw > 0.0 && finish_distance > 0.0 &&
       yaw_lookahead_time > 0.0 && heading_error_threshold > 0.0 &&
-      align_stuck_timeout >= 0.0 && align_progress_min >= 0.0 &&
       max_vx > 0.0 && max_vy > 0.0 && max_wz > 0.0 && cmd_interval_ms >= 10;
   if (!valid)
     RCLCPP_FATAL(node->get_logger(), "Invalid trajectory controller parameters");

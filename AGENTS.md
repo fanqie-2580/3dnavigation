@@ -1,9 +1,5 @@
 # Codex 工作区说明
 
-> **推送到 GitHub（必读）**：源码改动后同步推送流程见  
-> [`docs/push_to_github.md`](./docs/push_to_github.md)。  
-> 上传根目录：`/home/ll/3dnavigation_github_upload`；远端：`https://github.com/fanqie-2580/3dnavigation`（HTTPS + PAT，不用 SSH）。
-
 这个工作区用于我的机器人导航、规划、定位相关项目联调。 请严格按照本文件理解项目结构、运行环境和修改规则。
 
 ## 0. 当前工作区包含的项目
