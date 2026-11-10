@@ -15,9 +15,8 @@
                   0.0, 1.0, 0.0,
                   0.0, 0.0, 1.0]
 
-    # odin_map / odin_base_link: avoid colliding with Mid FAST-LIO map/base_link
-    map_frame: "odin_map"
-    base_frame: "odin_base_link"
+    map_frame: "map"
+    base_frame: "base_link"
     imu_frame: "odin1_imu"
     lidar_frame: "odin1_lidar"
     publish_static_sensor_tf: true

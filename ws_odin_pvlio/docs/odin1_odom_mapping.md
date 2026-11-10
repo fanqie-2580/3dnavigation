@@ -68,9 +68,7 @@ cp /home/ll/ws_odin_pvlio/maps/segmentation_ground_map.pcd \
    /home/ll/dddmr_navigation/src/dddmr_global_planner/data/
 ```
 
-可调环境变量：`VOXEL` `DISTANCE` `MAX_ANGLE` `MAX_HEIGHT` `MIN_OBSTACLE_HEIGHT` `KEEP_BELOW` `CEILING_VOXEL` `DROP_ABOVE`。
-
-默认会保留地面上方 1.8 m 内墙面密度，1.8–2.4 m 用 0.4 m 体素稀疏，高于 2.4 m 丢掉（减天花板）。
+可调环境变量：`VOXEL` `DISTANCE` `MAX_ANGLE` `MAX_HEIGHT` `MIN_OBSTACLE_HEIGHT`。
 
 > 分割只处理静态全局图。以后用 Odin 导航时，还需要把 dddmr 实时 `lidar_topic` / `sensor_frame` 改成 Odin 点云（另做联调）。
 

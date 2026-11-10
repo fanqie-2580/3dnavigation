@@ -24,16 +24,11 @@ OUT_DIR="${OUT_DIR:-$WS/maps}"
 VOXEL="${VOXEL:-0.05}"
 DISTANCE="${DISTANCE:-0.08}"
 MAX_ANGLE="${MAX_ANGLE:-25}"
-MAX_HEIGHT="${MAX_HEIGHT:-2.4}"
+MAX_HEIGHT="${MAX_HEIGHT:-3.0}"
 MIN_OBS_H="${MIN_OBSTACLE_HEIGHT:-0.12}"
-# Keep dense walls below this height above ground; thin then drop ceiling
-KEEP_BELOW="${KEEP_BELOW:-1.8}"
-CEILING_VOXEL="${CEILING_VOXEL:-0.40}"
-DROP_ABOVE="${DROP_ABOVE:-2.4}"
 
 echo "[seg] input=$INPUT"
 echo "[seg] out_dir=$OUT_DIR voxel=$VOXEL distance=$DISTANCE"
-echo "[seg] keep_below=$KEEP_BELOW ceiling_voxel=$CEILING_VOXEL drop_above=$DROP_ABOVE"
 
 python3 "$SCRIPT" \
   --input "$INPUT" \
@@ -42,10 +37,7 @@ python3 "$SCRIPT" \
   --distance "$DISTANCE" \
   --max-angle "$MAX_ANGLE" \
   --max-height "$MAX_HEIGHT" \
-  --min-obstacle-height "$MIN_OBS_H" \
-  --keep-below "$KEEP_BELOW" \
-  --ceiling-voxel "$CEILING_VOXEL" \
-  --drop-above "$DROP_ABOVE"
+  --min-obstacle-height "$MIN_OBS_H"
 
 echo "[seg] copy to dddmr (optional):"
 echo "  cp $OUT_DIR/segmentation_ground_map.pcd $OUT_DIR/segmentation_obstacle_map.pcd \\"

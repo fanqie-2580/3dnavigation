@@ -113,28 +113,13 @@ class OdinBridgeClient(Node):
         self.declare_parameter("server_host", "192.168.123.18")
         self.declare_parameter("server_port", 5601)
         self.declare_parameter("imu_topic", "/odin1/imu")
-        self.declare_parameter("cloud_topic", "/odin1/cloud_raw")
+        self.declare_parameter("cloud_topic", "/odin1/cloud_slam")
         self.declare_parameter("odom_topic", "/odin1/odometry")
-        # Dock often publishes device uptime; map once onto host ROS time.
-        self.declare_parameter("align_to_host_time", True)
-        self.declare_parameter("uptime_stamp_threshold_sec", 1.6e9)
-        # device: keep aligned device stamp (CORRECT for map: pose@t × cloud@t).
-        # host_receive: stamp at arrival — looks "live" but paints OLD geometry with
-        # NEW Mid pose → turn smear / wrong accum (do NOT use for mapping).
-        self.declare_parameter("cloud_stamp_policy", "device")
-        # Drop extreme TCP backlog only (seconds). Primary freshness = dock drop-old.
-        self.declare_parameter("max_cloud_age_sec", 3.0)
         self.host = self.get_parameter("server_host").value
         self.port = int(self.get_parameter("server_port").value)
         imu_topic = self.get_parameter("imu_topic").value
         cloud_topic = self.get_parameter("cloud_topic").value
         odom_topic = self.get_parameter("odom_topic").value
-        self.align_to_host_time = bool(self.get_parameter("align_to_host_time").value)
-        self.uptime_thr = float(self.get_parameter("uptime_stamp_threshold_sec").value)
-        self.cloud_stamp_policy = str(self.get_parameter("cloud_stamp_policy").value).strip().lower()
-        self.max_cloud_age_sec = float(self.get_parameter("max_cloud_age_sec").value)
-        self._time_offset_sec = None  # host = device + offset
-        self._n_cloud_drop_age = 0
 
         self.pub_imu = self.create_publisher(Imu, imu_topic, 200)
         self.pub_cloud = self.create_publisher(PointCloud2, cloud_topic, 10)
@@ -143,48 +128,9 @@ class OdinBridgeClient(Node):
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self.create_timer(2.0, self._age_stats)
         self.get_logger().info(
-            f"bridging tcp://{self.host}:{self.port} -> {imu_topic}, {cloud_topic}, {odom_topic} "
-            f"align_to_host_time={self.align_to_host_time} "
-            f"cloud_stamp_policy={self.cloud_stamp_policy} max_cloud_age={self.max_cloud_age_sec:.2f}s"
+            f"bridging tcp://{self.host}:{self.port} -> {imu_topic}, {cloud_topic}, {odom_topic}"
         )
-
-    def _age_stats(self) -> None:
-        if self._n_cloud_drop_age:
-            self.get_logger().info(
-                f"tcp client dropped {self._n_cloud_drop_age} stale clouds "
-                f"(age>{self.max_cloud_age_sec:.2f}s)"
-            )
-            self._n_cloud_drop_age = 0
-
-    def _stamp_to_sec(self, stamp: Time) -> float:
-        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
-
-    def _sec_to_stamp(self, t: float) -> Time:
-        if t < 0.0:
-            t = 0.0
-        sec = int(t)
-        nsec = int(round((t - sec) * 1e9))
-        if nsec >= 1_000_000_000:
-            sec += 1
-            nsec -= 1_000_000_000
-        return Time(sec=sec, nanosec=nsec)
-
-    def _align_header_stamp(self, stamp: Time) -> Time:
-        if not self.align_to_host_time:
-            return stamp
-        device_t = self._stamp_to_sec(stamp)
-        if device_t >= self.uptime_thr:
-            return stamp  # already host-like
-        host_now = self.get_clock().now().nanoseconds * 1e-9
-        if self._time_offset_sec is None:
-            self._time_offset_sec = host_now - device_t
-            self.get_logger().info(
-                f"Odin device-time offset locked: {self._time_offset_sec:.3f} s "
-                f"(device={device_t:.3f} host={host_now:.3f})"
-            )
-        return self._sec_to_stamp(device_t + self._time_offset_sec)
 
     def destroy_node(self):
         self._stop = True
@@ -212,26 +158,11 @@ class OdinBridgeClient(Node):
                 msg_type, length = struct.unpack("<BI", hdr)
                 payload = recv_exact(sock, length)
                 if msg_type == TYPE_IMU:
-                    msg = decode_imu(payload)
-                    msg.header.stamp = self._align_header_stamp(msg.header.stamp)
-                    self.pub_imu.publish(msg)
+                    self.pub_imu.publish(decode_imu(payload))
                 elif msg_type == TYPE_CLOUD:
-                    msg = decode_cloud(payload)
-                    msg.header.stamp = self._align_header_stamp(msg.header.stamp)
-                    host_now = self.get_clock().now().nanoseconds * 1e-9
-                    if self.cloud_stamp_policy in ("host_receive", "arrival", "receive"):
-                        # Stamp slightly behind host_now so EXACT Mid pair (|dt|~Mid lag) hits.
-                        msg.header.stamp = self._sec_to_stamp(host_now - 0.05)
-                    elif self.max_cloud_age_sec > 0.0:
-                        age = host_now - self._stamp_to_sec(msg.header.stamp)
-                        if age > self.max_cloud_age_sec:
-                            self._n_cloud_drop_age += 1
-                            continue
-                    self.pub_cloud.publish(msg)
+                    self.pub_cloud.publish(decode_cloud(payload))
                 elif msg_type == TYPE_ODOM:
-                    msg = decode_odom(payload)
-                    msg.header.stamp = self._align_header_stamp(msg.header.stamp)
-                    self.pub_odom.publish(msg)
+                    self.pub_odom.publish(decode_odom(payload))
         finally:
             try:
                 sock.close()

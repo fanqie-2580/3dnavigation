@@ -4,9 +4,6 @@
 Produces dddmr-compatible XYZ PCDs:
   segmentation_ground_map.pcd
   segmentation_obstacle_map.pcd
-
-Ceiling / high points can be hard-cut or heavily voxel-thinned so the global
-obstacle map keeps walls near robot height while dropping dense ceilings.
 """
 from __future__ import annotations
 
@@ -39,50 +36,10 @@ def save_xyz_pcd(path: Path, pts: np.ndarray) -> None:
 
 def plane_angle_deg(normal: np.ndarray) -> float:
     n = normal / (np.linalg.norm(normal) + 1e-12)
+    # angle between normal and +Z
     c = abs(float(n[2]))
     c = min(1.0, max(0.0, c))
     return float(np.degrees(np.arccos(c)))
-
-
-def thin_high_points(
-    cloud: o3d.geometry.PointCloud,
-    ground_z: float,
-    keep_below: float,
-    ceiling_voxel: float,
-    drop_above: float,
-) -> o3d.geometry.PointCloud:
-    """Keep dense structure below keep_below; thin or drop higher points.
-
-    Heights are absolute offsets above ground_z (meters).
-    - z <= ground_z + keep_below: keep as-is
-    - ground_z + keep_below < z <= ground_z + drop_above: voxel downsample
-    - z > ground_z + drop_above: drop
-    """
-    pts = np.asarray(cloud.points)
-    if pts.size == 0:
-        return cloud
-
-    z = pts[:, 2]
-    low_mask = z <= (ground_z + keep_below)
-    mid_mask = (~low_mask) & (z <= (ground_z + drop_above))
-    # high points beyond drop_above are discarded
-
-    parts: list[o3d.geometry.PointCloud] = []
-    if np.any(low_mask):
-        parts.append(cloud.select_by_index(np.where(low_mask)[0].tolist()))
-
-    if np.any(mid_mask):
-        high = cloud.select_by_index(np.where(mid_mask)[0].tolist())
-        if ceiling_voxel > 0:
-            high = high.voxel_down_sample(ceiling_voxel)
-        parts.append(high)
-
-    if not parts:
-        return o3d.geometry.PointCloud()
-    out = parts[0]
-    for p in parts[1:]:
-        out += p
-    return out
 
 
 def segment(
@@ -92,12 +49,9 @@ def segment(
     max_angle_deg: float,
     max_height: float,
     min_obstacle_height: float,
-    keep_below: float,
-    ceiling_voxel: float,
-    drop_above: float,
     ransac_n: int,
     num_iterations: int,
-) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud, float]:
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
     if voxel > 0:
         cloud = cloud.voxel_down_sample(voxel)
 
@@ -131,31 +85,17 @@ def segment(
 
     ground = cloud.select_by_index(inliers)
     obstacle = cloud.select_by_index(inliers, invert=True)
-    ground_z = float(np.median(np.asarray(ground.points)[:, 2]))
 
     # Distance of each obstacle point to the fitted plane (signed)
     if len(obstacle.points) > 0 and min_obstacle_height > 0:
         op = np.asarray(obstacle.points)
         denom = np.sqrt(a * a + b * b + c * c) + 1e-12
         dist = (a * op[:, 0] + b * op[:, 1] + c * op[:, 2] + d) / denom
+        # Keep points clearly above (or below) the ground plane
         mask = np.abs(dist) >= min_obstacle_height
         obstacle = obstacle.select_by_index(np.where(mask)[0].tolist())
 
-    n_before = len(obstacle.points)
-    obstacle = thin_high_points(
-        obstacle,
-        ground_z=ground_z,
-        keep_below=keep_below,
-        ceiling_voxel=ceiling_voxel,
-        drop_above=drop_above,
-    )
-    n_after = len(obstacle.points)
-    print(
-        f"[seg] obstacle height thin: {n_before} -> {n_after} "
-        f"(keep_below={keep_below}m ceiling_voxel={ceiling_voxel}m drop_above={drop_above}m "
-        f"ground_z={ground_z:.3f})"
-    )
-    return ground, obstacle, ground_z
+    return ground, obstacle
 
 
 def main() -> int:
@@ -176,7 +116,7 @@ def main() -> int:
     ap.add_argument(
         "--max-height",
         type=float,
-        default=2.4,
+        default=3.0,
         help="drop points higher than p5(z)+max_height before fit (m); 0=off",
     )
     ap.add_argument(
@@ -184,24 +124,6 @@ def main() -> int:
         type=float,
         default=0.12,
         help="obstacle points closer than this to plane are dropped (m)",
-    )
-    ap.add_argument(
-        "--keep-below",
-        type=float,
-        default=1.8,
-        help="keep full obstacle density below ground_z+keep_below (m); walls at robot height",
-    )
-    ap.add_argument(
-        "--ceiling-voxel",
-        type=float,
-        default=0.40,
-        help="voxel size for points between keep_below and drop_above (m); larger=thinner ceiling",
-    )
-    ap.add_argument(
-        "--drop-above",
-        type=float,
-        default=2.4,
-        help="drop all obstacle points above ground_z+drop_above (m)",
     )
     ap.add_argument("--ransac-n", type=int, default=3)
     ap.add_argument("--iterations", type=int, default=2000)
@@ -219,16 +141,13 @@ def main() -> int:
         return 1
     print(f"[seg] loaded {n0} points from {inp}")
 
-    ground, obstacle, _ground_z = segment(
+    ground, obstacle = segment(
         cloud,
         voxel=args.voxel,
         distance=args.distance,
         max_angle_deg=args.max_angle,
         max_height=args.max_height,
         min_obstacle_height=args.min_obstacle_height,
-        keep_below=args.keep_below,
-        ceiling_voxel=args.ceiling_voxel,
-        drop_above=args.drop_above,
         ransac_n=args.ransac_n,
         num_iterations=args.iterations,
     )
@@ -240,14 +159,6 @@ def main() -> int:
     save_xyz_pcd(o_path, np.asarray(obstacle.points))
     print(f"[seg] ground   {len(ground.points)} -> {g_path}")
     print(f"[seg] obstacle {len(obstacle.points)} -> {o_path}")
-
-    oz = np.asarray(obstacle.points)[:, 2] if len(obstacle.points) else np.array([])
-    if oz.size:
-        print(
-            f"[seg] obstacle z: [{oz.min():.2f},{oz.max():.2f}] "
-            f"above 1.8m={(oz > (float(np.median(np.asarray(ground.points)[:, 2])) + 1.8)).sum()} "
-            f"above 2.4m={(oz > (float(np.median(np.asarray(ground.points)[:, 2])) + 2.4)).sum()}"
-        )
     return 0
 
 
