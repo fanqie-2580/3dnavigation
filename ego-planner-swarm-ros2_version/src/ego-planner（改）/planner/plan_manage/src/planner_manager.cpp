@@ -380,14 +380,6 @@ namespace ego_planner
 
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
-    // Match latest SCAN: initControlPoints A* failure only means rebound guides are
-    // incomplete; still run BsplineOptimizeTrajRebound and let the 2/3 occupancy check
-    // decide success/failure (SCAN planner_manager does not abort here).
-    if (bspline_optimizer_->initControlPointsFailed())
-    {
-      RCLCPP_WARN(rclcpp::get_logger("planner_manager"),
-                  "[EGO] initControlPoints A* incomplete; continue rebound optimize like SCAN.");
-    }
     // 计算时间差并更新时间
     auto now = rclcpp::Clock().now();
     t_init = now - t_start;
@@ -454,7 +446,7 @@ namespace ego_planner
       cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
-      // Match SCAN: do not publish/display a failed/colliding control-point set.
+      visualization_->displayOptimalList(ctrl_pts, 0);
       continous_failures_count_++;
       return false;
     }

@@ -532,7 +532,6 @@ namespace ego_planner
   // 初始化控制点
   std::vector<std::pair<int, int>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
-    init_control_points_failed_ = false;
 
     if (flag_first_init)
     {
@@ -629,7 +628,6 @@ namespace ego_planner
         {
           RCLCPP_WARN(rclcpp::get_logger("initControlPoints"),
                       "A-star path has less than two points.");
-          init_control_points_failed_ = true;
           return {};
         }
         a_star_pathes.push_back(path);
@@ -637,7 +635,6 @@ namespace ego_planner
       else
       {
         RCLCPP_ERROR(rclcpp::get_logger("initControlPoints"), "A-star search failed.");
-        init_control_points_failed_ = true;
         return {};
       }
     }
@@ -1462,8 +1459,6 @@ namespace ego_planner
         }
         else
         {
-          // Match SCAN: drop this collision segment and keep optimizing with whatever
-          // rebound guides remain instead of hard-aborting the whole plan.
           RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "a star error");
           segment_ids.erase(segment_ids.begin() + i);
           i--;
@@ -1483,14 +1478,6 @@ namespace ego_planner
       /*** Assign parameters to each segment ***/
       for (size_t i = 0; i < segment_ids.size(); ++i)
       {
-        // Match SCAN: skip desynced / empty A* paths instead of aborting.
-        if (i >= a_star_pathes.size() || a_star_pathes[i].size() < 2)
-        {
-          RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"),
-                      "Skip invalid A-star path while assigning rebound directions.");
-          continue;
-        }
-
         // step 1
         for (int j = segment_ids[i].first; j <= segment_ids[i].second; ++j)
           cps_.flag_temp[j] = false;
@@ -1701,7 +1688,6 @@ namespace ego_planner
           success = false;
           restart_nums++;
           initControlPoints(cps_.points, false);
-          // Match SCAN: keep optimizing even if A* rebound guides are incomplete.
           new_lambda2_ *= 2; // 提高规避权重
 
           if (verbose_rebound_log_)
@@ -1719,10 +1705,7 @@ namespace ego_planner
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
         // 计算时间步长
-        // Match SCAN: only check the closest 2/3 of the local trajectory.
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        if (!(t_step > 0.0) || !std::isfinite(t_step))
-          t_step = grid_map_->getResolution();
         for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
         {
           const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
@@ -1730,9 +1713,15 @@ namespace ego_planner
           flag_occ = footprintOccupied(position, estimateSegmentYaw(position, next_position));
           if (flag_occ)
           {
+            // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+
             // 如果在前三个控制点范围内检测到了碰撞则视为不可行
             if (t <= bspline_interval_) // First 3 control points in obstacles!
             {
+              // cout << cps_.points.col(1).transpose() << "\n"
+              //      << cps_.points.col(2).transpose() << "\n"
+              //      << cps_.points.col(3).transpose() << "\n"
+              //      << cps_.points.col(4).transpose() << endl;
               RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
               return false;
             }
@@ -1803,7 +1792,6 @@ namespace ego_planner
         {
           restart_nums++;
           initControlPoints(cps_.points, false);
-          // Match SCAN rebound_optimize restart: raise lambda and keep iterating.
           new_lambda2_ *= 2;
 
           if (verbose_rebound_log_)
@@ -1879,15 +1867,21 @@ namespace ego_planner
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
       double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
-      if (!(t_step > 0.0) || !std::isfinite(t_step))
-        t_step = grid_map_->getResolution();
-      // Match SCAN: only validate the closest 2/3 after refine.
       for (double t = tm; t < tmp * 2.0 / 3.0; t += t_step)
       {
         const Eigen::Vector3d position = traj.evaluateDeBoorT(t);
         const Eigen::Vector3d next_position = traj.evaluateDeBoorT(std::min(tmp, t + t_step));
         if (footprintOccupied(position, estimateSegmentYaw(position, next_position)))
         {
+          // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+
+          // 将ref_pts存储为矩阵形式
+          Eigen::MatrixXd ref_pts(ref_pts_.size(), 3);
+          for (size_t i = 0; i < ref_pts_.size(); i++)
+          {
+            ref_pts.row(i) = ref_pts_[i].transpose();
+          }
+
           flag_safe = false;
           break;
         }

@@ -300,9 +300,6 @@ GridMap::FootprintCollisionResult GridMap::checkFootprint(
     return result;
   }
 
-  // Match SCAN getInflateOccupancy(): only sample the twin-cylinder centers at the
-  // trajectory height against occupancy_buffer_inflate_ (robot radius already baked
-  // into XY inflation / double_cylinder_radius).
   const Eigen::Vector3d heading(std::cos(body_yaw), std::sin(body_yaw), 0.0);
   const Eigen::Vector3d centers[2] = {
       body_position + mp_.footprint_offset_ * heading,
