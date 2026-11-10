@@ -146,12 +146,13 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'input_topic': '/odin1/cloud_raw',
-                    # L2 input: ground-only (Plan A). Full cloud optional on *_full.
+                    # Full Odin cloud for L2 + densify (ground-only backup:
+                    # launch/mid360_odin1_multi_ground_only.launch.py).
                     'output_topic': '/odin1/cloud_raw_ds',
                     'voxel_size': float(
                         context.launch_configurations.get('odin_voxel', '0.08')
                     ),
-                    'max_points': 12000,
+                    'max_points': 20000,
                     'min_confidence': 30.0,
                     'restamp_from_odom': True,
                     'one_cloud_per_odom': True,
@@ -163,13 +164,13 @@ def generate_launch_description():
                     'mid_restamp_max_dt': 0.40,
                     'max_cloud_age_sec': 1.50,
                     'fallback_period': 0.1,
-                    'ground_only': True,
+                    'ground_only': False,
                     'ground_topic': '/odin1/cloud_ground',
-                    'publish_ground_topic': True,
-                    'publish_full_topic': '/odin1/cloud_raw_ds_full',
+                    # Skip RANSAC entirely when not keeping ground-only.
+                    'publish_ground_topic': False,
+                    'publish_full_topic': '',
                     'ground_distance': 0.08,
                     'ground_max_angle_deg': 25.0,
-                    # RANSAC was ~2 cores and added visible Odin lag; keep light.
                     'ground_ransac_iters': 20,
                     'ground_min_inliers': 60,
                     'ground_fit_z_span': 1.5,
@@ -270,8 +271,8 @@ def generate_launch_description():
                     name='odin_mid_timed_project',
                     output='screen',
                     parameters=[{
-                        # Plan A step2: project ground-only (already in odin_lidar frame).
-                        'cloud_topic': '/odin1/cloud_ground',
+                        # Full Odin cloud (lidar frame from downsample bridge).
+                        'cloud_topic': '/odin1/cloud_raw_ds',
                         'out_topic': '/odin1/cloud_in_map',
                         'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                         'odin_odom_topic': '/odin1/odometry',
@@ -313,10 +314,10 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
-                        # CT-LIO path keeps align_only TF; B1 densifies ground with Odin odom.
+                        # CT-LIO path keeps align_only TF; B1 densifies full Odin with Odin odom.
                         'align_only': use_ct,
                         'cloud_topic': (
-                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_ground'
+                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw_ds'
                         ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
