@@ -55,17 +55,22 @@ sleep 2
 
 SHARE_LAUNCH=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/install/open3d_loc/share/open3d_loc/launch
 mkdir -p "$SHARE_LAUNCH"
-cp -f /home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/open3d_loc/launch/localization_3d_odin1.launch.py \
-  "$SHARE_LAUNCH/"
+SRC_LAUNCH=/home/ll/FAST_LIO_LOCALIZATION_HUMANOID-humble/open3d_loc/launch/localization_3d_odin1.launch.py
+# Ignore when install share is the same inode/symlink as source (cp -f would fail under set -e)
+if [[ "$(readlink -f "$SRC_LAUNCH")" != "$(readlink -f "$SHARE_LAUNCH/localization_3d_odin1.launch.py" 2>/dev/null || true)" ]]; then
+  cp -f "$SRC_LAUNCH" "$SHARE_LAUNCH/" || true
+fi
 
 nohup ros2 launch open3d_loc localization_3d_odin1.launch.py \
   map_file:="$MAP" \
   localization_rviz:=true \
   > /tmp/odin1_localization.log 2>&1 &
 sleep 8
-# Same continuous Odin odom as mapping: force map≡odom (ICP corridor slide otherwise)
-python3 "$ODIN_NAV/scripts/odin1_reset_odom2map_identity.py" \
-  > /tmp/odin1_reset_o2m.log 2>&1 || true
+# Jetson saved map ≠ current dock odom origin — publish aligned /initialpose if available
+if [[ -f /tmp/odin1_global_align.json ]]; then
+  python3 "$ODIN_NAV/scripts/odin1_publish_initialpose.py" \
+    > /tmp/odin1_publish_initialpose.log 2>&1 || true
+fi
 
 # 3) DDDMR docker
 if ! docker ps --format '{{.Names}}' | grep -qx dddmr_dev; then
@@ -112,6 +117,7 @@ nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
   reference_path_topic:=/ego_repaired_global_path \
+  reference_path_z_offset:=0.4 \
   > /tmp/ego_odin1_local.log 2>&1 &
 sleep 6
 

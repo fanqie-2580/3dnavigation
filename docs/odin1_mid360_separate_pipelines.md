@@ -248,7 +248,11 @@ nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   odom_topic:=/baselink2map \
   cloud_topic:=/cloud_registered_1 \
   reference_path_topic:=/ego_repaired_global_path \
+  reference_path_z_offset:=0.4 \
   > /tmp/ego_odin1_local.log 2>&1 &
+
+# reference_path_z_offset:=0.4：全局路径 Z 来自地面分割点，抬到机身规划高度，
+# 避免 EGO checkFootprint 在地面膨胀层里把目标判 occupied 并 truncate。
 
 source /home/ll/unitree_ros2/setup.sh
 source /home/ll/ros_ws/install/setup.bash
