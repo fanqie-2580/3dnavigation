@@ -155,7 +155,7 @@ Visualization Manager:
             Durability Policy: Volatile
             Filter size: 10
             History Policy: Keep Last
-            Reliability Policy: Best Effort
+            Reliability Policy: Reliable
             Value: /grid_map/occupancy
           Use Fixed Frame: true
           Use rainbow: false
@@ -189,7 +189,7 @@ Visualization Manager:
             Durability Policy: Volatile
             Filter size: 10
             History Policy: Keep Last
-            Reliability Policy: Best Effort
+            Reliability Policy: Reliable
             Value: /drone_0_grid/grid_map/occupancy_inflate
           Use Fixed Frame: true
           Use rainbow: false
