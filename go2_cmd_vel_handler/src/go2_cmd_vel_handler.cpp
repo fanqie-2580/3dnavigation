@@ -73,9 +73,10 @@ public:
 
         
 
-        // 启动时自动站立
-
+        // Stand up, then enter BalanceStand so subsequent Move(vx,vy,vyaw) is accepted.
         send_recovery();
+        balance_timer_ = this->create_wall_timer(
+            1500ms, std::bind(&Go2CmdVelBridge::send_balance_once, this));
 
     }
 
@@ -207,6 +208,17 @@ private:
         sport_req_.RecoveryStand(req);
     }
 
+    void send_balance_once()
+    {
+        if (balance_timer_) {
+            balance_timer_->cancel();
+            balance_timer_.reset();
+        }
+        RCLCPP_INFO(this->get_logger(), "Sending BalanceStand command...");
+        unitree_api::msg::Request req;
+        sport_req_.BalanceStand(req);
+    }
+
 
 
     void send_stop()
@@ -241,6 +253,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_state_pub_;
 
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr balance_timer_;
 
 
 
