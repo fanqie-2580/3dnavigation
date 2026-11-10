@@ -47,6 +47,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx dddmr_dev; then
   sleep 2
 fi
 
+# Kill by PID only — pkill -f matches this bash -lc cmdline and self-kills.
 docker exec dddmr_dev bash -lc '
   export DISPLAY=:1 QT_X11_NO_MITSHM=1
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -55,8 +56,10 @@ docker exec dddmr_dev bash -lc '
   source /opt/ros/humble/setup.bash
   cd /root/dddmr_ws
   [ -f install/setup.bash ] && source install/setup.bash
-  pkill -f dddmr_global_ego_docker 2>/dev/null || true
-  pkill -f "global_planner_node|mcl_feature|pcl_publisher" 2>/dev/null || true
+  self=$$
+  for pid in $(pgrep -f "dddmr_global_ego_docker.launch.py|global_planner_node|mcl_feature|pcl_publisher|p2p_move_base_localization.rviz" || true); do
+    if [ "$pid" != "$self" ]; then kill "$pid" 2>/dev/null || true; fi
+  done
   sleep 1
   nohup ros2 launch p2p_move_base dddmr_global_ego_docker.launch.py \
     odom_topic:=/baselink2map \
@@ -71,8 +74,16 @@ docker exec dddmr_dev bash -lc '
   echo DOCKER_MID_NAV_STARTED
 '
 
-# 4) EGO Mid360 only
+# 4) EGO Mid360 only — must not inherit Odin1 (same .so names, ABI mismatch → SIGSEGV)
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH || true
+export LD_LIBRARY_PATH=""
+set +u
+source /opt/ros/humble/setup.bash
 source /home/ll/ego-planner-swarm-ros2_version/install/setup.bash
+# Guard: refuse to start if Odin paths leaked back in
+case ":${LD_LIBRARY_PATH}:" in
+  *":/home/ll/ego-planner-swarm-odin1/"*) echo "ERROR: Odin1 libs in LD_LIBRARY_PATH; abort Mid EGO"; exit 1 ;;
+esac
 nohup ros2 launch ego_planner dddmr_reference_tracking.launch.py \
   use_rviz:=true \
   odom_topic:=/baselink2map \
