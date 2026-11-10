@@ -1462,11 +1462,12 @@ namespace ego_planner
         }
         else
         {
-          // Match SCAN: drop this collision segment and keep optimizing with whatever
-          // rebound guides remain instead of hard-aborting the whole plan.
-          RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "a star error");
-          segment_ids.erase(segment_ids.begin() + i);
-          i--;
+          // Do not drop the colliding segment: that lets the optimizer keep a
+          // trajectory through inflate (seen as "no avoidance" in RViz).
+          RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"),
+                       "a star error; reject plan instead of ignoring collision");
+          force_stop_type_ = STOP_FOR_ERROR;
+          return false;
         }
       }
 
