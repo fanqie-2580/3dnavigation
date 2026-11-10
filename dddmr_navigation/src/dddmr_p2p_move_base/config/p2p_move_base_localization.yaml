@@ -408,21 +408,20 @@ ego_reference_path_provider:
     dynamic_layer_name: "lidar"
     repair_dynamic_blockage: true
     repair_soft_terrain: true
-    # false: do not feed blocked original path to EGO (avoids driving through inflate)
-    publish_original_when_repair_fails: false
-    enable_stop_prefix: true
+    publish_original_when_repair_fails: true
+    enable_stop_prefix: false
     soft_terrain_repair_min_cost: 0.25
     soft_terrain_repair_min_improvement: 0.20
     path_soft_cost_sample_step: 0.10
     soft_terrain_cost_weight: 1.0
     publish_frequency: 2.0
-    repair_window_distance: 6.0
-    rejoin_search_distance: 12.0
+    repair_window_distance: 5.0
+    rejoin_search_distance: 8.0
     rejoin_candidate_step: 0.5
     edge_check_sample_step: 0.10
     min_rejoin_distance_after_block: 1.0
     ground_lookup_radius: 0.35
-    min_clearance_margin: 0.05
+    min_clearance_margin: 0.0
     no_support_block_distance: 0.40
     min_stop_path_distance: 0.25
     min_publish_interval: 0.8

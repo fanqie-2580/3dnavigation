@@ -1118,25 +1118,6 @@ void EgoReferencePathProvider::publishLoop()
       publishPath(stop_path, OutputMode::StopBeforeBlock, &blockage);
       return;
     }
-
-    // Fallback: hold at robot so EGO does not keep tracking a stale blocked path.
-    stop_path.header = source_path.header;
-    stop_path.header.stamp = now();
-    if (stop_path.header.frame_id.empty() && perception_3d_ros_)
-      stop_path.header.frame_id = perception_3d_ros_->getGlobalUtils()->getGblFrame();
-    geometry_msgs::msg::PoseStamped hold = robot_pose;
-    hold.header = stop_path.header;
-    stop_path.poses.push_back(hold);
-    stop_path.poses.push_back(hold);
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "Repair failed and no safe prefix; publishing hold-in-place stop path. blocked=[%.2f, %.2f, %.2f] reason=%s",
-      blockage.blocked_pose.pose.position.x,
-      blockage.blocked_pose.pose.position.y,
-      blockage.blocked_pose.pose.position.z,
-      blockage.reason.c_str());
-    publishPath(stop_path, OutputMode::StopBeforeBlock, &blockage);
-    return;
   }
 
   RCLCPP_WARN_THROTTLE(
