@@ -518,32 +518,42 @@ class OdinIndependentAccum(Node):
         return best.copy()
 
     def _xyz_stride(self, msg: PointCloud2) -> np.ndarray:
-        offs = {f.name: f.offset for f in msg.fields}
+        """Vectorized XYZ extract — Python per-point unpack was a major lag source."""
+        offs = {f.name: (f.offset, f.datatype) for f in msg.fields}
         if not all(k in offs for k in ('x', 'y', 'z')):
             return np.zeros((0, 3), dtype=np.float64)
-        has_conf = 'confidence' in offs
-        pts: list[list[float]] = []
-        n = msg.width * msg.height
-        k = 0
-        for i in range(n):
-            b = i * msg.point_step
-            x, y, z = struct.unpack_from('fff', msg.data, b + offs['x'])
-            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
-                continue
-            if has_conf and self.min_confidence > 0:
-                # confidence often uint8/uint16/float — try float then u8
-                try:
-                    conf = struct.unpack_from('f', msg.data, b + offs['confidence'])[0]
-                except Exception:
-                    conf = float(msg.data[b + offs['confidence']])
-                if conf < self.min_confidence:
-                    continue
-            if (not self.cloud_already_in_odom) and (x * x + y * y + z * z) < self.blind2:
-                continue
-            if (k % self.stride) == 0:
-                pts.append([x, y, z])
-            k += 1
-        return np.asarray(pts, dtype=np.float64)
+        n = int(msg.width) * int(msg.height)
+        if n <= 0:
+            return np.zeros((0, 3), dtype=np.float64)
+        step = int(msg.point_step)
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        if raw.size < n * step:
+            n = raw.size // step
+        if n <= 0:
+            return np.zeros((0, 3), dtype=np.float64)
+        arr = raw[: n * step].reshape(n, step)
+
+        def col_f32(name: str) -> np.ndarray:
+            o = offs[name][0]
+            return arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+
+        xyz = np.column_stack([col_f32('x'), col_f32('y'), col_f32('z')]).astype(np.float64)
+        keep = np.isfinite(xyz).all(axis=1)
+        if 'confidence' in offs and self.min_confidence > 0:
+            o, dt = offs['confidence']
+            if dt == 7:  # FLOAT32
+                conf = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+            elif dt == 4:  # UINT16
+                conf = arr[:, o : o + 2].copy().view(np.uint16).reshape(-1).astype(np.float32)
+            else:
+                conf = arr[:, o].astype(np.float32)
+            keep &= conf >= float(self.min_confidence)
+        if not self.cloud_already_in_odom and self.blind2 > 0.0:
+            keep &= (xyz[:, 0] ** 2 + xyz[:, 1] ** 2 + xyz[:, 2] ** 2) >= self.blind2
+        xyz = xyz[keep]
+        if self.stride > 1 and len(xyz) > 0:
+            xyz = xyz[:: int(self.stride)]
+        return xyz
 
     def on_cloud(self, msg: PointCloud2) -> None:
         arr = self._xyz_stride(msg)

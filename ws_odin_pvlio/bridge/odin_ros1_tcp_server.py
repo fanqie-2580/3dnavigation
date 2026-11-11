@@ -92,7 +92,11 @@ class ClientHub(object):
     def __init__(self):
         self._lock = threading.Lock()
         self._clients = []
-        self._q = queue.Queue(maxsize=500)
+        # Small queue for imu/odom. Clouds use a single latest-slot so a slow
+        # TCP link never ships a backlog of stale clouds behind IMU floods.
+        self._q = queue.Queue(maxsize=64)
+        self._latest_cloud = None
+        self._cloud_lock = threading.Lock()
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._writer.start()
 
@@ -101,8 +105,11 @@ class ClientHub(object):
             self._clients.append(conn)
         print("[bridge-server] client +1 total=%d" % len(self._clients))
 
-    def enqueue(self, data, drop_old_same_type=None):
-        # drop_old_same_type unused; if full, drop oldest then put
+    def enqueue(self, data, is_cloud=False):
+        if is_cloud:
+            with self._cloud_lock:
+                self._latest_cloud = data
+            return
         try:
             self._q.put_nowait(data)
         except queue.Full:
@@ -117,28 +124,46 @@ class ClientHub(object):
 
     def _write_loop(self):
         while not rospy.is_shutdown():
+            # Send at most one latest cloud, then flush imu/odom. A pure
+            # "cloud-first continue" starved odometry and broke unproject on
+            # Jetson (skip_unproj climbed while odin_odom barely increased).
+            cloud = None
+            with self._cloud_lock:
+                if self._latest_cloud is not None:
+                    cloud = self._latest_cloud
+                    self._latest_cloud = None
+            if cloud is not None:
+                self._broadcast(cloud)
+            drained = 0
             try:
-                data = self._q.get(timeout=0.5)
+                while drained < 32:
+                    data = self._q.get_nowait()
+                    self._broadcast(data)
+                    drained += 1
             except queue.Empty:
-                continue
-            dead = []
+                pass
+            if cloud is None and drained == 0:
+                time.sleep(0.005)
+
+    def _broadcast(self, data):
+        dead = []
+        with self._lock:
+            clients = list(self._clients)
+        for c in clients:
+            try:
+                c.sendall(data)
+            except Exception:
+                dead.append(c)
+        if dead:
             with self._lock:
-                clients = list(self._clients)
-            for c in clients:
-                try:
-                    c.sendall(data)
-                except Exception:
-                    dead.append(c)
-            if dead:
-                with self._lock:
-                    for c in dead:
-                        if c in self._clients:
-                            self._clients.remove(c)
-                        try:
-                            c.close()
-                        except Exception:
-                            pass
-                print("[bridge-server] client -%d total=%d" % (len(dead), len(self._clients)))
+                for c in dead:
+                    if c in self._clients:
+                        self._clients.remove(c)
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            print("[bridge-server] client -%d total=%d" % (len(dead), len(self._clients)))
 
 
 def accept_loop(sock, hub):
@@ -184,17 +209,20 @@ def main():
     t.start()
 
     def on_imu(msg):
-        hub.enqueue(pack_frame(TYPE_IMU, encode_imu(msg)))
+        hub.enqueue(pack_frame(TYPE_IMU, encode_imu(msg)), is_cloud=False)
 
     def on_cloud(msg):
-        hub.enqueue(pack_frame(TYPE_CLOUD, encode_cloud(msg)))
+        hub.enqueue(pack_frame(TYPE_CLOUD, encode_cloud(msg)), is_cloud=True)
 
     def on_odom(msg):
-        hub.enqueue(pack_frame(TYPE_ODOM, encode_odom(msg)))
+        hub.enqueue(pack_frame(TYPE_ODOM, encode_odom(msg)), is_cloud=False)
 
-    rospy.Subscriber(imu_topic, Imu, on_imu, queue_size=200)
-    rospy.Subscriber(cloud_topic, PointCloud2, on_cloud, queue_size=2)
-    rospy.Subscriber(odom_topic, Odometry, on_odom, queue_size=50)
+    # Keep only the latest cloud to cut TCP backlog latency on Jetson.
+    # IMU queue small: high-rate IMU previously filled the shared send queue
+    # and delayed cloud frames by hundreds of ms.
+    rospy.Subscriber(imu_topic, Imu, on_imu, queue_size=10)
+    rospy.Subscriber(cloud_topic, PointCloud2, on_cloud, queue_size=1, buff_size=2**24)
+    rospy.Subscriber(odom_topic, Odometry, on_odom, queue_size=20)
     rospy.spin()
     sock.close()
 

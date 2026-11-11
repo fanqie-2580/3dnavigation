@@ -155,7 +155,10 @@ def generate_launch_description():
                     'max_points': 20000,
                     'min_confidence': 30.0,
                     'restamp_from_odom': True,
-                    'one_cloud_per_odom': True,
+                    # False: do not wait for Mid odom tick (was adding ~100ms+
+                    # and stacking behind slow Python pack). Still restamp to a
+                    # nearby Mid stamp when one exists within mid_restamp_max_dt.
+                    'one_cloud_per_odom': False,
                     # Restamp against Mid IEKF timebase (not system Odin /Odometry).
                     'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'odin_odom_topic': '/odin1/odometry',
@@ -163,7 +166,9 @@ def generate_launch_description():
                     # Looser gates: dock TCP + restamp leaves residual lag vs Mid.
                     'mid_restamp_max_dt': 0.40,
                     'max_cloud_age_sec': 1.50,
-                    'fallback_period': 0.1,
+                    # 50ms floor between pubs; with latest-only pending this is the
+                    # main rate limit (was 100ms and also processed backlogged frames).
+                    'fallback_period': 0.05,
                     'ground_only': False,
                     'ground_topic': '/odin1/cloud_ground',
                     # Skip RANSAC entirely when not keeping ground-only.

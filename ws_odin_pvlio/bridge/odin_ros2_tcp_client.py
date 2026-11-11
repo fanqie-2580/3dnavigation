@@ -115,11 +115,15 @@ class OdinBridgeClient(Node):
         self.declare_parameter("imu_topic", "/odin1/imu")
         self.declare_parameter("cloud_topic", "/odin1/cloud_slam")
         self.declare_parameter("odom_topic", "/odin1/odometry")
+        # Dock host clock is often wrong (e.g. stuck in 1970). Restamp with Jetson
+        # ROS time so Mid/Odin fusion age gates and restamp matching work.
+        self.declare_parameter("restamp_on_receive", True)
         self.host = self.get_parameter("server_host").value
         self.port = int(self.get_parameter("server_port").value)
         imu_topic = self.get_parameter("imu_topic").value
         cloud_topic = self.get_parameter("cloud_topic").value
         odom_topic = self.get_parameter("odom_topic").value
+        self.restamp_on_receive = bool(self.get_parameter("restamp_on_receive").value)
 
         self.pub_imu = self.create_publisher(Imu, imu_topic, 200)
         self.pub_cloud = self.create_publisher(PointCloud2, cloud_topic, 10)
@@ -129,8 +133,14 @@ class OdinBridgeClient(Node):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self.get_logger().info(
-            f"bridging tcp://{self.host}:{self.port} -> {imu_topic}, {cloud_topic}, {odom_topic}"
+            f"bridging tcp://{self.host}:{self.port} -> {imu_topic}, {cloud_topic}, {odom_topic} "
+            f"restamp={self.restamp_on_receive}"
         )
+
+    def _maybe_restamp(self, msg):
+        if self.restamp_on_receive:
+            msg.header.stamp = self.get_clock().now().to_msg()
+        return msg
 
     def destroy_node(self):
         self._stop = True
@@ -145,9 +155,15 @@ class OdinBridgeClient(Node):
                 time.sleep(1.0)
 
     def _session(self):
-        sock = socket.create_connection((self.host, self.port), timeout=5.0)
+        # Dense cloud_slam frames can exceed 5s on a congested dock link; a short
+        # socket timeout caused reconnect flaps that looked like Odin "delay".
+        sock = socket.create_connection((self.host, self.port), timeout=10.0)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(5.0)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        except Exception:
+            pass
+        sock.settimeout(60.0)
         self.get_logger().info(f"connected to {self.host}:{self.port}")
         try:
             while not self._stop and rclpy.ok():
@@ -158,11 +174,11 @@ class OdinBridgeClient(Node):
                 msg_type, length = struct.unpack("<BI", hdr)
                 payload = recv_exact(sock, length)
                 if msg_type == TYPE_IMU:
-                    self.pub_imu.publish(decode_imu(payload))
+                    self.pub_imu.publish(self._maybe_restamp(decode_imu(payload)))
                 elif msg_type == TYPE_CLOUD:
-                    self.pub_cloud.publish(decode_cloud(payload))
+                    self.pub_cloud.publish(self._maybe_restamp(decode_cloud(payload)))
                 elif msg_type == TYPE_ODOM:
-                    self.pub_odom.publish(decode_odom(payload))
+                    self.pub_odom.publish(self._maybe_restamp(decode_odom(payload)))
         finally:
             try:
                 sock.close()

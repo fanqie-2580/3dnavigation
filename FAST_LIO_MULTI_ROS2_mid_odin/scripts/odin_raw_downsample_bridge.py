@@ -304,6 +304,8 @@ class OdinRawDownsampleBridge(Node):
             self.create_subscription(
                 Odometry, self.get_parameter('odom_topic').value, self.on_mid_odom, reliable
             )
+        # Latest-cloud publisher: avoid processing a backlog of stale frames.
+        self.create_timer(0.02, self._poll_pending)
         self.create_timer(2.0, self._status)
         self.get_logger().info(
             f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
@@ -333,18 +335,22 @@ class OdinRawDownsampleBridge(Node):
             PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
             PointField(name='offset_time', offset=16, datatype=PointField.FLOAT32, count=1),
         ]
-        packed = b''.join(
-            struct.pack('<fffff', float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]))
-            for r in arr
-        )
+        # Vectorized pack — Python struct.pack-per-point was ~100ms on 8k pts.
+        if arr.size == 0:
+            packed = b''
+            width = 0
+        else:
+            pts = np.ascontiguousarray(arr[:, :5], dtype=np.float32)
+            packed = pts.tobytes(order='C')
+            width = int(pts.shape[0])
         out = PointCloud2()
         out.header = header
         out.height = 1
-        out.width = len(arr)
+        out.width = width
         out.fields = fields
         out.is_bigendian = False
         out.point_step = 20
-        out.row_step = 20 * len(arr)
+        out.row_step = 20 * width
         out.is_dense = True
         out.data = packed
         return out
@@ -395,46 +401,55 @@ class OdinRawDownsampleBridge(Node):
             if dt < best_dt:
                 best_dt = dt
                 best = T
-        if best is None or best_dt > self.odin_odom_max_dt:
-            return None
-        return best
+        if best is not None and best_dt <= self.odin_odom_max_dt:
+            return best
+        # Restamped cloud/odom can desync briefly after TCP stalls; better to
+        # use the newest odom than drop the whole scan (which looked like lag).
+        return self._odin_odom[-1][1]
 
     def _cloud_in_odom(self, msg: PointCloud2) -> bool:
         fid = (msg.header.frame_id or '').strip().lower()
         return fid in ('odom', 'map', 'odin_odom', 'odin_map')
 
     def cb(self, msg: PointCloud2) -> None:
+        """Keep only the newest cloud. Processing backlog was the main Odin lag
+        (~250ms): each frame ~80ms, so a queued 3-frame backlog looked like delay
+        vs Mid/robot motion. Overwrite pending and let the poll timer publish.
+        """
         self._n_cloud += 1
+        self._pending = msg
+
+    def _poll_pending(self) -> None:
+        msg = self._pending
+        if msg is None:
+            return
+        # Drop if we are still inside fallback_period (rate limit).
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        if self._last_pub_sec >= 0.0 and (now_sec - self._last_pub_sec) < self.fallback_period:
+            return
+        self._pending = None
+
         t_cloud = _stamp_sec(msg.header.stamp)
         if self._mid_stamps and self.max_cloud_age_sec > 0.0:
             newest_mid = self._mid_stamps[-1][0]
             if (newest_mid - t_cloud) > self.max_cloud_age_sec:
                 self._n_skip_age += 1
                 return
-        # Prefer Mid-odom gated publish when Mid is alive; otherwise publish on a
-        # fallback period so LIO can bootstrap / recover from Mid↔L2 deadlock.
+
         if (
             self.one_cloud_per_odom
             and self._mid_odom_stamp is not None
             and not self._mid_stalled()
         ):
-            self._pending = msg
-            if self._mid_odom_key is not None and self._last_pub_key != self._mid_odom_key:
-                if self._publish_from_msg(msg, None):
-                    self._last_pub_key = self._mid_odom_key
-                self._pending = None
+            # Align publish cadence to Mid odom when requested.
+            if self._mid_odom_key is None or self._last_pub_key == self._mid_odom_key:
+                self._pending = msg  # wait for a new Mid tick
+                return
+            if self._publish_from_msg(msg, None):
+                self._last_pub_key = self._mid_odom_key
             return
 
-        # No Mid odom yet, or Mid stalled: rate-limit by wall time / cloud stamp.
-        stamp = msg.header.stamp
-        pub_sec = _stamp_sec(stamp)
-        if self._last_pub_sec >= 0.0 and (pub_sec - self._last_pub_sec) < self.fallback_period:
-            now_sec = self.get_clock().now().nanoseconds * 1e-9
-            if (now_sec - self._last_pub_sec) < self.fallback_period:
-                self._pending = msg
-                return
-            stamp = self.get_clock().now().to_msg()
-        self._publish_from_msg(msg, stamp)
+        self._publish_from_msg(msg, msg.header.stamp)
 
     def _publish_from_msg(self, msg: PointCloud2, stamp) -> bool:
         t_cloud = _stamp_sec(msg.header.stamp)
@@ -470,9 +485,19 @@ class OdinRawDownsampleBridge(Node):
             xyz = (xyz - t) @ R
             arr = np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
 
-        if self.voxel > 0:
-            keys = np.floor(arr[:, :3] / self.voxel).astype(np.int32)
-            _, idx = np.unique(keys, axis=0, return_index=True)
+        # Pre-stride before unique: np.unique on 35k×3 int keys was ~100ms.
+        if len(arr) > self.max_points * 3:
+            step0 = int(np.ceil(len(arr) / float(self.max_points * 3)))
+            arr = arr[::step0]
+        if self.voxel > 0 and len(arr) > 0:
+            keys = np.ascontiguousarray(
+                np.floor(arr[:, :3] / self.voxel).astype(np.int32)
+            )
+            # Structured-view unique is much faster than unique(axis=0).
+            flat = keys.view(
+                [('', keys.dtype), ('', keys.dtype), ('', keys.dtype)]
+            ).reshape(-1)
+            _, idx = np.unique(flat, return_index=True)
             arr = arr[np.sort(idx)]
         if len(arr) > self.max_points:
             step = int(np.ceil(len(arr) / self.max_points))
