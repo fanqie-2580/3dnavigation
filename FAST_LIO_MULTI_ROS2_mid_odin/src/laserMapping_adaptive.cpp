@@ -200,8 +200,8 @@ inline double mid_pitch_from_rot(const M3D &R)
 
 inline bool odin_pose_update_allowed()
 {
-    // Hold Odin IEKF/densify on yaw-rate, pitch-rate, climb vz, or body pitch.
-    // Stairs often have small |ω| but large pitch/vz — yaw-only gate missed them.
+    // Full-time tight couple: gates <=0 disable holds (stairs/turns still update).
+    // Optional gates remain for experiments; production yaml sets all to 0.
     if (!lidar2_update_en)
         return false;
     if (lidar2_pose_gyr_gate > 0.0 && last_imu_gyr_norm >= lidar2_pose_gyr_gate)
@@ -214,6 +214,21 @@ inline bool odin_pose_update_allowed()
         std::fabs(last_mid_pitch) * 180.0 / M_PI >= lidar2_pitch_gate_deg)
         return false;
     return true;
+}
+
+// Never skip Stage2; inflate Odin cov under fast motion / climb so Mid stays stable.
+inline double odin_cov_scale_now()
+{
+    double s = std::max(1.0, lidar2_residual_cov_scale);
+    if (last_imu_gyr_norm >= 0.35)
+        s *= 2.0;
+    if (last_imu_gyr_pitch >= 0.20)
+        s *= 1.5;
+    if (std::fabs(last_mid_vz) >= 0.12)
+        s *= 1.5;
+    if (std::fabs(last_mid_pitch) * 180.0 / M_PI >= 10.0)
+        s *= 1.5;
+    return s;
 }
 
 // Gravity-leveled cloud_slam: apply CAD translation only for IEKF (no Ry(-13°)),
@@ -1625,13 +1640,15 @@ public:
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
+                 << " full_time_tight="
+                 << ((lidar2_pose_gyr_gate <= 0.0 && lidar2_pitch_gyr_gate <= 0.0 &&
+                      lidar2_vz_gate <= 0.0 && lidar2_pitch_gate_deg <= 0.0)
+                         ? "true"
+                         : "false")
                  << " gyr_gate=" << lidar2_pose_gyr_gate
-                 << (lidar2_pose_gyr_gate <= 0.0
-                         ? " (disabled → full-time tight coupling)"
-                         : " rad/s (hold Odin IEKF above)")
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
-                 << " max_odin_res=" << lidar2_max_residual << "m"
+                 << " (motion-inflated) max_odin_res=" << lidar2_max_residual << "m"
                  << " pitch_gyr=" << lidar2_pitch_gyr_gate
                  << " vz=" << lidar2_vz_gate
                  << " pitch_deg=" << lidar2_pitch_gate_deg
@@ -1829,14 +1846,13 @@ private:
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-                // Stage 2: soft Odin residuals when not climbing/turning.
+                // Stage 2: always soft-update with Odin when bundle+L2 synced.
                 const bool odin_ok = bundle_enabled && odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0;
                 if (odin_ok)
                 {
                     residual_select = 2;
-                    const double R_odin =
-                        LASER_POINT_COV * std::max(1.0, lidar2_residual_cov_scale);
+                    const double R_odin = LASER_POINT_COV * odin_cov_scale_now();
                     double solve2 = 0;
                     kf.update_iterated_dyn_share_modified(R_odin, solve2);
                     solve_H_time += solve2;
@@ -1906,17 +1922,9 @@ private:
             /*** Bundle update or async update ***/
             if (multi_lidar && lidar2_update_en)
             {
-                // Bundle only on flat/slow motion; stairs/pitch → Mid-only async.
-                if (!odin_pose_update_allowed())
-                {
-                    bundle_enabled = false;
-                    bundle_enabled_tic = 0;
-                }
-                else
-                {
-                    bundle_enabled = true;
-                    bundle_enabled_tic = 0;
-                }
+                // Full-time tight couple: always prefer Mid+Odin bundle when L2 on.
+                bundle_enabled = true;
+                bundle_enabled_tic = 0;
             }
             else if (multi_lidar && !lidar2_update_en)
             {

@@ -54,19 +54,18 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Two-stage gated tight coupling: Mid IEKF first, then soft Odin residuals
-      # (cov * lidar2_residual_cov_scale). Gravity-frame L2 uses translation-only.
+      # Full-time two-stage tight coupling: Mid IEKF first, then Odin residuals
+      # every synced bundle (stairs/turns included). Gates <=0 = never hold Odin.
+      # Safety = soft cov + residual clip + sync window (not Mid-only hold).
       lidar2_update_en: true
-      # Fast yaw: Mid-only (no Odin residuals / no bundle). <=0 = ignore.
-      lidar2_pose_gyr_gate: 0.35
-      # Stairs/slope: hold Odin when pitching, climbing, or body pitched.
-      lidar2_pitch_gyr_gate: 0.20
-      lidar2_vz_gate: 0.12
-      lidar2_pitch_gate_deg: 10.0
+      lidar2_pose_gyr_gate: 0.0
+      lidar2_pitch_gyr_gate: 0.0
+      lidar2_vz_gate: 0.0
+      lidar2_pitch_gate_deg: 0.0
       # Drop L2 frames whose stamp is farther than this from paired Mid scan.
       # Must match launch mid_restamp_max_dt (bridge skips L2 outside window).
       lidar2_max_sync_dt: 0.05
-      # Soft Odin stage: larger = weaker pull on Mid (25 = tighter flat-ground).
+      # Soft Odin stage base scale; motion inflates this in code (still updates).
       lidar2_residual_cov_scale: 25.0
       # Clip Odin point-to-plane |pd| above this (m) before Stage2 IEKF.
       lidar2_max_residual: 0.12
