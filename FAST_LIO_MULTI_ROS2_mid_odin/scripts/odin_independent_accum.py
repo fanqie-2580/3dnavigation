@@ -201,11 +201,6 @@ class OdinIndependentAccum(Node):
         # Skip warp under Mid noise when robot is still (else Odin shakes).
         self.declare_parameter('motion_sync_min_trans', 0.02)
         self.declare_parameter('motion_sync_min_rot_deg', 0.5)
-        # Mid IEKF still steps a few mm / a few tenths of a degree while the
-        # robot is still. Reprojecting every Odin scan with that pose makes the
-        # cloud shake. Keep the last pose until real motion leaves this band.
-        self.declare_parameter('pose_hold_trans_m', 0.025)
-        self.declare_parameter('pose_hold_yaw_deg', 0.8)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -256,10 +251,6 @@ class OdinIndependentAccum(Node):
         self.motion_sync_max_dt = float(self.get_parameter('motion_sync_max_dt').value)
         self.motion_sync_min_trans = float(self.get_parameter('motion_sync_min_trans').value)
         self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
-        self.pose_hold_trans_m = float(self.get_parameter('pose_hold_trans_m').value)
-        self.pose_hold_yaw_deg = float(self.get_parameter('pose_hold_yaw_deg').value)
-        self._held_mid_T: Optional[np.ndarray] = None
-        self._held_odin_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
@@ -437,28 +428,50 @@ class OdinIndependentAccum(Node):
             return None
         return best
 
-    def _stable_pose(self, T: np.ndarray, held_name: str) -> np.ndarray:
-        """Reuse the last pose while the change is inside odometry noise."""
-        held = getattr(self, held_name)
-        if held is None:
-            held = T.copy()
-            setattr(self, held_name, held)
-            return held
-        dyaw = self._horiz_yaw(T) - self._horiz_yaw(held)
-        while dyaw > math.pi:
-            dyaw -= 2.0 * math.pi
-        while dyaw < -math.pi:
-            dyaw += 2.0 * math.pi
-        dxyz = T[:3, 3] - held[:3, 3]
-        if (
-            float(np.linalg.norm(dxyz)) < self.pose_hold_trans_m
-            and abs(math.degrees(dyaw)) < self.pose_hold_yaw_deg
-        ):
-            self._n_motion_hold += 1
-            return held
-        held = T.copy()
-        setattr(self, held_name, held)
-        return held
+    def _pose_at(self, buf, t_query: float):
+        """Pose at t_query. Interpolate inside a short bracket, else nearest ≤50ms."""
+        if not buf:
+            return None
+        prev = None
+        nxt = None
+        best = None
+        best_dt = 1e9
+        for t, T in buf:
+            dt = abs(t - t_query)
+            if dt < best_dt:
+                best_dt = dt
+                best = (t, T)
+            if t <= t_query and (prev is None or t > prev[0]):
+                prev = (t, T)
+            if t >= t_query and (nxt is None or t < nxt[0]):
+                nxt = (t, T)
+        if prev is not None and nxt is not None and prev[0] != nxt[0]:
+            gap = nxt[0] - prev[0]
+            if gap <= 0.15:
+                a = (t_query - prev[0]) / gap
+                return self._lerp_se3(prev[1], nxt[1], a), 0.0
+        if best is not None and best_dt <= 0.05:
+            return best[1], best_dt
+        return None
+
+    @staticmethod
+    def _lerp_se3(T0: np.ndarray, T1: np.ndarray, a: float) -> np.ndarray:
+        T = np.eye(4, dtype=np.float64)
+        T[:3, 3] = (1.0 - a) * T0[:3, 3] + a * T1[:3, 3]
+        q0 = np.array(rot_to_quat(T0[:3, :3]), dtype=np.float64)
+        q1 = np.array(rot_to_quat(T1[:3, :3]), dtype=np.float64)
+        if float(np.dot(q0, q1)) < 0.0:
+            q1 = -q1
+        dot = float(np.clip(np.dot(q0, q1), -1.0, 1.0))
+        if dot > 0.9995:
+            q = q0 + a * (q1 - q0)
+            q = q / np.linalg.norm(q)
+        else:
+            th = math.acos(dot)
+            s = math.sin(th)
+            q = (math.sin((1.0 - a) * th) * q0 + math.sin(a * th) * q1) / s
+        T[:3, :3] = quat_to_rot(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+        return T
 
     def _warp_to_latest_mid(
         self, pts: np.ndarray, t_cloud: float
@@ -685,19 +698,19 @@ class OdinIndependentAccum(Node):
 
         if self.project_with_mid:
             t_cloud = stamp_sec(msg.header.stamp)
-            hit = self._nearest_mid_odom(t_cloud, max_dt=0.08)
-            if hit is None:
+            mid_hit = self._pose_at(self._mid_odom_buf, t_cloud)
+            if mid_hit is None:
                 self._n_skip_odom += 1
                 return
-            T_mid = self._stable_pose(hit[1], '_held_mid_T')
+            T_mid, dt_mid = mid_hit
             if self.cloud_already_in_odom:
-                # Odom-frame cloud. Unprojecting with the live Odin pose shakes
-                # the body cloud while the robot is still.
-                T_odin = self._nearest_odom(t_cloud, max_dt=0.08)
-                if T_odin is None:
+                odin_hit = self._pose_at(self._odom_buf, t_cloud)
+                if odin_hit is None:
                     self._n_skip_odom += 1
                     return
-                T_odin = self._stable_pose(T_odin, '_held_odin_T')
+                T_odin, dt_odin = odin_hit
+                self._last_sync_dt = max(dt_mid, dt_odin)
+                # p_odom = T_odin * T_imu_lidar * p_lidar, both poses at this stamp.
                 T_map = (
                     T_mid
                     @ self.T_body_odin_lidar
@@ -705,6 +718,7 @@ class OdinIndependentAccum(Node):
                     @ se3_inv(T_odin)
                 )
             else:
+                self._last_sync_dt = dt_mid
                 T_map = T_mid @ self.T_body_odin_lidar
             R, t = T_map[:3, :3], T_map[:3, 3]
             world = (arr @ R.T) + t
@@ -732,10 +746,6 @@ class OdinIndependentAccum(Node):
         # Use cloud stamp when it is on Jetson clock (restamp_on_receive);
         # otherwise fall back to "now - small lag" via ROS clock.
         t_cloud = stamp_sec(stamp)
-        now_ros = self.get_clock().now().nanoseconds * 1e-9
-        # If stamp looks like sensor epoch (far from now), use receive estimate.
-        if abs(now_ros - t_cloud) > 2.0:
-            t_cloud = now_ros - 0.05
         out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out, t_cloud)
         # Only retouch stamp when a real warp happened; otherwise keep cloud
         # stamp so stationary frames are bit-stable in time too.

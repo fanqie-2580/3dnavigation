@@ -351,8 +351,6 @@ def generate_launch_description():
                         'motion_sync_to_mid': False,
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
-                        'pose_hold_trans_m': 0.025,
-                        'pose_hold_yaw_deg': 0.8,
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],

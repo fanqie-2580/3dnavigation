@@ -297,8 +297,6 @@ class OdinRawDownsampleBridge(Node):
         self._last_n_l2 = 0
         self._last_mid_wall = -1.0
         self._last_viz_pub_sec = -1.0
-        self._stable_arr = None
-        self._stable_cen = None
         self._last_l2_match = '-'
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
@@ -616,14 +614,6 @@ class OdinRawDownsampleBridge(Node):
         if out_arr.size == 0 or len(out_arr) == 0:
             self._n_skip_ground += 1
             return False
-        # Voxel means hop inside an 8cm cell, so a still scene's centroid
-        # walks about 1cm. Keep the last cloud until the scene really moves.
-        cen = out_arr[:, :3].mean(axis=0)
-        if self._stable_cen is not None and float(np.linalg.norm(cen - self._stable_cen)) < 0.02:
-            out_arr = self._stable_arr
-        else:
-            self._stable_arr = out_arr
-            self._stable_cen = cen
 
         # Both streams are stamped on the Livox clock at the TCP client.
         # Copying a Mid header onto this cloud made /cloud_raw_ds seconds
