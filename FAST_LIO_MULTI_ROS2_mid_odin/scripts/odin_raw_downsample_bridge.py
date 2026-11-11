@@ -308,6 +308,13 @@ class OdinRawDownsampleBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
+        # Depth 1: a depth-20 queue + slow voxel kept republishing ~3s-old
+        # cloud_slam, so densify landed where the robot used to be.
+        cloud_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
         self.pub = self.create_publisher(PointCloud2, out, reliable)
         self.pub_ground = None
@@ -319,7 +326,7 @@ class OdinRawDownsampleBridge(Node):
         self.pub_l2 = None
         if self.l2_body_topic and self.l2_body_topic != out:
             self.pub_l2 = self.create_publisher(PointCloud2, self.l2_body_topic, reliable)
-        self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
+        self.sub = self.create_subscription(PointCloud2, inn, self.cb, cloud_qos)
         self.create_subscription(
             Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
         )
@@ -525,11 +532,11 @@ class OdinRawDownsampleBridge(Node):
         self._pending = None
         self._pending_wall = -1.0
 
-        # Age-gate by wall arrival (Livox stamp vs system restamp are not comparable).
-        if self.max_cloud_age_sec > 0.0 and wall_cloud > 0.0:
-            if (now_sec - wall_cloud) > self.max_cloud_age_sec:
-                self._n_skip_age += 1
-                return
+        # Drop scans that sat in the executor queue. Painting them stacks
+        # geometry from where the robot was, not where it is.
+        if wall_cloud > 0.0 and (now_sec - wall_cloud) > 0.35:
+            self._n_skip_age += 1
+            return
 
         if (
             self.one_cloud_per_odom
@@ -610,15 +617,16 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_ground += 1
             return False
 
-        # Match Mid for L2 IEKF only. Densify/raw main topic MUST keep geometry
-        # stamp — Mid-restamping made independent_accum look up Odin odom at the
-        # wrong time → map-frame Odin cloud shakes every frame.
+        # Main densify topic MUST keep Odin geometry/receive stamp.
+        # Mid-restamping odom-frame cloud_slam made /odin1/cloud_raw_ds ~1–2s
+        # behind /odin1/odometry (and Mid Livox stamps), so any stamp-paired
+        # path painted densify at the wrong pose. L2 body may still Mid-match.
         if stamp is None:
             stamp = msg.header.stamp
         geom_stamp = msg.header.stamp
         mid_match = self._match_mid_for_l2(t_cloud, wall_cloud) if self._mid_stamps else None
-        use_geom_for_main = (self._out_frame_id == 'odin_lidar')
-        if use_geom_for_main:
+        keep_odin_stamp = self._out_frame_id in ('odin_lidar', 'odom', 'map')
+        if keep_odin_stamp:
             viz_stamp = geom_stamp
         else:
             viz_stamp = stamp
@@ -637,13 +645,14 @@ class OdinRawDownsampleBridge(Node):
             nsec = int((viz_sec - sec) * 1e9)
             viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
         self._last_viz_pub_sec = viz_sec
-        self._last_pub_sec = time.time() if use_geom_for_main else viz_sec
+        # Same clock as _poll_pending (ROS). time.time() made the rate gate lie.
+        self._last_pub_sec = self.get_clock().now().nanoseconds * 1e-9
 
         header = Header()
         header.stamp = viz_stamp
         header.frame_id = self._out_frame_id
 
-        # Main topic: geometry stamp when lidar-frame (raw densify).
+        # Main topic: Odin stamp (lidar or odom-frame densify).
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:

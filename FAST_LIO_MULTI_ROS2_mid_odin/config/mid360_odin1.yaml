@@ -54,11 +54,12 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Scheme ② tight couple: Mid owns point IEKF; Odin /odometry soft pose-factor.
-      # Optional point Stage2 stays available via lidar2_point_update_en (default off).
-      lidar2_update_en: true
+      # Pose-factor off: Mid Livox stamps lag Jetson/Odin restamp by ~1.5s, so
+      # soft pose updates never match cleanly and Mid map thickens. Densify
+      # stays via independent_accum continuous yaw+xy (visual, not IEKF).
+      lidar2_update_en: false
       lidar2_point_update_en: false
-      lidar2_pose_factor_en: true
+      lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.12
       lidar2_pose_max_dt: 0.20
       odin_odom_topic: "/odin1/odometry"

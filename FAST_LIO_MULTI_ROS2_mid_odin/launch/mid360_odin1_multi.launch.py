@@ -343,7 +343,12 @@ def generate_launch_description():
                         # Mid IEKF map is gravity-aligned (floors level). Baking
                         # extrinsic Ry(-13°) into map←odin_map here re-tilts the
                         # already-level Odin cloud. Use yaw/xy lock only.
+                        # One-shot yaw+xy: accum lives in Odin odom; publish applies
+                        # fixed map←odin (continuous T used to bake voxels → wrong).
                         'align_mode': 'yaw',
+                        'align_continuous': False,
+                        'align_min_trans': 0.03,
+                        'align_min_rot_deg': 1.0,
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
                         # Off: Mid restamp/pose-factor motion sync made Odin map cloud shake.
