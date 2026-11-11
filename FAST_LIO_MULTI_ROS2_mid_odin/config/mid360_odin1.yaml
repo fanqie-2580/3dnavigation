@@ -54,10 +54,10 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Scheme ② tight couple: Mid owns point IEKF; Odin /odometry soft pose-factor.
-      # Optional point Stage2 stays available via lidar2_point_update_en (default off).
+      # USB host-time aligned: trial full point tight-couple (Mid+Odin residuals).
+      # Keep soft pose-factor; Odin points still do NOT insert into Mid ikd-tree.
       lidar2_update_en: true
-      lidar2_point_update_en: false
+      lidar2_point_update_en: true
       lidar2_pose_factor_en: true
       lidar2_pose_alpha: 0.12
       lidar2_pose_max_dt: 0.20
@@ -66,7 +66,9 @@
       lidar2_pitch_gyr_gate: 0.0
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
-      lidar2_max_sync_dt: 0.05
+      # Stamp match window; USB arrival lag ~120ms is OK if header stamps agree.
+      lidar2_max_sync_dt: 0.08
+      # Soft Odin point pull: large cov + residual clip to limit Mid twist.
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
       lidar2_map_insert_en: false
