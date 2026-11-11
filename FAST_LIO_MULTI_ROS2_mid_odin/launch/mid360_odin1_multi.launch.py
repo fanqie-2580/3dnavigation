@@ -327,7 +327,7 @@ def generate_launch_description():
                         # CT-LIO path keeps align_only TF; B1 densifies full Odin with Odin odom.
                         'align_only': use_ct,
                         'cloud_topic': (
-                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_l2_body'
+                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw_ds'
                         ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
@@ -337,7 +337,7 @@ def generate_launch_description():
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
                         # Body cloud × Mid pose at the same stamp. No one-shot world lock.
-                        'cloud_already_in_odom': False,
+                        'cloud_already_in_odom': True,
                         'project_with_mid': (not use_ct),
                         'publish_in_parent_frame': False,
                         'wait_align_for_parent': False,
@@ -351,6 +351,8 @@ def generate_launch_description():
                         'motion_sync_to_mid': False,
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
+                        'pose_hold_trans_m': 0.025,
+                        'pose_hold_yaw_deg': 0.8,
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],

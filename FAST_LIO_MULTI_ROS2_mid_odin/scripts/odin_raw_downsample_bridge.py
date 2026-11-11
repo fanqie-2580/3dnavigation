@@ -297,6 +297,8 @@ class OdinRawDownsampleBridge(Node):
         self._last_n_l2 = 0
         self._last_mid_wall = -1.0
         self._last_viz_pub_sec = -1.0
+        self._stable_arr = None
+        self._stable_cen = None
         self._last_l2_match = '-'
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
@@ -361,14 +363,19 @@ class OdinRawDownsampleBridge(Node):
             step0 = int(np.ceil(len(arr) / float(self.max_points * 3)))
             arr = arr[::step0]
         if self.voxel > 0 and len(arr) > 0:
-            keys = np.ascontiguousarray(
-                np.floor(arr[:, :3] / self.voxel).astype(np.int32)
-            )
-            flat = keys.view(
-                [('', keys.dtype), ('', keys.dtype), ('', keys.dtype)]
-            ).reshape(-1)
-            _, idx = np.unique(flat, return_index=True)
-            arr = arr[np.sort(idx)]
+            keys = np.floor(arr[:, :3] / self.voxel).astype(np.int64)
+            order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
+            keys = keys[order]
+            arr = arr[order]
+            if len(arr) == 1:
+                return arr
+            change = np.any(np.diff(keys, axis=0) != 0, axis=1)
+            starts = np.concatenate(([0], np.flatnonzero(change) + 1))
+            sums = np.add.reduceat(arr[:, :3].astype(np.float64), starts)
+            counts = np.diff(np.append(starts, len(arr))).astype(np.float64)
+            out = arr[starts].copy()
+            out[:, :3] = (sums / counts[:, None]).astype(arr.dtype)
+            arr = out
         if len(arr) > self.max_points:
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
@@ -609,6 +616,14 @@ class OdinRawDownsampleBridge(Node):
         if out_arr.size == 0 or len(out_arr) == 0:
             self._n_skip_ground += 1
             return False
+        # Voxel means hop inside an 8cm cell, so a still scene's centroid
+        # walks about 1cm. Keep the last cloud until the scene really moves.
+        cen = out_arr[:, :3].mean(axis=0)
+        if self._stable_cen is not None and float(np.linalg.norm(cen - self._stable_cen)) < 0.02:
+            out_arr = self._stable_arr
+        else:
+            self._stable_arr = out_arr
+            self._stable_cen = cen
 
         # Both streams are stamped on the Livox clock at the TCP client.
         # Copying a Mid header onto this cloud made /cloud_raw_ds seconds

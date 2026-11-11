@@ -201,6 +201,11 @@ class OdinIndependentAccum(Node):
         # Skip warp under Mid noise when robot is still (else Odin shakes).
         self.declare_parameter('motion_sync_min_trans', 0.02)
         self.declare_parameter('motion_sync_min_rot_deg', 0.5)
+        # Mid IEKF still steps a few mm / a few tenths of a degree while the
+        # robot is still. Reprojecting every Odin scan with that pose makes the
+        # cloud shake. Keep the last pose until real motion leaves this band.
+        self.declare_parameter('pose_hold_trans_m', 0.025)
+        self.declare_parameter('pose_hold_yaw_deg', 0.8)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -251,6 +256,10 @@ class OdinIndependentAccum(Node):
         self.motion_sync_max_dt = float(self.get_parameter('motion_sync_max_dt').value)
         self.motion_sync_min_trans = float(self.get_parameter('motion_sync_min_trans').value)
         self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
+        self.pose_hold_trans_m = float(self.get_parameter('pose_hold_trans_m').value)
+        self.pose_hold_yaw_deg = float(self.get_parameter('pose_hold_yaw_deg').value)
+        self._held_mid_T: Optional[np.ndarray] = None
+        self._held_odin_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
@@ -428,6 +437,29 @@ class OdinIndependentAccum(Node):
             return None
         return best
 
+    def _stable_pose(self, T: np.ndarray, held_name: str) -> np.ndarray:
+        """Reuse the last pose while the change is inside odometry noise."""
+        held = getattr(self, held_name)
+        if held is None:
+            held = T.copy()
+            setattr(self, held_name, held)
+            return held
+        dyaw = self._horiz_yaw(T) - self._horiz_yaw(held)
+        while dyaw > math.pi:
+            dyaw -= 2.0 * math.pi
+        while dyaw < -math.pi:
+            dyaw += 2.0 * math.pi
+        dxyz = T[:3, 3] - held[:3, 3]
+        if (
+            float(np.linalg.norm(dxyz)) < self.pose_hold_trans_m
+            and abs(math.degrees(dyaw)) < self.pose_hold_yaw_deg
+        ):
+            self._n_motion_hold += 1
+            return held
+        held = T.copy()
+        setattr(self, held_name, held)
+        return held
+
     def _warp_to_latest_mid(
         self, pts: np.ndarray, t_cloud: float
     ) -> Tuple[np.ndarray, Optional[object], float]:
@@ -592,7 +624,7 @@ class OdinIndependentAccum(Node):
         self._publish_align_tf(T_map_odinmap)
         self._aligned = True
 
-    def _nearest_odom(self, t_cloud: float) -> Optional[np.ndarray]:
+    def _nearest_odom(self, t_cloud: float, max_dt: Optional[float] = None) -> Optional[np.ndarray]:
         """Nearest by stamp. Prefer nearest over 'latest' when cloud is delayed."""
         if not self._odom_buf:
             return None
@@ -603,7 +635,8 @@ class OdinIndependentAccum(Node):
             if dt < best_dt:
                 best_dt = dt
                 best = T
-        if best is None or best_dt > self.odom_pair_max_dt:
+        limit = self.odom_pair_max_dt if max_dt is None else max_dt
+        if best is None or best_dt > limit:
             return None
         return best.copy()
 
@@ -651,12 +684,29 @@ class OdinIndependentAccum(Node):
             return
 
         if self.project_with_mid:
-            hit = self._nearest_mid_odom(stamp_sec(msg.header.stamp), max_dt=0.08)
+            t_cloud = stamp_sec(msg.header.stamp)
+            hit = self._nearest_mid_odom(t_cloud, max_dt=0.08)
             if hit is None:
                 self._n_skip_odom += 1
                 return
-            T_map_lidar = hit[1] @ self.T_body_odin_lidar
-            R, t = T_map_lidar[:3, :3], T_map_lidar[:3, 3]
+            T_mid = self._stable_pose(hit[1], '_held_mid_T')
+            if self.cloud_already_in_odom:
+                # Odom-frame cloud. Unprojecting with the live Odin pose shakes
+                # the body cloud while the robot is still.
+                T_odin = self._nearest_odom(t_cloud, max_dt=0.08)
+                if T_odin is None:
+                    self._n_skip_odom += 1
+                    return
+                T_odin = self._stable_pose(T_odin, '_held_odin_T')
+                T_map = (
+                    T_mid
+                    @ self.T_body_odin_lidar
+                    @ se3_inv(self.T_imu_lidar)
+                    @ se3_inv(T_odin)
+                )
+            else:
+                T_map = T_mid @ self.T_body_odin_lidar
+            R, t = T_map[:3, :3], T_map[:3, 3]
             world = (arr @ R.T) + t
             stamp = msg.header.stamp
         elif self.cloud_already_in_odom:
