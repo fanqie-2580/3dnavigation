@@ -1175,12 +1175,19 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
-        // Mid IEKF residuals are Mid-only. Odin (intensity>=100) must not pull the
-        // shared pose — restamped cloud_slam + mount extrinsic errors were twisting
-        // /cloud_registered. Odin still densifies ikdtree in map_incremental when
-        // odin_pose_update_allowed() (gated map-level tight coupling).
-        if (point_body.intensity >= kOdinIntensityTag ||
-            (!bundle_enabled && current_lidar_num == 2))
+        // True tight couple (gated): Odin residuals allowed only in bundle when
+        // odin_pose_update_allowed() (gyr + lidar2_update_en). Async Odin-only
+        // never updates Mid. Deskew/time-base fixes keep Mid from twisting.
+        const bool is_odin = point_body.intensity >= kOdinIntensityTag;
+        if (is_odin)
+        {
+            if (!bundle_enabled || !odin_pose_update_allowed())
+            {
+                point_selected_surf[i] = false;
+                continue;
+            }
+        }
+        else if (!bundle_enabled && current_lidar_num == 2)
         {
             point_selected_surf[i] = false;
             continue;
@@ -1208,12 +1215,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         VF(4) pabcd;
         point_selected_surf[i] = false;
-        if (esti_plane(pabcd, points_near, 0.1f))
+        // Odin: stricter plane fit so weak/misaligned L2 cannot dominate Mid.
+        const float plane_thr = is_odin ? 0.05f : 0.1f;
+        const float s_thr = is_odin ? 0.95f : 0.9f;
+        if (esti_plane(pabcd, points_near, plane_thr))
         {
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
             float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
 
-            if (s > 0.9)
+            if (s > s_thr)
             {
                 point_selected_surf[i] = true;
                 normvec->points[i].x = pabcd(0);
@@ -1790,26 +1800,19 @@ private:
             /*** Bundle update or async update ***/
             if (multi_lidar && lidar2_update_en)
             {
-                // Official adaptive: weak Mid features → bundle. Optional gyr gate
-                // (lidar2_pose_gyr_gate > 0) can still forbid bundle during fast yaw;
-                // gate <= 0 keeps full-time tight coupling (no Mid-only hold).
+                // Prefer Mid+Odin bundle whenever yaw-rate allows (true tight pair).
+                // Fast yaw → Mid-only async. If L2 buffer empty, sync falls back.
                 if (lidar2_pose_gyr_gate > 0.0 &&
                     last_imu_gyr_norm >= lidar2_pose_gyr_gate)
                 {
                     bundle_enabled = false;
                     bundle_enabled_tic = 0;
                 }
-                else if (feats_down_size < voxelized_pt_num_thres &&
-                         (double)effect_feat_num / feats_down_size < effect_pt_num_ratio_thres)
+                else
                 {
                     bundle_enabled = true;
                     bundle_enabled_tic = 0;
                 }
-                else if (bundle_enabled_tic > bundle_enabled_tic_thres)
-                {
-                    bundle_enabled = false;
-                }
-                bundle_enabled_tic++;
             }
             else if (multi_lidar && !lidar2_update_en)
             {
