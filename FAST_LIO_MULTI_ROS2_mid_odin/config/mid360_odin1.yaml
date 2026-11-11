@@ -53,9 +53,11 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # true: Odin (L2) residuals update IEKF + ikdtree (tight coupling).
-      # L2 input is /odin1/cloud_raw_ds (full cloud; ground-only launch kept as backup).
-      lidar2_update_en: true
+      # false: Odin only densifies / visualizes. Delayed TCP Odin must NOT update
+      # Mid IEKF — async L2 residuals smear Mid walls (MA-LIO/Autoware: sync or
+      # leave second lidar observation-only when clocks are not PTP-aligned).
+      # L2 input remains /odin1/cloud_raw_ds for optional future tight coupling.
+      lidar2_update_en: false
       # <=0: full-time tight coupling (Odin always in IEKF).
       lidar2_pose_gyr_gate: 0.0
 
