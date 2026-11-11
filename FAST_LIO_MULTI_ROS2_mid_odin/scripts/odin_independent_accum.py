@@ -174,6 +174,10 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('align_only', False)
         # true: cloud already in odom (cloud_slam / CT-LIO registered). false: raw × odom.
         self.declare_parameter('cloud_already_in_odom', True)
+        # true: lidar-frame cloud × Mid /Odometry at the same stamp × extrinsic.
+        # One-shot yaw lock cannot follow two odometries that drift apart, so
+        # later scans were voxelized away from the wall they belong to.
+        self.declare_parameter('project_with_mid', False)
         # After extrinsic lock, transform scans into parent_frame (Mid map) for B1 densify.
         self.declare_parameter('publish_in_parent_frame', False)
         # Hold publishing until align lock when projecting into parent (avoid smeared start).
@@ -231,6 +235,7 @@ class OdinIndependentAccum(Node):
         self.out_accum_topic = str(self.get_parameter('out_accum_topic').value)
         self.align_only = bool(self.get_parameter('align_only').value)
         self.cloud_already_in_odom = bool(self.get_parameter('cloud_already_in_odom').value)
+        self.project_with_mid = bool(self.get_parameter('project_with_mid').value)
         self.publish_in_parent_frame = bool(self.get_parameter('publish_in_parent_frame').value)
         self.wait_align_for_parent = bool(self.get_parameter('wait_align_for_parent').value)
         self.stride = max(1, int(self.get_parameter('stride').value))
@@ -303,11 +308,12 @@ class OdinIndependentAccum(Node):
             self.pub_scan = self.create_publisher(PointCloud2, self.out_scan_topic, 5)
             self.pub_accum = self.create_publisher(PointCloud2, self.out_accum_topic, 1)
         self._static_br = StaticTransformBroadcaster(self)
-        self._publish_identity_tf()
+        if not self.project_with_mid:
+            self._publish_identity_tf()
 
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, 50)
         # Always buffer Mid odom for motion sync (and one-shot align).
-        if self.align_to_mid_once or self.motion_sync_to_mid:
+        if self.align_to_mid_once or self.motion_sync_to_mid or self.project_with_mid:
             self.create_subscription(Odometry, self.mid_odom_topic, self.on_mid_odom, 50)
             if self.align_mode.startswith('icp') and not self.align_only:
                 self.create_subscription(
@@ -324,11 +330,11 @@ class OdinIndependentAccum(Node):
 
         self.get_logger().info(
             f'INDEPENDENT Odin: cloud={self.cloud_topic} odom={self.odom_topic} '
-            f'frame={self.map_frame} already_in_odom={self.cloud_already_in_odom} '
+            f'already_in_odom={self.cloud_already_in_odom} project_with_mid={self.project_with_mid} '
             f'align_only={self.align_only} align_mode={self.align_mode} '
             f'publish_in_parent={self.publish_in_parent_frame} '
             f'motion_sync_to_mid={self.motion_sync_to_mid} '
-            f'out_scan={self.out_scan_topic} (no Mid pose for points)'
+            f'out_scan={self.out_scan_topic}'
         )
 
     def _status(self) -> None:
@@ -341,6 +347,8 @@ class OdinIndependentAccum(Node):
         )
 
     def _output_frame(self) -> str:
+        if self.project_with_mid:
+            return self.parent_frame
         if self.publish_in_parent_frame and self._aligned:
             return self.parent_frame
         return self.map_frame
@@ -394,11 +402,9 @@ class OdinIndependentAccum(Node):
         return resp
 
     def on_mid_odom(self, msg: Odometry) -> None:
-        # Index Mid poses by Jetson ROS time at reception. Odin clouds are
-        # restamped on TCP receive onto the same clock; Mid header stamps stay
-        # on the LiDAR capture timeline (~1s offset) and cannot be matched
-        # directly for motion sync.
-        t = self.get_clock().now().nanoseconds * 1e-9
+        # Both streams are on the Livox scan clock now. Index by header stamp
+        # so a late cloud still uses the pose from when it was captured.
+        t = stamp_sec(msg.header.stamp)
         T = se3_from_pose(msg.pose.pose)
         self._mid_T = T
         self._mid_stamp_latest = msg.header.stamp
@@ -407,7 +413,7 @@ class OdinIndependentAccum(Node):
         while self._mid_odom_buf and self._mid_odom_buf[0][0] < cutoff:
             self._mid_odom_buf.popleft()
 
-    def _nearest_mid_odom(self, t_query: float) -> Optional[Tuple[float, np.ndarray]]:
+    def _nearest_mid_odom(self, t_query: float, max_dt: Optional[float] = None):
         if not self._mid_odom_buf:
             return None
         best = None
@@ -417,7 +423,8 @@ class OdinIndependentAccum(Node):
             if dt < best_dt:
                 best_dt = dt
                 best = (t, T)
-        if best is None or best_dt > self.motion_sync_max_dt:
+        limit = self.motion_sync_max_dt if max_dt is None else max_dt
+        if best is None or best_dt > limit:
             return None
         return best
 
@@ -643,7 +650,16 @@ class OdinIndependentAccum(Node):
         if arr.size == 0:
             return
 
-        if self.cloud_already_in_odom:
+        if self.project_with_mid:
+            hit = self._nearest_mid_odom(stamp_sec(msg.header.stamp), max_dt=0.08)
+            if hit is None:
+                self._n_skip_odom += 1
+                return
+            T_map_lidar = hit[1] @ self.T_body_odin_lidar
+            R, t = T_map_lidar[:3, :3], T_map_lidar[:3, 3]
+            world = (arr @ R.T) + t
+            stamp = msg.header.stamp
+        elif self.cloud_already_in_odom:
             world = arr
             stamp = msg.header.stamp
         else:

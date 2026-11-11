@@ -327,7 +327,7 @@ def generate_launch_description():
                         # CT-LIO path keeps align_only TF; B1 densifies full Odin with Odin odom.
                         'align_only': use_ct,
                         'cloud_topic': (
-                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw_ds'
+                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_l2_body'
                         ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
@@ -336,14 +336,15 @@ def generate_launch_description():
                         # B1: publish already-aligned clouds into Mid map for RViz/fuse.
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
-                        # cloud_slam is already in odom — do NOT re-multiply odom (was misplacing accum).
-                        'cloud_already_in_odom': True,
-                        'publish_in_parent_frame': (not use_ct),
-                        'wait_align_for_parent': True,
+                        # Body cloud × Mid pose at the same stamp. No one-shot world lock.
+                        'cloud_already_in_odom': False,
+                        'project_with_mid': (not use_ct),
+                        'publish_in_parent_frame': False,
+                        'wait_align_for_parent': False,
                         # Mid IEKF map is gravity-aligned (floors level). Baking
                         # extrinsic Ry(-13°) into map←odin_map here re-tilts the
                         # already-level Odin cloud. Use yaw/xy lock only.
-                        'align_mode': 'yaw',
+                        'align_mode': 'off' if not use_ct else 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
                         # Off: Mid restamp/pose-factor motion sync made Odin map cloud shake.

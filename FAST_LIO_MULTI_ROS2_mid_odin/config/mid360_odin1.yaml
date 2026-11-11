@@ -60,7 +60,7 @@
       lidar2_point_update_en: false
       lidar2_pose_factor_en: true
       lidar2_pose_alpha: 0.12
-      lidar2_pose_max_dt: 0.20
+      lidar2_pose_max_dt: 0.08
       odin_odom_topic: "/odin1/odometry"
       lidar2_pose_gyr_gate: 0.0
       lidar2_pitch_gyr_gate: 0.0
