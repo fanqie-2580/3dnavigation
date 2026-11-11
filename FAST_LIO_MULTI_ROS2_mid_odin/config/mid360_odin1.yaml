@@ -57,12 +57,16 @@
       # Two-stage gated tight coupling: Mid IEKF first, then soft Odin residuals
       # (cov * lidar2_residual_cov_scale). Gravity-frame L2 uses translation-only.
       lidar2_update_en: true
-      # Fast yaw: Mid-only (no Odin residuals / no bundle). <=0 = always on.
+      # Fast yaw: Mid-only (no Odin residuals / no bundle). <=0 = ignore.
       lidar2_pose_gyr_gate: 0.35
+      # Stairs/slope: hold Odin when pitching, climbing, or body pitched.
+      lidar2_pitch_gyr_gate: 0.20
+      lidar2_vz_gate: 0.12
+      lidar2_pitch_gate_deg: 10.0
       # Drop L2 frames whose stamp is farther than this from paired Mid scan.
       lidar2_max_sync_dt: 0.05
-      # Soft Odin stage: larger = weaker pull on Mid (25 ≈ Mid-dominant).
-      lidar2_residual_cov_scale: 25.0
+      # Soft Odin stage: larger = weaker pull on Mid (40 ≈ safer on rough ground).
+      lidar2_residual_cov_scale: 40.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

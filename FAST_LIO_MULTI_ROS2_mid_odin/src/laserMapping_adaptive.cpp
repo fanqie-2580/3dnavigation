@@ -161,13 +161,20 @@ bool lidar2_update_en = false;
 // During fast yaw, cloud_slam L2 residuals pull Mid pose → /cloud_registered
 // smears for a few seconds. Gate Odin IEKF/map by IMU |gyro|.
 double last_imu_gyr_norm = 0.0;
+double last_imu_gyr_pitch = 0.0; // |ωy| — stairs pitch rate (yaw-norm alone misses this)
+double last_mid_vz = 0.0;
+double last_mid_pitch = 0.0; // rad, from Mid IEKF rot
 double lidar2_pose_gyr_gate = 0.35; // rad/s; above => Odin densify-off + no pose update
+double lidar2_pitch_gyr_gate = 0.20; // rad/s |ωy|; stairs / slope
+double lidar2_vz_gate = 0.12;       // m/s |vz|; climbing
+double lidar2_pitch_gate_deg = 10.0; // |pitch| of Mid state
 // Reject L2 IEKF/bundle pair when |t_L2 - t_Mid| exceeds this (TCP lag gate).
 double lidar2_max_sync_dt = 0.08;
 // Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
 double lidar2_residual_cov_scale = 25.0;
 long long n_skip_l2_sync = 0;
 long long n_odin_iekf_updates = 0;
+long long n_odin_hold_stairs = 0;
 // Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
 // state_point right after IEKF. Stamp-based lookup failed in practice:
 // /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
@@ -179,14 +186,29 @@ constexpr float kOdinIntensityTag = 100.0f;
 // 0=unused, 1=Mid residuals only, 2=Odin residuals only (two-stage tight couple)
 int residual_select = 1;
 
+inline double mid_pitch_from_rot(const M3D &R)
+{
+    // R: body→map; pitch ≈ asin(-R(2,0)) for Z-up, X-forward.
+    const double s = -R(2, 0);
+    return std::asin(std::max(-1.0, std::min(1.0, s)));
+}
+
 inline bool odin_pose_update_allowed()
 {
-    // lidar2_pose_gyr_gate <= 0 disables the turn hold → full-time tight coupling.
+    // Hold Odin IEKF/densify on yaw-rate, pitch-rate, climb vz, or body pitch.
+    // Stairs often have small |ω| but large pitch/vz — yaw-only gate missed them.
     if (!lidar2_update_en)
         return false;
-    if (lidar2_pose_gyr_gate <= 0.0)
-        return true;
-    return last_imu_gyr_norm < lidar2_pose_gyr_gate;
+    if (lidar2_pose_gyr_gate > 0.0 && last_imu_gyr_norm >= lidar2_pose_gyr_gate)
+        return false;
+    if (lidar2_pitch_gyr_gate > 0.0 && last_imu_gyr_pitch >= lidar2_pitch_gyr_gate)
+        return false;
+    if (lidar2_vz_gate > 0.0 && std::fabs(last_mid_vz) >= lidar2_vz_gate)
+        return false;
+    if (lidar2_pitch_gate_deg > 0.0 &&
+        std::fabs(last_mid_pitch) * 180.0 / M_PI >= lidar2_pitch_gate_deg)
+        return false;
+    return true;
 }
 
 // Gravity-leveled cloud_slam: apply CAD translation only for IEKF (no Ry(-13°)),
@@ -448,6 +470,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
         const double gy = msg->angular_velocity.y;
         const double gz = msg->angular_velocity.z;
         last_imu_gyr_norm = std::sqrt(gx * gx + gy * gy + gz * gz);
+        last_imu_gyr_pitch = std::fabs(gy);
     }
 
     imu_buffer.push_back(msg);
@@ -1374,6 +1397,9 @@ public:
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
+        this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
+        this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
+        this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
         this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
@@ -1447,6 +1473,9 @@ public:
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
+        this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
+        this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
+        this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
         this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
@@ -1582,6 +1611,9 @@ public:
                          : " rad/s (hold Odin IEKF above)")
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
+                 << " pitch_gyr=" << lidar2_pitch_gyr_gate
+                 << " vz=" << lidar2_vz_gate
+                 << " pitch_deg=" << lidar2_pitch_gate_deg
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
@@ -1775,9 +1807,10 @@ private:
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-                // Stage 2: soft Odin residuals into the same IEKF when gated.
-                if (bundle_enabled && odin_pose_update_allowed() &&
-                    lidar2_residual_cov_scale > 0.0)
+                // Stage 2: soft Odin residuals when not climbing/turning.
+                const bool odin_ok = bundle_enabled && odin_pose_update_allowed() &&
+                                     lidar2_residual_cov_scale > 0.0;
+                if (odin_ok)
                 {
                     residual_select = 2;
                     const double R_odin =
@@ -1787,9 +1820,14 @@ private:
                     solve_H_time += solve2;
                     n_odin_iekf_updates++;
                 }
+                else if (bundle_enabled && lidar2_update_en)
+                    n_odin_hold_stairs++;
                 residual_select = 1;
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                // Refresh climb/pitch gates from Mid state for the next frame.
+                last_mid_vz = state_point.vel(2);
+                last_mid_pitch = mid_pitch_from_rot(state_point.rot.toRotationMatrix());
                 geoQuat.x = state_point.rot.coeffs()[0];
                 geoQuat.y = state_point.rot.coeffs()[1];
                 geoQuat.z = state_point.rot.coeffs()[2];
@@ -1843,10 +1881,8 @@ private:
             /*** Bundle update or async update ***/
             if (multi_lidar && lidar2_update_en)
             {
-                // Prefer Mid+Odin bundle whenever yaw-rate allows (true tight pair).
-                // Fast yaw → Mid-only async. If L2 buffer empty, sync falls back.
-                if (lidar2_pose_gyr_gate > 0.0 &&
-                    last_imu_gyr_norm >= lidar2_pose_gyr_gate)
+                // Bundle only on flat/slow motion; stairs/pitch → Mid-only async.
+                if (!odin_pose_update_allowed())
                 {
                     bundle_enabled = false;
                     bundle_enabled_tic = 0;
