@@ -219,6 +219,10 @@ class OdinRawDownsampleBridge(Node):
         # Official Odin IMU→lidar (wiki), R≈I.
         self.declare_parameter('extrinsic_T_imu_L', [-0.02663, 0.03447, 0.02174])
         # Plan A: keep only Odin ground for L2 / densify.
+        # If true, odom-frame cloud_slam is unprojected to lidar (needed for L2
+        # IEKF). If false, keep odom frame — avoids stamp-matched unproject
+        # flicker that makes Odin shake while the robot is still.
+        self.declare_parameter('unproject_odom_clouds', False)
         self.declare_parameter('ground_only', False)
         self.declare_parameter('ground_topic', '/odin1/cloud_ground')
         self.declare_parameter('publish_ground_topic', True)
@@ -239,7 +243,9 @@ class OdinRawDownsampleBridge(Node):
         self.mid_restamp_max_dt = float(self.get_parameter('mid_restamp_max_dt').value)
         self.max_cloud_age_sec = float(self.get_parameter('max_cloud_age_sec').value)
         self.fallback_period = float(self.get_parameter('fallback_period').value)
+        self.unproject_odom_clouds = bool(self.get_parameter('unproject_odom_clouds').value)
         self.ground_only = bool(self.get_parameter('ground_only').value)
+        self._out_frame_id = 'odin_lidar'
         self.publish_ground_topic = bool(self.get_parameter('publish_ground_topic').value)
         self.publish_full_topic = str(self.get_parameter('publish_full_topic').value or '').strip()
         self.ground_distance = float(self.get_parameter('ground_distance').value)
@@ -464,26 +470,39 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_empty += 1
             return False
 
+        self._out_frame_id = 'odin_lidar'
         if self._cloud_in_odom(msg):
-            if not self._warned_odom_cloud:
-                self.get_logger().warn(
-                    'Input looks like odom-frame cloud_slam (frame_id=%s, fields=%s). '
-                    'Unprojecting with /odin1/odometry for L2; prefer mode0 true raw '
-                    'with offset_time for better undistortion.'
-                    % (msg.header.frame_id, [f.name for f in msg.fields])
-                )
-                self._warned_odom_cloud = True
-            T_oi = self._lookup_odin_odom(msg.header.stamp)
-            if T_oi is None:
-                self._n_skip_unproj += 1
-                return False
-            T_oL = T_oi @ self.T_imu_L
-            R = T_oL[:3, :3]
-            t = T_oL[:3, 3]
-            xyz = arr[:, :3].astype(np.float64)
-            # p_L = R^T (p_o - t); row vectors => (p - t) @ R
-            xyz = (xyz - t) @ R
-            arr = np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
+            if self.unproject_odom_clouds:
+                if not self._warned_odom_cloud:
+                    self.get_logger().warn(
+                        'Input looks like odom-frame cloud_slam (frame_id=%s, fields=%s). '
+                        'Unprojecting with /odin1/odometry for L2; prefer mode0 true raw '
+                        'with offset_time for better undistortion.'
+                        % (msg.header.frame_id, [f.name for f in msg.fields])
+                    )
+                    self._warned_odom_cloud = True
+                T_oi = self._lookup_odin_odom(msg.header.stamp)
+                if T_oi is None:
+                    self._n_skip_unproj += 1
+                    return False
+                T_oL = T_oi @ self.T_imu_L
+                R = T_oL[:3, :3]
+                t = T_oL[:3, 3]
+                xyz = arr[:, :3].astype(np.float64)
+                # p_L = R^T (p_o - t); row vectors => (p - t) @ R
+                xyz = (xyz - t) @ R
+                arr = np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
+            else:
+                # Keep odom-frame cloud_slam as-is. Unproject+reproject with
+                # restamped nearest-odom was the main stationary shake source
+                # (raw centroid ~1.5mm, after unproject ~12mm).
+                if not self._warned_odom_cloud:
+                    self.get_logger().info(
+                        'Keeping odom-frame cloud_slam (no unproject) to avoid '
+                        'stationary flicker; densify uses cloud_already_in_odom.'
+                    )
+                    self._warned_odom_cloud = True
+                self._out_frame_id = 'odom'
 
         # Pre-stride before unique: np.unique on 35k×3 int keys was ~100ms.
         if len(arr) > self.max_points * 3:
@@ -548,7 +567,7 @@ class OdinRawDownsampleBridge(Node):
 
         header = Header()
         header.stamp = stamp
-        header.frame_id = 'odin_lidar'
+        header.frame_id = self._out_frame_id
 
         # L2 input keeps Mid-restamped time (laserMapping sync).
         self.pub.publish(self._make_cloud(header, out_arr))

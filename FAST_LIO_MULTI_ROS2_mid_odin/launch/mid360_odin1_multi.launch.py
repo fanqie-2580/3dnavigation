@@ -170,6 +170,8 @@ def generate_launch_description():
                     # main rate limit (was 100ms and also processed backlogged frames).
                     'fallback_period': 0.05,
                     'ground_only': False,
+                    # cloud_slam arrives in odom; do not unproject (stationary shake).
+                    'unproject_odom_clouds': False,
                     'ground_topic': '/odin1/cloud_ground',
                     # Skip RANSAC entirely when not keeping ground-only.
                     'publish_ground_topic': False,
@@ -331,7 +333,8 @@ def generate_launch_description():
                         # B1: publish already-aligned clouds into Mid map for RViz/fuse.
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
-                        'cloud_already_in_odom': True if use_ct else False,
+                        # cloud_raw_ds keeps cloud_slam in odom (no unproject).
+                        'cloud_already_in_odom': True,
                         'publish_in_parent_frame': (not use_ct),
                         'wait_align_for_parent': True,
                         # Mid IEKF map is gravity-aligned (floors level). Baking
@@ -340,6 +343,9 @@ def generate_launch_description():
                         'align_mode': 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
+                        'motion_sync_to_mid': True,
+                        'motion_sync_min_trans': 0.02,
+                        'motion_sync_min_rot_deg': 0.5,
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],

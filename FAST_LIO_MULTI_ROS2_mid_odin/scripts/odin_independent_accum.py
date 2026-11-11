@@ -191,8 +191,12 @@ class OdinIndependentAccum(Node):
         # latest Mid /Odometry pose so live viz matches robot/Mid motion.
         # (MA-LIO / CTE-MLO use continuous-time; SE3 relative warp is the
         # practical equivalent when Odin arrives ~200ms late over TCP.)
+        # Live Odin scan warp to Mid pose (viz only). Does not touch Mid IEKF.
         self.declare_parameter('motion_sync_to_mid', True)
         self.declare_parameter('motion_sync_max_dt', 0.80)
+        # Skip warp under Mid noise when robot is still (else Odin shakes).
+        self.declare_parameter('motion_sync_min_trans', 0.02)
+        self.declare_parameter('motion_sync_min_rot_deg', 0.5)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -240,6 +244,9 @@ class OdinIndependentAccum(Node):
         self.odom_pair_max_dt = float(self.get_parameter('odom_pair_max_dt').value)
         self.motion_sync_to_mid = bool(self.get_parameter('motion_sync_to_mid').value)
         self.motion_sync_max_dt = float(self.get_parameter('motion_sync_max_dt').value)
+        self.motion_sync_min_trans = float(self.get_parameter('motion_sync_min_trans').value)
+        self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
+        self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
         self.mid_accum_topic = str(self.get_parameter('mid_accum_topic').value)
@@ -329,8 +336,8 @@ class OdinIndependentAccum(Node):
             f'odin_odom_accum pub={self._n_pub} skip_odom={self._n_skip_odom} '
             f'skip_align={self._n_skip_align} aligned={self._aligned} '
             f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)} '
-            f'motion_sync={self._n_motion_sync} sync_dt={self._last_sync_dt*1000:.0f}ms '
-            f'mid_odom_buf={len(self._mid_odom_buf)}'
+            f'motion_sync={self._n_motion_sync} hold={self._n_motion_hold} '
+            f'sync_dt={self._last_sync_dt*1000:.0f}ms mid_odom_buf={len(self._mid_odom_buf)}'
         )
 
     def _output_frame(self) -> str:
@@ -432,10 +439,20 @@ class OdinIndependentAccum(Node):
         t_dst, T_dst = self._mid_odom_buf[-1]
         dt = float(t_dst - t_src)
         if abs(dt) < 1e-4:
-            return pts, self._mid_stamp_latest, dt
+            return pts, None, dt
         T = T_dst @ se3_inv(T_src)
         R = T[:3, :3]
         tr = T[:3, 3]
+        trans = float(np.linalg.norm(tr))
+        # Rotation angle from trace(R): stable for small Mid noise.
+        cos_a = 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)
+        cos_a = max(-1.0, min(1.0, cos_a))
+        rot_deg = math.degrees(math.acos(cos_a))
+        if trans < self.motion_sync_min_trans and rot_deg < self.motion_sync_min_rot_deg:
+            # Stationary (or Mid noise only): keep Odin pose frozen.
+            self._n_motion_hold += 1
+            self._last_sync_dt = dt
+            return pts, None, dt
         out = (pts @ R.T) + tr
         self._n_motion_sync += 1
         self._last_sync_dt = dt
@@ -654,7 +671,8 @@ class OdinIndependentAccum(Node):
         if abs(now_ros - t_cloud) > 2.0:
             t_cloud = now_ros - 0.05
         out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out, t_cloud)
-        # Publish with current ROS time so age matches Mid live display.
+        # Only retouch stamp when a real warp happened; otherwise keep cloud
+        # stamp so stationary frames are bit-stable in time too.
         pub_stamp = self.get_clock().now().to_msg() if sync_stamp is not None else stamp
 
         if self.pub_scan is not None:
