@@ -6,7 +6,7 @@ register_keys:
   # 0: use odin internal system time as data time stamp, typical and recommended;
   # 1: use host ros time (upon receive) as data time stamp, only use if you specifically require this setup, not recommended for most users
   # 2: align odin1 time to host time, timestamp is the sensor data reception time on host time axis
-  use_host_ros_time: 0  # Changed to 0 to use device timestamp without PTP offset correction
+  use_host_ros_time: 2  # Jetson USB: align to host so Mid /Odometry stamps match
 
   streamctrl: 1           # 0: off; 1: on
 

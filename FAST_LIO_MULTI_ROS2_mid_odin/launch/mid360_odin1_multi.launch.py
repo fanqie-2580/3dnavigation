@@ -138,6 +138,9 @@ def generate_launch_description():
             )
 
         # Odin1 → /odin1/cloud_raw_ds for FAST_LIO_MULTI L2 (host-restamp + voxel).
+        # 657a8e0 densify expects odom-frame cloud_slam. Dock TCP used to publish
+        # slam onto /odin1/cloud_raw; USB host_sdk on Jetson keeps slam on
+        # /odin1/cloud_slam (/odin1/cloud_raw is lidar-frame) — subscribe slam.
         nodes.append(
             Node(
                 package='fast_lio_multi',
@@ -145,7 +148,7 @@ def generate_launch_description():
                 name='odin_raw_downsample_bridge',
                 output='screen',
                 parameters=[{
-                    'input_topic': '/odin1/cloud_raw',
+                    'input_topic': '/odin1/cloud_slam',
                     # Full Odin cloud for L2 + densify (ground-only backup:
                     # launch/mid360_odin1_multi_ground_only.launch.py).
                     'output_topic': '/odin1/cloud_raw_ds',
@@ -336,15 +339,14 @@ def generate_launch_description():
                         # B1: publish already-aligned clouds into Mid map for RViz/fuse.
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
-                        # Body cloud × Mid pose at the same stamp. No one-shot world lock.
+                        # cloud_slam is already in odom — do NOT re-multiply odom (was misplacing accum).
                         'cloud_already_in_odom': True,
-                        'project_with_mid': (not use_ct),
-                        'publish_in_parent_frame': False,
-                        'wait_align_for_parent': False,
+                        'publish_in_parent_frame': (not use_ct),
+                        'wait_align_for_parent': True,
                         # Mid IEKF map is gravity-aligned (floors level). Baking
                         # extrinsic Ry(-13°) into map←odin_map here re-tilts the
                         # already-level Odin cloud. Use yaw/xy lock only.
-                        'align_mode': 'off' if not use_ct else 'yaw',
+                        'align_mode': 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
                         # Off: Mid restamp/pose-factor motion sync made Odin map cloud shake.
