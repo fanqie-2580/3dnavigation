@@ -327,29 +327,25 @@ def generate_launch_description():
                     name='odin_independent_accum',
                     output='screen',
                     parameters=[{
-                        # CT-LIO path keeps align_only TF; B1 densifies full Odin with Odin odom.
+                        # CT-LIO: align TF only. Else: densify lidar-frame Odin with Mid pose
+                        # (no Odin cloud_slam / own map for RViz accum).
                         'align_only': use_ct,
                         'cloud_topic': (
-                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_raw_ds'
+                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_l2_body'
                         ),
                         'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
                         'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                         'map_frame': 'odin_map',
                         'parent_frame': 'map',
-                        # B1: publish already-aligned clouds into Mid map for RViz/fuse.
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
-                        # cloud_slam is already in odom — do NOT re-multiply odom (was misplacing accum).
-                        'cloud_already_in_odom': True,
-                        'publish_in_parent_frame': (not use_ct),
-                        'wait_align_for_parent': True,
-                        # Mid IEKF map is gravity-aligned (floors level). Baking
-                        # extrinsic Ry(-13°) into map←odin_map here re-tilts the
-                        # already-level Odin cloud. Use yaw/xy lock only.
-                        'align_mode': 'yaw',
+                        'cloud_already_in_odom': bool(use_ct),
+                        'project_with_mid': (not use_ct),
+                        'publish_in_parent_frame': False,
+                        'wait_align_for_parent': False,
+                        'align_mode': 'off' if not use_ct else 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
-                        # Off: Mid restamp/pose-factor motion sync made Odin map cloud shake.
                         'motion_sync_to_mid': False,
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
