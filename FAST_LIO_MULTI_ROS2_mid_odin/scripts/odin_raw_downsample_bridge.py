@@ -223,6 +223,10 @@ class OdinRawDownsampleBridge(Node):
         # IEKF). If false, keep odom frame — avoids stamp-matched unproject
         # flicker that makes Odin shake while the robot is still.
         self.declare_parameter('unproject_odom_clouds', False)
+        # Separate lidar-frame stream for FAST_LIO L2 IEKF. Empty = off.
+        # Main output_topic stays odom-frame when unproject_odom_clouds=False
+        # (stable viz); this topic unprojects with Odin odom at cloud stamp.
+        self.declare_parameter('l2_body_topic', '')
         self.declare_parameter('ground_only', False)
         self.declare_parameter('ground_topic', '/odin1/cloud_ground')
         self.declare_parameter('publish_ground_topic', True)
@@ -244,6 +248,7 @@ class OdinRawDownsampleBridge(Node):
         self.max_cloud_age_sec = float(self.get_parameter('max_cloud_age_sec').value)
         self.fallback_period = float(self.get_parameter('fallback_period').value)
         self.unproject_odom_clouds = bool(self.get_parameter('unproject_odom_clouds').value)
+        self.l2_body_topic = str(self.get_parameter('l2_body_topic').value or '').strip()
         self.ground_only = bool(self.get_parameter('ground_only').value)
         self._out_frame_id = 'odin_lidar'
         self.publish_ground_topic = bool(self.get_parameter('publish_ground_topic').value)
@@ -277,12 +282,15 @@ class OdinRawDownsampleBridge(Node):
         self._n_pub = 0
         self._n_ground_pub = 0
         self._n_skip_unproj = 0
+        self._n_skip_l2 = 0
+        self._n_l2_pub = 0
         self._n_skip_empty = 0
         self._n_skip_age = 0
         self._n_skip_ground = 0
         self._last_ground_mode = '-'
         self._last_n_full = 0
         self._last_n_ground = 0
+        self._last_n_l2 = 0
         self._last_mid_wall = -1.0
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
@@ -302,6 +310,9 @@ class OdinRawDownsampleBridge(Node):
         self.pub_full = None
         if self.publish_full_topic:
             self.pub_full = self.create_publisher(PointCloud2, self.publish_full_topic, reliable)
+        self.pub_l2 = None
+        if self.l2_body_topic and self.l2_body_topic != out:
+            self.pub_l2 = self.create_publisher(PointCloud2, self.l2_body_topic, reliable)
         self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
         self.create_subscription(
             Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
@@ -319,19 +330,54 @@ class OdinRawDownsampleBridge(Node):
             f'mid_dt<={self.mid_restamp_max_dt:.3f}s max_age={self.max_cloud_age_sec:.2f}s '
             f'one_per_odom={self.one_cloud_per_odom} ground_only={self.ground_only} '
             f'ground_topic={ground_topic if self.publish_ground_topic else "off"} '
-            f'full_topic={self.publish_full_topic or "off"} qos=RELIABLE '
-            f'(unproject odom-frame if needed; match Mid by cloud stamp)'
+            f'full_topic={self.publish_full_topic or "off"} '
+            f'l2_body={self.l2_body_topic or "off"} qos=RELIABLE '
+            f'(viz odom passthrough; L2 body unproject at cloud stamp)'
         )
 
     def _status(self) -> None:
         self.get_logger().info(
             f'stats cloud={self._n_cloud} odin_odom={self._n_odin} mid_odom={self._n_mid} '
-            f'pub={self._n_pub} ground_pub={self._n_ground_pub} '
-            f'last_full={self._last_n_full} last_ground={self._last_n_ground} '
+            f'pub={self._n_pub} l2_pub={self._n_l2_pub} ground_pub={self._n_ground_pub} '
+            f'last_full={self._last_n_full} last_l2={self._last_n_l2} '
+            f'last_ground={self._last_n_ground} '
             f'mode={self._last_ground_mode} skip_ground={self._n_skip_ground} '
-            f'skip_unproj={self._n_skip_unproj} skip_empty={self._n_skip_empty} '
+            f'skip_unproj={self._n_skip_unproj} skip_l2={self._n_skip_l2} '
+            f'skip_empty={self._n_skip_empty} '
             f'skip_age={self._n_skip_age} pending={"Y" if self._pending is not None else "N"}'
         )
+
+    def _voxel_downsample(self, arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return arr
+        if len(arr) > self.max_points * 3:
+            step0 = int(np.ceil(len(arr) / float(self.max_points * 3)))
+            arr = arr[::step0]
+        if self.voxel > 0 and len(arr) > 0:
+            keys = np.ascontiguousarray(
+                np.floor(arr[:, :3] / self.voxel).astype(np.int32)
+            )
+            flat = keys.view(
+                [('', keys.dtype), ('', keys.dtype), ('', keys.dtype)]
+            ).reshape(-1)
+            _, idx = np.unique(flat, return_index=True)
+            arr = arr[np.sort(idx)]
+        if len(arr) > self.max_points:
+            step = int(np.ceil(len(arr) / self.max_points))
+            arr = arr[::step]
+        return arr
+
+    def _unproject_to_lidar(self, arr: np.ndarray, stamp) -> Optional[np.ndarray]:
+        """Unproject odom-frame XYZ with Odin odom at *geometry* stamp."""
+        T_oi = self._lookup_odin_odom(stamp)
+        if T_oi is None:
+            return None
+        T_oL = T_oi @ self.T_imu_L
+        R = T_oL[:3, :3]
+        t = T_oL[:3, 3]
+        xyz = arr[:, :3].astype(np.float64)
+        xyz = (xyz - t) @ R
+        return np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
 
     def _make_cloud(self, header: Header, arr: np.ndarray) -> PointCloud2:
         fields = [
@@ -470,57 +516,36 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_empty += 1
             return False
 
+        in_odom = self._cloud_in_odom(msg)
+        # Raw copy for optional L2 body unproject (before viz-path rewrite).
+        arr_raw = arr
+
         self._out_frame_id = 'odin_lidar'
-        if self._cloud_in_odom(msg):
+        if in_odom:
             if self.unproject_odom_clouds:
                 if not self._warned_odom_cloud:
                     self.get_logger().warn(
                         'Input looks like odom-frame cloud_slam (frame_id=%s, fields=%s). '
-                        'Unprojecting with /odin1/odometry for L2; prefer mode0 true raw '
-                        'with offset_time for better undistortion.'
+                        'Unprojecting main output with /odin1/odometry.'
                         % (msg.header.frame_id, [f.name for f in msg.fields])
                     )
                     self._warned_odom_cloud = True
-                T_oi = self._lookup_odin_odom(msg.header.stamp)
-                if T_oi is None:
+                body = self._unproject_to_lidar(arr, msg.header.stamp)
+                if body is None:
                     self._n_skip_unproj += 1
                     return False
-                T_oL = T_oi @ self.T_imu_L
-                R = T_oL[:3, :3]
-                t = T_oL[:3, 3]
-                xyz = arr[:, :3].astype(np.float64)
-                # p_L = R^T (p_o - t); row vectors => (p - t) @ R
-                xyz = (xyz - t) @ R
-                arr = np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
+                arr = body
             else:
-                # Keep odom-frame cloud_slam as-is. Unproject+reproject with
-                # restamped nearest-odom was the main stationary shake source
-                # (raw centroid ~1.5mm, after unproject ~12mm).
+                # Keep odom-frame cloud_slam as-is for viz/densify stability.
                 if not self._warned_odom_cloud:
                     self.get_logger().info(
-                        'Keeping odom-frame cloud_slam (no unproject) to avoid '
-                        'stationary flicker; densify uses cloud_already_in_odom.'
+                        'Keeping odom-frame cloud_slam on main output (no unproject); '
+                        'L2 body topic unprojects separately when enabled.'
                     )
                     self._warned_odom_cloud = True
                 self._out_frame_id = 'odom'
 
-        # Pre-stride before unique: np.unique on 35k×3 int keys was ~100ms.
-        if len(arr) > self.max_points * 3:
-            step0 = int(np.ceil(len(arr) / float(self.max_points * 3)))
-            arr = arr[::step0]
-        if self.voxel > 0 and len(arr) > 0:
-            keys = np.ascontiguousarray(
-                np.floor(arr[:, :3] / self.voxel).astype(np.int32)
-            )
-            # Structured-view unique is much faster than unique(axis=0).
-            flat = keys.view(
-                [('', keys.dtype), ('', keys.dtype), ('', keys.dtype)]
-            ).reshape(-1)
-            _, idx = np.unique(flat, return_index=True)
-            arr = arr[np.sort(idx)]
-        if len(arr) > self.max_points:
-            step = int(np.ceil(len(arr) / self.max_points))
-            arr = arr[::step]
+        arr = self._voxel_downsample(arr)
 
         self._last_n_full = int(len(arr))
         ground = arr
@@ -569,7 +594,7 @@ class OdinRawDownsampleBridge(Node):
         header.stamp = stamp
         header.frame_id = self._out_frame_id
 
-        # L2 input keeps Mid-restamped time (laserMapping sync).
+        # Viz / densify: Mid-restamped time on main topic.
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:
@@ -581,6 +606,30 @@ class OdinRawDownsampleBridge(Node):
             self._n_ground_pub += 1
         if self.pub_full is not None and len(arr) > 0:
             self.pub_full.publish(self._make_cloud(header, arr))
+
+        # Dual-stream L2 body for IEKF: unproject at original cloud stamp only.
+        # Failure skips L2 pub — never blocks viz main output.
+        if self.pub_l2 is not None:
+            l2_arr = None
+            if in_odom:
+                if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
+                    # Main path already unprojected+voxelized.
+                    l2_arr = out_arr if not self.ground_only else arr
+                else:
+                    body = self._unproject_to_lidar(arr_raw, msg.header.stamp)
+                    if body is None:
+                        self._n_skip_l2 += 1
+                    else:
+                        l2_arr = self._voxel_downsample(body)
+            else:
+                l2_arr = out_arr if not self.ground_only else arr
+            if l2_arr is not None and len(l2_arr) > 0:
+                l2_header = Header()
+                l2_header.stamp = stamp
+                l2_header.frame_id = 'odin_lidar'
+                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
+                self._n_l2_pub += 1
+                self._last_n_l2 = int(len(l2_arr))
         return True
 
 

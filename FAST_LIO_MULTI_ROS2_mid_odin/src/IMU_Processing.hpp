@@ -333,25 +333,21 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   auto v_imu = meas.imu;
   v_imu.push_front(last_imu_);
   const double imu_end_time = get_time_sec(v_imu.back()->header.stamp);
-  // Keep Mid/Odin on their own scan clocks. Mixing them onto min(beg) via float
-  // curvature shifts + a shared backward pass can yield |dt|≫scan period and
-  // explode Mid points (raw Mid stays ~10m, body Mid becomes 50–200m).
-  constexpr double kMaxBundleSpan = 0.20; // s; Mid+Odin pair should already be ≪ this
-  constexpr double kMaxUndistortDt = 0.12; // s; motion-compensation model limit (~1 Mid scan)
+  // ALWAYS anchor IMU propagation + Mid deskew on Mid scan time.
+  // Using min(Mid,Odin) made Mid curvature relative to an earlier Odin stamp and
+  // twisted /cloud_registered whenever the TCP/restamped L2 led Mid.
+  constexpr double kMaxBundleSpan = 0.20; // s
+  constexpr double kMaxUndistortDt = 0.12; // s; motion-compensation model limit
 
-  double pcl_beg_time = std::min(meas.lidar_beg_time, meas.lidar_beg_time2);
-  double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
-  if (pcl_end_time - pcl_beg_time > kMaxBundleSpan)
-  {
-    // Pathological pair/time base: fall back to Mid-only window for propagation.
-    pcl_beg_time = meas.lidar_beg_time;
-    pcl_end_time = meas.lidar_end_time;
-  }
+  double pcl_beg_time = meas.lidar_beg_time;
+  double pcl_end_time = meas.lidar_end_time;
+  if (pcl_end_time < pcl_beg_time)
+    std::swap(pcl_end_time, pcl_beg_time);
 
   PointCloudXYZI pcl_1_out = *(meas.lidar);
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
-  sort(pcl_2_out.points.begin(), pcl_2_out.points.end(), time_list);
+  // Odin cloud_slam is already motion-compensated; do not re-sort/deskew with Mid IMU.
 
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
@@ -462,7 +458,11 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  deskew_cloud(pcl_2_out, meas.lidar_beg_time2);
+  // Never Mid-IMU-deskew Odin: cloud_slam (+ unproject) is already deskewed in
+  // Odin time. Re-applying Mid IMU with restamped stamps was a Mid-twist source
+  // via bad residuals pulling the shared IEKF.
+  for (auto &pt : pcl_2_out.points)
+    pt.curvature = 0.0f;
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
   for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1

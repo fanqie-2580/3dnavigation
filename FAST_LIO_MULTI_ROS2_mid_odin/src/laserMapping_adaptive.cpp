@@ -162,6 +162,9 @@ bool lidar2_update_en = false;
 // smears for a few seconds. Gate Odin IEKF/map by IMU |gyro|.
 double last_imu_gyr_norm = 0.0;
 double lidar2_pose_gyr_gate = 0.35; // rad/s; above => Odin densify-off + no pose update
+// Reject L2 IEKF/bundle pair when |t_L2 - t_Mid| exceeds this (TCP lag gate).
+double lidar2_max_sync_dt = 0.08;
+long long n_skip_l2_sync = 0;
 // Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
 // state_point right after IEKF. Stamp-based lookup failed in practice:
 // /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
@@ -450,18 +453,18 @@ bool sync_packages_async(MeasureGroup &meas)
     }
 
     int lidar_use_num_now_ = 0;
-    if (!lidar_buffer.empty() && !lidar_buffer2.empty()) // if both, use older one
+    if (!lidar_buffer.empty() && !lidar_buffer2.empty())
     {
-        // lidar 1 is older
-        if (time_buffer.front() < time_buffer2.front())
+        // Async path is Mid-only for IEKF. Odin couples only via bundle.
+        // Drop Odin frames older than Mid front so L2 cannot starve Mid.
+        while (!time_buffer2.empty() &&
+               time_buffer2.front() + 1e-3 < time_buffer.front())
         {
-            lidar_use_num_now_ = 1;
+            lidar_buffer2.pop_front();
+            time_buffer2.pop_front();
+            n_skip_l2_sync++;
         }
-        // lidar 2 is older
-        else
-        {
-            lidar_use_num_now_ = 2;
-        }    
+        lidar_use_num_now_ = 1;
     }
     else
     {
@@ -471,7 +474,11 @@ bool sync_packages_async(MeasureGroup &meas)
         }
         else if (!lidar_buffer2.empty())
         {
-            lidar_use_num_now_ = 2;
+            // Discard Odin-only async packages (would IMU-prop Mid to L2 time).
+            lidar_buffer2.pop_front();
+            time_buffer2.pop_front();
+            n_skip_l2_sync++;
+            return false;
         }
     }
     if (lidar_use_num_now_ == 0)
@@ -536,6 +543,27 @@ bool sync_packages_async(MeasureGroup &meas)
         /*** push a lidar scan ***/
         if(!lidar_pushed)
         {
+            // Gate async L2-only updates: require a Mid stamp within sync dt,
+            // else drop this Odin frame (TCP lag / restamp mismatch).
+            if (lidar2_max_sync_dt > 0.0)
+            {
+                const double t2 = time_buffer2.front();
+                double best_dt = 1e9;
+                if (!time_buffer.empty())
+                {
+                    for (double t1 : time_buffer)
+                        best_dt = std::min(best_dt, std::fabs(t1 - t2));
+                }
+                else if (last_timestamp_lidar > 0.0)
+                    best_dt = std::fabs(last_timestamp_lidar - t2);
+                if (best_dt > lidar2_max_sync_dt)
+                {
+                    n_skip_l2_sync++;
+                    lidar_buffer2.pop_front();
+                    time_buffer2.pop_front();
+                    return false;
+                }
+            }
             meas.lidar2 = lidar_buffer2.front();
             meas.lidar_beg_time2 = time_buffer2.front();
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1);
@@ -584,6 +612,7 @@ bool sync_packages_async(MeasureGroup &meas)
         lidar_pushed = false;
         return true;
     }
+    return false;
 }
 bool sync_packages_bundle(MeasureGroup &meas)
 {
@@ -597,7 +626,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
         {
             // Pair Mid front with nearest Odin by stamp (do NOT merge whole buffers —
             // that mixed scans from different poses and ghosted orange accum).
-            constexpr double kMaxBundleDt = 0.08; // 80 ms
+            const double max_bundle_dt =
+                (lidar2_max_sync_dt > 0.0) ? lidar2_max_sync_dt : 0.08;
             meas.lidar = lidar_buffer.front();
             meas.lidar_beg_time = time_buffer.front();
             if (meas.lidar->points.size() <= 1) // time too little
@@ -628,8 +658,9 @@ bool sync_packages_bundle(MeasureGroup &meas)
                     best_i = i;
                 }
             }
-            if (best_dt > kMaxBundleDt)
+            if (best_dt > max_bundle_dt)
             {
+                n_skip_l2_sync++;
                 // Drop the older stream head so the next tick can re-pair.
                 if (time_buffer.front() < time_buffer2.front())
                 {
@@ -1144,11 +1175,12 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
-        // Bundle: Odin tagged intensity>=100. Async lidar2 scan: whole frame is L2.
-        // Also skip Odin residuals when yaw-rate gate says hold (cloud_slam turn smear).
-        if (!odin_pose_update_allowed() &&
-            (point_body.intensity >= kOdinIntensityTag ||
-             (!bundle_enabled && current_lidar_num == 2)))
+        // Mid IEKF residuals are Mid-only. Odin (intensity>=100) must not pull the
+        // shared pose — restamped cloud_slam + mount extrinsic errors were twisting
+        // /cloud_registered. Odin still densifies ikdtree in map_incremental when
+        // odin_pose_update_allowed() (gated map-level tight coupling).
+        if (point_body.intensity >= kOdinIntensityTag ||
+            (!bundle_enabled && current_lidar_num == 2))
         {
             point_selected_surf[i] = false;
             continue;
@@ -1305,6 +1337,7 @@ public:
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("mapping.lidar2_update_en", false);
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
+        this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
         this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
@@ -1376,6 +1409,7 @@ public:
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
+        this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
         this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
@@ -1509,6 +1543,7 @@ public:
                  << (lidar2_pose_gyr_gate <= 0.0
                          ? " (disabled → full-time tight coupling)"
                          : " rad/s (hold Odin IEKF above)")
+                 << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
@@ -1578,6 +1613,12 @@ private:
         {
             // RCLCPP_INFO(this->get_logger(), "Timer tick: synced=%d, bundle=%d", synced, bundle_enabled);
             high_resolution_clock::time_point t1 = high_resolution_clock::now();
+
+            // Async Odin-only: do NOT IMU-propagate Mid to L2 stamps (Process
+            // would kf.predict along Odin time and leave Mid pose twisted until
+            // the next Mid update). Independent densify owns Odin viz.
+            if (multi_lidar && !bundle_enabled && current_lidar_num == 2)
+                return;
 
             if (bundle_enabled)
             {
@@ -1680,9 +1721,11 @@ private:
                 return;
             }
 
-            // Odin-only async while yaw-rate gate holds: do not touch Mid IEKF.
+            // Never let async Odin-only packages update Mid IEKF (twists Mid pose).
+            // Bundle Mid+Odin may still use gated Odin residuals; L2-only = densify/viz.
             const bool skip_l2_update =
-                !odin_pose_update_allowed() && !bundle_enabled && current_lidar_num == 2;
+                (!bundle_enabled && current_lidar_num == 2) ||
+                (!odin_pose_update_allowed() && current_lidar_num == 2);
 
             if (!skip_l2_update)
             {

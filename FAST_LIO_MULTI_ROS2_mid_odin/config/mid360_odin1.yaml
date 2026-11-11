@@ -12,7 +12,8 @@
       map_frame: "map"
       # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
       lid_topic: "/livox/lidar"
-      lid_topic2: "/odin1/cloud_raw_ds"
+      # Lidar-frame Odin for IEKF (downsample dual-stream). Viz stays on /odin1/cloud_raw_ds.
+      lid_topic2: "/odin1/cloud_l2_body"
       imu_topic: "/livox/imu"
 
     method:
@@ -53,13 +54,13 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # false: Odin only densifies / visualizes. Delayed TCP Odin must NOT update
-      # Mid IEKF — async L2 residuals smear Mid walls (MA-LIO/Autoware: sync or
-      # leave second lidar observation-only when clocks are not PTP-aligned).
-      # L2 input remains /odin1/cloud_raw_ds for optional future tight coupling.
-      lidar2_update_en: false
-      # <=0: full-time tight coupling (Odin always in IEKF).
-      lidar2_pose_gyr_gate: 0.0
+      # Gated tight coupling: L2 body residuals update Mid IEKF when sync+gyr OK.
+      # Viz/densify still use independent odom-frame /odin1/cloud_raw_ds.
+      lidar2_update_en: true
+      # Fast yaw: hold Odin out of IEKF (was smear source). <=0 = always on.
+      lidar2_pose_gyr_gate: 0.35
+      # Drop L2 frames whose stamp is farther than this from paired Mid scan.
+      lidar2_max_sync_dt: 0.08
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

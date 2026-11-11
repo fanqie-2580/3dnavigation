@@ -170,8 +170,10 @@ def generate_launch_description():
                     # main rate limit (was 100ms and also processed backlogged frames).
                     'fallback_period': 0.05,
                     'ground_only': False,
-                    # cloud_slam arrives in odom; do not unproject (stationary shake).
+                    # cloud_slam arrives in odom; do not unproject main output
+                    # (stationary shake). L2 IEKF uses separate body topic.
                     'unproject_odom_clouds': False,
+                    'l2_body_topic': '/odin1/cloud_l2_body',
                     'ground_topic': '/odin1/cloud_ground',
                     # Skip RANSAC entirely when not keeping ground-only.
                     'publish_ground_topic': False,
