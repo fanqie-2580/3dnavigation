@@ -187,6 +187,12 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('accum_skip_sec', 2.0)
         self.declare_parameter('odom_buffer_sec', 3.0)
         self.declare_parameter('odom_pair_max_dt', 0.20)
+        # Autoware/LIO-SAM style: warp Odin scan from its stamp pose to the
+        # latest Mid /Odometry pose so live viz matches robot/Mid motion.
+        # (MA-LIO / CTE-MLO use continuous-time; SE3 relative warp is the
+        # practical equivalent when Odin arrives ~200ms late over TCP.)
+        self.declare_parameter('motion_sync_to_mid', True)
+        self.declare_parameter('motion_sync_max_dt', 0.80)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -232,6 +238,8 @@ class OdinIndependentAccum(Node):
         self.accum_skip_sec = float(self.get_parameter('accum_skip_sec').value)
         self.odom_buffer_sec = float(self.get_parameter('odom_buffer_sec').value)
         self.odom_pair_max_dt = float(self.get_parameter('odom_pair_max_dt').value)
+        self.motion_sync_to_mid = bool(self.get_parameter('motion_sync_to_mid').value)
+        self.motion_sync_max_dt = float(self.get_parameter('motion_sync_max_dt').value)
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
         self.mid_accum_topic = str(self.get_parameter('mid_accum_topic').value)
@@ -243,6 +251,8 @@ class OdinIndependentAccum(Node):
         self._n_pub = 0
         self._n_skip_odom = 0
         self._n_skip_align = 0
+        self._n_motion_sync = 0
+        self._last_sync_dt = 0.0
 
         xyz = list(self.get_parameter('imu_to_lidar_xyz').value)
         rpy = list(self.get_parameter('imu_to_lidar_rpy_deg').value)
@@ -265,7 +275,9 @@ class OdinIndependentAccum(Node):
         self._accum = VoxelAccum(voxel, max_n)
         self._dirty = False
         self._odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
+        self._mid_odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
         self._mid_T: Optional[np.ndarray] = None
+        self._mid_stamp_latest = None
         self._odin_T: Optional[np.ndarray] = None
         self._aligned = False
         self._T_parent_child = np.eye(4, dtype=np.float64)
@@ -287,7 +299,8 @@ class OdinIndependentAccum(Node):
         self._publish_identity_tf()
 
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, 50)
-        if self.align_to_mid_once:
+        # Always buffer Mid odom for motion sync (and one-shot align).
+        if self.align_to_mid_once or self.motion_sync_to_mid:
             self.create_subscription(Odometry, self.mid_odom_topic, self.on_mid_odom, 50)
             if self.align_mode.startswith('icp') and not self.align_only:
                 self.create_subscription(
@@ -307,6 +320,7 @@ class OdinIndependentAccum(Node):
             f'frame={self.map_frame} already_in_odom={self.cloud_already_in_odom} '
             f'align_only={self.align_only} align_mode={self.align_mode} '
             f'publish_in_parent={self.publish_in_parent_frame} '
+            f'motion_sync_to_mid={self.motion_sync_to_mid} '
             f'out_scan={self.out_scan_topic} (no Mid pose for points)'
         )
 
@@ -314,7 +328,9 @@ class OdinIndependentAccum(Node):
         self.get_logger().info(
             f'odin_odom_accum pub={self._n_pub} skip_odom={self._n_skip_odom} '
             f'skip_align={self._n_skip_align} aligned={self._aligned} '
-            f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)}'
+            f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)} '
+            f'motion_sync={self._n_motion_sync} sync_dt={self._last_sync_dt*1000:.0f}ms '
+            f'mid_odom_buf={len(self._mid_odom_buf)}'
         )
 
     def _output_frame(self) -> str:
@@ -371,9 +387,59 @@ class OdinIndependentAccum(Node):
         return resp
 
     def on_mid_odom(self, msg: Odometry) -> None:
-        if self._aligned:
-            return
-        self._mid_T = se3_from_pose(msg.pose.pose)
+        # Index Mid poses by Jetson ROS time at reception. Odin clouds are
+        # restamped on TCP receive onto the same clock; Mid header stamps stay
+        # on the LiDAR capture timeline (~1s offset) and cannot be matched
+        # directly for motion sync.
+        t = self.get_clock().now().nanoseconds * 1e-9
+        T = se3_from_pose(msg.pose.pose)
+        self._mid_T = T
+        self._mid_stamp_latest = msg.header.stamp
+        self._mid_odom_buf.append((t, T))
+        cutoff = t - self.odom_buffer_sec
+        while self._mid_odom_buf and self._mid_odom_buf[0][0] < cutoff:
+            self._mid_odom_buf.popleft()
+
+    def _nearest_mid_odom(self, t_query: float) -> Optional[Tuple[float, np.ndarray]]:
+        if not self._mid_odom_buf:
+            return None
+        best = None
+        best_dt = 1e9
+        for t, T in self._mid_odom_buf:
+            dt = abs(t - t_query)
+            if dt < best_dt:
+                best_dt = dt
+                best = (t, T)
+        if best is None or best_dt > self.motion_sync_max_dt:
+            return None
+        return best
+
+    def _warp_to_latest_mid(
+        self, pts: np.ndarray, t_cloud: float
+    ) -> Tuple[np.ndarray, Optional[object], float]:
+        """Warp map-frame points from pose@t_cloud to latest Mid pose (SE3).
+
+        p_dst = T_mid(t_now) * inv(T_mid(t_cloud)) * p_src
+        Same idea as Autoware concatenate motion compensation / LIO-SAM deskew
+        relative transform, applied to a delayed second LiDAR.
+        """
+        if (not self.motion_sync_to_mid) or pts.size == 0 or not self._mid_odom_buf:
+            return pts, None, 0.0
+        src = self._nearest_mid_odom(t_cloud)
+        if src is None:
+            return pts, None, 0.0
+        t_src, T_src = src
+        t_dst, T_dst = self._mid_odom_buf[-1]
+        dt = float(t_dst - t_src)
+        if abs(dt) < 1e-4:
+            return pts, self._mid_stamp_latest, dt
+        T = T_dst @ se3_inv(T_src)
+        R = T[:3, :3]
+        tr = T[:3, 3]
+        out = (pts @ R.T) + tr
+        self._n_motion_sync += 1
+        self._last_sync_dt = dt
+        return out, self._mid_stamp_latest, dt
 
     def on_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
@@ -578,11 +644,24 @@ class OdinIndependentAccum(Node):
             self._n_skip_align += 1
             return
 
+        # Live scan: warp to latest Mid pose for visual/control sync.
+        # Accum keeps capture-time geometry (do not smear the map).
+        # Use cloud stamp when it is on Jetson clock (restamp_on_receive);
+        # otherwise fall back to "now - small lag" via ROS clock.
+        t_cloud = stamp_sec(stamp)
+        now_ros = self.get_clock().now().nanoseconds * 1e-9
+        # If stamp looks like sensor epoch (far from now), use receive estimate.
+        if abs(now_ros - t_cloud) > 2.0:
+            t_cloud = now_ros - 0.05
+        out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out, t_cloud)
+        # Publish with current ROS time so age matches Mid live display.
+        pub_stamp = self.get_clock().now().to_msg() if sync_stamp is not None else stamp
+
         if self.pub_scan is not None:
             header = Header()
-            header.stamp = stamp
+            header.stamp = pub_stamp
             header.frame_id = self._output_frame()
-            self.pub_scan.publish(make_cloud(header, out))
+            self.pub_scan.publish(make_cloud(header, out_live))
             self._n_pub += 1
 
         if (time.time() - self._t0) >= self.accum_skip_sec:
