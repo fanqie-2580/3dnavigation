@@ -201,6 +201,8 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('motion_sync_min_trans', 0.02)
         self.declare_parameter('motion_sync_min_rot_deg', 0.5)
         self.declare_parameter('mid_wall_pair_max_dt', 0.08)
+        # Odin geometry is older than arrival; look up Mid this many seconds earlier.
+        self.declare_parameter('mid_pose_lookback_sec', 0.12)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -252,6 +254,7 @@ class OdinIndependentAccum(Node):
         self.motion_sync_min_trans = float(self.get_parameter('motion_sync_min_trans').value)
         self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
         self.mid_wall_pair_max_dt = float(self.get_parameter('mid_wall_pair_max_dt').value)
+        self.mid_pose_lookback_sec = float(self.get_parameter('mid_pose_lookback_sec').value)
         self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
@@ -430,13 +433,18 @@ class OdinIndependentAccum(Node):
         return best
 
     def _mid_pose_by_wall(self, wall_cloud: float):
-        """Mid pose that arrived with the cloud (stamp bases Mid↔Odin differ)."""
+        """Mid pose for Odin geometry time ≈ arrival - lookback.
+
+        Pairing at raw arrival uses a newer Mid yaw than the Odin points
+        (USB/unproject lag) and fans the densify map while turning.
+        """
         if not self._mid_odom_buf:
             return None
+        target = wall_cloud - max(0.0, self.mid_pose_lookback_sec)
         best = None
         best_dt = 1e9
         for _t, wall, T in self._mid_odom_buf:
-            dt = abs(wall - wall_cloud)
+            dt = abs(wall - target)
             if dt < best_dt:
                 best_dt = dt
                 best = T
