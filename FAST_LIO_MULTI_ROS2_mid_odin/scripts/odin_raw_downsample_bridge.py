@@ -656,37 +656,29 @@ class OdinRawDownsampleBridge(Node):
         if self.pub_full is not None and len(arr) > 0:
             self.pub_full.publish(self._make_cloud(header, arr))
 
-        # Dual-stream L2 body for IEKF: unproject at geometry stamp only.
-        # Require Mid association within mid_restamp_max_dt (stamp or wall).
+        # Dual-stream L2 body: unproject at geometry stamp and KEEP that stamp.
+        # Copying a Mid header onto L2 (wall-matched) made densify look up an
+        # old Mid pose for fresh Odin geometry → fan smear on turns.
         if self.pub_l2 is not None:
-            l2_ok = True
-            l2_stamp = geom_stamp
-            if self.restamp_from_odom:
-                if mid_match is None:
-                    self._n_skip_l2_sync += 1
-                    l2_ok = False
-                else:
-                    l2_stamp = mid_match[1]
-            if l2_ok:
-                l2_arr = None
-                if in_odom:
-                    if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
-                        l2_arr = out_arr if not self.ground_only else arr
-                    else:
-                        body = self._unproject_to_lidar(arr_raw, geom_stamp)
-                        if body is None:
-                            self._n_skip_l2 += 1
-                        else:
-                            l2_arr = self._voxel_downsample(body)
-                else:
+            l2_arr = None
+            if in_odom:
+                if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
                     l2_arr = out_arr if not self.ground_only else arr
-                if l2_arr is not None and len(l2_arr) > 0:
-                    l2_header = Header()
-                    l2_header.stamp = l2_stamp
-                    l2_header.frame_id = 'odin_lidar'
-                    self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
-                    self._n_l2_pub += 1
-                    self._last_n_l2 = int(len(l2_arr))
+                else:
+                    body = self._unproject_to_lidar(arr_raw, geom_stamp)
+                    if body is None:
+                        self._n_skip_l2 += 1
+                    else:
+                        l2_arr = self._voxel_downsample(body)
+            else:
+                l2_arr = out_arr if not self.ground_only else arr
+            if l2_arr is not None and len(l2_arr) > 0:
+                l2_header = Header()
+                l2_header.stamp = geom_stamp
+                l2_header.frame_id = 'odin_lidar'
+                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
+                self._n_l2_pub += 1
+                self._last_n_l2 = int(len(l2_arr))
         return True
 
 

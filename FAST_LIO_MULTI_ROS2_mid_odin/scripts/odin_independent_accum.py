@@ -200,6 +200,7 @@ class OdinIndependentAccum(Node):
         # Skip warp under Mid noise when robot is still (else Odin shakes).
         self.declare_parameter('motion_sync_min_trans', 0.02)
         self.declare_parameter('motion_sync_min_rot_deg', 0.5)
+        self.declare_parameter('mid_wall_pair_max_dt', 0.08)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -250,6 +251,7 @@ class OdinIndependentAccum(Node):
         self.motion_sync_max_dt = float(self.get_parameter('motion_sync_max_dt').value)
         self.motion_sync_min_trans = float(self.get_parameter('motion_sync_min_trans').value)
         self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
+        self.mid_wall_pair_max_dt = float(self.get_parameter('mid_wall_pair_max_dt').value)
         self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
@@ -286,7 +288,8 @@ class OdinIndependentAccum(Node):
         self._accum = VoxelAccum(voxel, max_n)
         self._dirty = False
         self._odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
-        self._mid_odom_buf: Deque[Tuple[float, np.ndarray]] = deque()
+        # Mid: (header_stamp, wall_sec, T)
+        self._mid_odom_buf: Deque[Tuple[float, float, np.ndarray]] = deque()
         self._mid_T: Optional[np.ndarray] = None
         self._mid_stamp_latest = None
         self._odin_T: Optional[np.ndarray] = None
@@ -401,12 +404,12 @@ class OdinIndependentAccum(Node):
         return resp
 
     def on_mid_odom(self, msg: Odometry) -> None:
-        # USB host-time path: index by header stamp so cloud@t pairs with Mid@t.
         t = stamp_sec(msg.header.stamp)
+        wall = self.get_clock().now().nanoseconds * 1e-9
         T = se3_from_pose(msg.pose.pose)
         self._mid_T = T
         self._mid_stamp_latest = msg.header.stamp
-        self._mid_odom_buf.append((t, T))
+        self._mid_odom_buf.append((t, wall, T))
         cutoff = t - self.odom_buffer_sec
         while self._mid_odom_buf and self._mid_odom_buf[0][0] < cutoff:
             self._mid_odom_buf.popleft()
@@ -416,7 +419,7 @@ class OdinIndependentAccum(Node):
             return None
         best = None
         best_dt = 1e9
-        for t, T in self._mid_odom_buf:
+        for t, _wall, T in self._mid_odom_buf:
             dt = abs(t - t_query)
             if dt < best_dt:
                 best_dt = dt
@@ -426,15 +429,37 @@ class OdinIndependentAccum(Node):
             return None
         return best
 
+    def _mid_pose_by_wall(self, wall_cloud: float):
+        """Mid pose that arrived with the cloud (stamp bases Mid↔Odin differ)."""
+        if not self._mid_odom_buf:
+            return None
+        best = None
+        best_dt = 1e9
+        for _t, wall, T in self._mid_odom_buf:
+            dt = abs(wall - wall_cloud)
+            if dt < best_dt:
+                best_dt = dt
+                best = T
+        if best is None or best_dt > self.mid_wall_pair_max_dt:
+            return None
+        return best, best_dt
+
     def _pose_at(self, buf, t_query: float):
         """Pose at t_query. Interpolate inside ≤0.35s bracket, else nearest ≤80ms."""
         if not buf:
             return None
+        # buf entries may be (t,T) or (t,wall,T)
+        def unpack(item):
+            if len(item) == 3:
+                return item[0], item[2]
+            return item[0], item[1]
+
         prev = None
         nxt = None
         best = None
         best_dt = 1e9
-        for t, T in buf:
+        for item in buf:
+            t, T = unpack(item)
             dt = abs(t - t_query)
             if dt < best_dt:
                 best_dt = dt
@@ -486,7 +511,7 @@ class OdinIndependentAccum(Node):
         if src is None:
             return pts, None, 0.0
         t_src, T_src = src
-        t_dst, T_dst = self._mid_odom_buf[-1]
+        t_dst, _wall_dst, T_dst = self._mid_odom_buf[-1]
         dt = float(t_dst - t_src)
         if abs(dt) < 1e-4:
             return pts, None, dt
@@ -695,8 +720,11 @@ class OdinIndependentAccum(Node):
 
         if self.project_with_mid:
             # Lidar-frame densify into Mid map — no Odin SLAM / cloud_slam.
-            t_cloud = stamp_sec(msg.header.stamp)
-            mid_hit = self._pose_at(self._mid_odom_buf, t_cloud)
+            # Mid Livox stamps and Odin host stamps differ by ~1s; pairing by
+            # header stamp painted fresh geometry with an old Mid yaw (fan smear).
+            # Use arrival-time association instead.
+            wall_cloud = self.get_clock().now().nanoseconds * 1e-9
+            mid_hit = self._mid_pose_by_wall(wall_cloud)
             if mid_hit is None:
                 self._n_skip_odom += 1
                 return
