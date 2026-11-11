@@ -336,7 +336,7 @@ def generate_launch_description():
                         # B1: publish already-aligned clouds into Mid map for RViz/fuse.
                         'out_scan_topic': '/odin1/cloud_in_map',
                         'out_accum_topic': '/viz/accum_odin',
-                        # cloud_raw_ds keeps cloud_slam in odom (no unproject).
+                        # cloud_slam is already in odom — do NOT re-multiply odom (was misplacing accum).
                         'cloud_already_in_odom': True,
                         'publish_in_parent_frame': (not use_ct),
                         'wait_align_for_parent': True,
@@ -346,7 +346,8 @@ def generate_launch_description():
                         'align_mode': 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
-                        'motion_sync_to_mid': True,
+                        # Off: Mid restamp/pose-factor motion sync made Odin map cloud shake.
+                        'motion_sync_to_mid': False,
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],

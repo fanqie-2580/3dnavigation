@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import struct
+import time
 from collections import deque
 from typing import Deque, Dict, Optional, Tuple
 
@@ -609,16 +610,22 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_ground += 1
             return False
 
-        # Match Mid for viz/L2: stamp timebase first, else arrival (clock skew).
+        # Match Mid for L2 IEKF only. Densify/raw main topic MUST keep geometry
+        # stamp — Mid-restamping made independent_accum look up Odin odom at the
+        # wrong time → map-frame Odin cloud shakes every frame.
         if stamp is None:
             stamp = msg.header.stamp
         geom_stamp = msg.header.stamp
         mid_match = self._match_mid_for_l2(t_cloud, wall_cloud) if self._mid_stamps else None
-        viz_stamp = stamp
-        if self.restamp_from_odom and mid_match is not None:
-            viz_stamp = mid_match[1]
+        use_geom_for_main = (self._out_frame_id == 'odin_lidar')
+        if use_geom_for_main:
+            viz_stamp = geom_stamp
+        else:
+            viz_stamp = stamp
+            if self.restamp_from_odom and mid_match is not None:
+                viz_stamp = mid_match[1]
         viz_sec = _stamp_sec(viz_stamp)
-        # Monotonic nudge only for viz (not L2): avoids header loop-back spam.
+        # Monotonic nudge for publish cadence only (keep ≤1ms so odom pair still works).
         if viz_sec + 1e-6 < self._last_viz_pub_sec:
             viz_sec = self._last_viz_pub_sec + 1e-3
             sec = int(viz_sec)
@@ -630,13 +637,13 @@ class OdinRawDownsampleBridge(Node):
             nsec = int((viz_sec - sec) * 1e9)
             viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
         self._last_viz_pub_sec = viz_sec
-        self._last_pub_sec = viz_sec
+        self._last_pub_sec = time.time() if use_geom_for_main else viz_sec
 
         header = Header()
         header.stamp = viz_stamp
         header.frame_id = self._out_frame_id
 
-        # Viz / densify: Mid-associated time on main topic.
+        # Main topic: geometry stamp when lidar-frame (raw densify).
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:

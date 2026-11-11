@@ -194,6 +194,8 @@ def main():
     port = int(rospy.get_param("~port", DEFAULT_PORT))
     imu_topic = rospy.get_param("~imu_topic", "/odin1/imu")
     # SLAM cloud is already in odom frame; raw lidar frame needs host-side transform
+    # Densify/accum: cloud_slam (odom-frame) is stable. Pose-factor uses /odometry.
+    # Set ~cloud_topic:=/odin1/cloud_raw only when testing raw L2 point residuals.
     cloud_topic = rospy.get_param("~cloud_topic", "/odin1/cloud_slam")
     odom_topic = rospy.get_param("~odom_topic", "/odin1/odometry")
 

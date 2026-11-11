@@ -458,11 +458,26 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // Never Mid-IMU-deskew Odin: cloud_slam (+ unproject) is already deskewed in
-  // Odin time. Re-applying Mid IMU with restamped stamps was a Mid-twist source
-  // via bad residuals pulling the shared IEKF.
-  for (auto &pt : pcl_2_out.points)
-    pt.curvature = 0.0f;
+  // cloud_raw has offset_time → curvature>0: deskew Odin to Mid timebase with Mid IMU
+  // (scheme ①). cloud_slam (already motion-compensated) keeps curvature=0 → skip.
+  {
+    bool has_odin_time = false;
+    for (const auto &pt : pcl_2_out.points)
+    {
+      if (std::fabs(pt.curvature) > 1e-4f)
+      {
+        has_odin_time = true;
+        break;
+      }
+    }
+    if (has_odin_time)
+      deskew_cloud(pcl_2_out, meas.lidar_beg_time2);
+    else
+    {
+      for (auto &pt : pcl_2_out.points)
+        pt.curvature = 0.0f;
+    }
+  }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
   for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1

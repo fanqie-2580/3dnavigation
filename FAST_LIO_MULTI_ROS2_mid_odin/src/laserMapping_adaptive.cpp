@@ -158,6 +158,26 @@ bool extrinsic_L2_gravity_frame = false; // true: pose Odin with Mid yaw+pos onl
 // false: Odin only densifies publish cloud; Mid360 alone drives IEKF + ikdtree.
 // Bad L2 extrinsic otherwise corrupts pose/map as soon as the robot moves.
 bool lidar2_update_en = false;
+// Point residuals from Odin into IEKF (can smear Mid). Prefer pose-factor instead.
+bool lidar2_point_update_en = false;
+// Soft relative-pose tight couple from /odin1/odometry (scheme ②).
+bool lidar2_pose_factor_en = true;
+double lidar2_pose_alpha = 0.12;   // blend weight on relative innov [0,1]
+double lidar2_pose_max_dt = 0.20;  // s vs Mid scan time
+std::string odin_odom_topic = "/odin1/odometry";
+std::mutex mtx_odin_odom;
+double odin_odom_stamp = -1.0;
+Eigen::Vector3d odin_odom_pos = Eigen::Vector3d::Zero();
+Eigen::Matrix3d odin_odom_rot = Eigen::Matrix3d::Identity();
+bool odin_odom_have = false;
+bool odin_pose_align_init = false;
+double odin_yaw_align = 0.0; // Mid_yaw - Odin_yaw at lock
+Eigen::Vector3d last_pf_mid_pos = Eigen::Vector3d::Zero();
+Eigen::Vector3d last_pf_odin_pos = Eigen::Vector3d::Zero();
+double last_pf_mid_yaw = 0.0;
+double last_pf_odin_yaw = 0.0;
+bool last_pf_valid = false;
+long long n_odin_pose_factor = 0;
 // During fast yaw, cloud_slam L2 residuals pull Mid pose → /cloud_registered
 // smears for a few seconds. Gate Odin IEKF/map by IMU |gyro|.
 double last_imu_gyr_norm = 0.0;
@@ -174,6 +194,8 @@ double lidar2_max_sync_dt = 0.08;
 double lidar2_residual_cov_scale = 25.0;
 // Reject Odin point-to-plane residuals larger than this (meters) in Stage2.
 double lidar2_max_residual = 0.12;
+// If false: Odin still updates IEKF (tight couple) but never enters ikdtree.
+bool lidar2_map_insert_en = false;
 // True only after a successful Stage2 Odin update this frame (gates map insert).
 bool last_odin_iekf_ok = false;
 long long n_skip_l2_sync = 0;
@@ -198,6 +220,115 @@ inline double mid_pitch_from_rot(const M3D &R)
     return std::asin(std::max(-1.0, std::min(1.0, s)));
 }
 
+inline double yaw_from_rot(const M3D &R)
+{
+    return std::atan2(R(1, 0), R(0, 0));
+}
+
+inline double wrap_pi(double a)
+{
+    while (a > M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
+}
+
+void odin_odom_cb(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    const auto &p = msg->pose.pose.position;
+    const auto &q = msg->pose.pose.orientation;
+    Eigen::Quaterniond qq(q.w, q.x, q.y, q.z);
+    if (qq.norm() < 1e-9)
+        return;
+    qq.normalize();
+    std::lock_guard<std::mutex> lk(mtx_odin_odom);
+    odin_odom_stamp = rclcpp::Time(msg->header.stamp).seconds();
+    odin_odom_pos << p.x, p.y, p.z;
+    odin_odom_rot = qq.toRotationMatrix();
+    odin_odom_have = true;
+}
+
+// Scheme ②: Mid owns point IEKF; Odin contributes a soft relative-pose factor.
+void apply_odin_pose_factor()
+{
+    if (!lidar2_pose_factor_en)
+        return;
+    double t_o = -1.0;
+    Eigen::Vector3d p_o = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d R_o = Eigen::Matrix3d::Identity();
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        t_o = odin_odom_stamp;
+        p_o = odin_odom_pos;
+        R_o = odin_odom_rot;
+    }
+    if (lidar2_pose_max_dt > 0.0 &&
+        std::fabs(t_o - publish_lidar_time) > lidar2_pose_max_dt)
+        return;
+
+    state_ikfom s = kf.get_x();
+    const M3D R_m = s.rot.toRotationMatrix();
+    const double yaw_m = yaw_from_rot(R_m);
+    const double yaw_o = yaw_from_rot(R_o);
+
+    if (!odin_pose_align_init)
+    {
+        odin_yaw_align = wrap_pi(yaw_m - yaw_o);
+        odin_pose_align_init = true;
+        last_pf_mid_pos = s.pos;
+        last_pf_odin_pos = p_o;
+        last_pf_mid_yaw = yaw_m;
+        last_pf_odin_yaw = wrap_pi(yaw_o + odin_yaw_align);
+        last_pf_valid = true;
+        std::cout << "\033[32;1mOdin pose-factor: yaw_align="
+                  << odin_yaw_align * 180.0 / M_PI << " deg\033[0m" << std::endl;
+        return;
+    }
+    if (!last_pf_valid)
+        return;
+
+    const Eigen::Vector3d dp_m = s.pos - last_pf_mid_pos;
+    const Eigen::Vector3d dp_o_src = p_o - last_pf_odin_pos;
+    const double ca = std::cos(odin_yaw_align);
+    const double sa = std::sin(odin_yaw_align);
+    const Eigen::Vector3d dp_o(ca * dp_o_src(0) - sa * dp_o_src(1),
+                               sa * dp_o_src(0) + ca * dp_o_src(1),
+                               dp_o_src(2));
+    Eigen::Vector3d innov = dp_o - dp_m;
+    // Drop TCP/glitch jumps — do not yank Mid.
+    if (innov.norm() > 0.35)
+    {
+        last_pf_mid_pos = s.pos;
+        last_pf_odin_pos = p_o;
+        last_pf_mid_yaw = yaw_m;
+        last_pf_odin_yaw = wrap_pi(yaw_o + odin_yaw_align);
+        return;
+    }
+
+    const double a = std::max(0.0, std::min(1.0, lidar2_pose_alpha));
+    s.pos += a * innov;
+
+    const double dy_o = wrap_pi(wrap_pi(yaw_o + odin_yaw_align) - last_pf_odin_yaw);
+    const double dy_m = wrap_pi(yaw_m - last_pf_mid_yaw);
+    const double innov_yaw = wrap_pi(dy_o - dy_m);
+    if (std::fabs(innov_yaw) < 0.25)
+    {
+        const Eigen::AngleAxisd aa(a * innov_yaw, Eigen::Vector3d::UnitZ());
+        const Eigen::Matrix3d R_new = aa.toRotationMatrix() * R_m;
+        s.rot = SO3(Eigen::Quaterniond(R_new));
+    }
+
+    kf.change_x(s);
+    n_odin_pose_factor++;
+
+    state_point = s;
+    last_pf_mid_pos = s.pos;
+    last_pf_odin_pos = p_o;
+    last_pf_mid_yaw = yaw_from_rot(s.rot.toRotationMatrix());
+    last_pf_odin_yaw = wrap_pi(yaw_o + odin_yaw_align);
+}
+
 inline bool odin_pose_update_allowed()
 {
     // Full-time tight couple: gates <=0 disable holds (stairs/turns still update).
@@ -220,13 +351,18 @@ inline bool odin_pose_update_allowed()
 inline double odin_cov_scale_now()
 {
     double s = std::max(1.0, lidar2_residual_cov_scale);
+    // Mild motion already weakens Odin — full-time couple was smearing Mid at scale=25.
+    if (last_imu_gyr_norm >= 0.20)
+        s *= 1.5;
     if (last_imu_gyr_norm >= 0.35)
         s *= 2.0;
+    if (last_imu_gyr_pitch >= 0.12)
+        s *= 1.5;
     if (last_imu_gyr_pitch >= 0.20)
         s *= 1.5;
-    if (std::fabs(last_mid_vz) >= 0.12)
+    if (std::fabs(last_mid_vz) >= 0.08)
         s *= 1.5;
-    if (std::fabs(last_mid_pitch) * 180.0 / M_PI >= 10.0)
+    if (std::fabs(last_mid_pitch) * 180.0 / M_PI >= 6.0)
         s *= 1.5;
     return s;
 }
@@ -857,8 +993,9 @@ void map_incremental()
         const bool is_odin_pt =
             feats_down_body->points[i].intensity >= kOdinIntensityTag ||
             (!bundle_enabled && current_lidar_num == 2);
-        // Hold / failed Stage2: never insert Odin into ikdtree (map pollution).
-        if (is_odin_pt && (!odin_pose_update_allowed() || !last_odin_iekf_ok))
+        // Tight-couple pose via residuals, but keep Mid map clean unless enabled.
+        if (is_odin_pt &&
+            (!lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok))
             continue;
         const float bx = feats_down_body->points[i].x;
         const float by = feats_down_body->points[i].y;
@@ -1427,10 +1564,16 @@ public:
 
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("mapping.lidar2_update_en", false);
+        this->declare_parameter<bool>("mapping.lidar2_point_update_en", false);
+        this->declare_parameter<bool>("mapping.lidar2_pose_factor_en", true);
+        this->declare_parameter<double>("mapping.lidar2_pose_alpha", 0.12);
+        this->declare_parameter<double>("mapping.lidar2_pose_max_dt", 0.20);
+        this->declare_parameter<std::string>("mapping.odin_odom_topic", "/odin1/odometry");
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
+        this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
@@ -1504,10 +1647,16 @@ public:
         this->get_parameter_or("mapping.b_acc_cov", b_acc_cov, 0.0001);
         this->get_parameter_or("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
+        this->get_parameter_or("mapping.lidar2_point_update_en", lidar2_point_update_en, false);
+        this->get_parameter_or("mapping.lidar2_pose_factor_en", lidar2_pose_factor_en, true);
+        this->get_parameter_or("mapping.lidar2_pose_alpha", lidar2_pose_alpha, 0.12);
+        this->get_parameter_or("mapping.lidar2_pose_max_dt", lidar2_pose_max_dt, 0.20);
+        this->get_parameter_or("mapping.odin_odom_topic", odin_odom_topic, std::string("/odin1/odometry"));
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
+        this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
@@ -1548,6 +1697,13 @@ public:
         }
 
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (lidar2_pose_factor_en)
+        {
+            sub_odin_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                odin_odom_topic, 50, odin_odom_cb);
+            std::cout << "\033[32;1mOdin pose-factor subscribe: " << odin_odom_topic
+                      << " alpha=" << lidar2_pose_alpha << "\033[0m" << std::endl;
+        }
 
         //---------------------------
         // 4. Create Publishers
@@ -1640,18 +1796,13 @@ public:
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
-                 << " full_time_tight="
-                 << ((lidar2_pose_gyr_gate <= 0.0 && lidar2_pitch_gyr_gate <= 0.0 &&
-                      lidar2_vz_gate <= 0.0 && lidar2_pitch_gate_deg <= 0.0)
-                         ? "true"
-                         : "false")
-                 << " gyr_gate=" << lidar2_pose_gyr_gate
+                 << " point_update=" << (lidar2_point_update_en ? "true" : "false")
+                 << " pose_factor=" << (lidar2_pose_factor_en ? "true" : "false")
+                 << " pose_alpha=" << lidar2_pose_alpha
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
-                 << " (motion-inflated) max_odin_res=" << lidar2_max_residual << "m"
-                 << " pitch_gyr=" << lidar2_pitch_gyr_gate
-                 << " vz=" << lidar2_vz_gate
-                 << " pitch_deg=" << lidar2_pitch_gate_deg
+                 << " max_odin_res=" << lidar2_max_residual << "m"
+                 << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
@@ -1846,8 +1997,9 @@ private:
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-                // Stage 2: always soft-update with Odin when bundle+L2 synced.
-                const bool odin_ok = bundle_enabled && odin_pose_update_allowed() &&
+                // Optional Stage 2 point residuals (usually OFF — prefer pose-factor).
+                const bool odin_ok = lidar2_point_update_en && bundle_enabled &&
+                                     odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0;
                 if (odin_ok)
                 {
@@ -1856,14 +2008,15 @@ private:
                     double solve2 = 0;
                     kf.update_iterated_dyn_share_modified(R_odin, solve2);
                     solve_H_time += solve2;
-                    // Only allow Odin map insert when Stage2 had effective matches.
                     last_odin_iekf_ok = (effect_feat_num > 0);
                     if (last_odin_iekf_ok)
                         n_odin_iekf_updates++;
                 }
-                else if (bundle_enabled && lidar2_update_en)
+                else if (bundle_enabled && lidar2_update_en && lidar2_point_update_en)
                     n_odin_hold_stairs++;
                 residual_select = 1;
+                // Scheme ②: soft relative pose factor from Odin odometry.
+                apply_odin_pose_factor();
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 // Refresh climb/pitch gates from Mid state for the next frame.
@@ -1958,6 +2111,7 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc2_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox2_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odin_odom_;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
