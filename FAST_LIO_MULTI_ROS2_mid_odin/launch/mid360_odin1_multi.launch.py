@@ -163,9 +163,10 @@ def generate_launch_description():
                     'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'odin_odom_topic': '/odin1/odometry',
                     'odin_odom_max_dt': 1.0,
-                    # Looser gates: dock TCP + restamp leaves residual lag vs Mid.
-                    'mid_restamp_max_dt': 0.40,
-                    'max_cloud_age_sec': 1.50,
+                    # Must match mapping.lidar2_max_sync_dt: never restamp L2
+                    # outside this window (lying stamps twist Mid IEKF).
+                    'mid_restamp_max_dt': 0.05,
+                    'max_cloud_age_sec': 0.50,
                     # 50ms floor between pubs; with latest-only pending this is the
                     # main rate limit (was 100ms and also processed backlogged frames).
                     'fallback_period': 0.05,

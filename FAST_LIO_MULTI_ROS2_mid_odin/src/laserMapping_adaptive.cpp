@@ -172,9 +172,14 @@ double lidar2_pitch_gate_deg = 10.0; // |pitch| of Mid state
 double lidar2_max_sync_dt = 0.08;
 // Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
 double lidar2_residual_cov_scale = 25.0;
+// Reject Odin point-to-plane residuals larger than this (meters) in Stage2.
+double lidar2_max_residual = 0.12;
+// True only after a successful Stage2 Odin update this frame (gates map insert).
+bool last_odin_iekf_ok = false;
 long long n_skip_l2_sync = 0;
 long long n_odin_iekf_updates = 0;
 long long n_odin_hold_stairs = 0;
+long long n_odin_res_clip = 0;
 // Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
 // state_point right after IEKF. Stamp-based lookup failed in practice:
 // /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
@@ -834,9 +839,11 @@ void map_incremental()
     const float det_r2 = DET_RANGE * DET_RANGE;
     for (int i = 0; i < feats_down_size; i++)
     {
-        if (!odin_pose_update_allowed() &&
-            (feats_down_body->points[i].intensity >= kOdinIntensityTag ||
-             (!bundle_enabled && current_lidar_num == 2)))
+        const bool is_odin_pt =
+            feats_down_body->points[i].intensity >= kOdinIntensityTag ||
+            (!bundle_enabled && current_lidar_num == 2);
+        // Hold / failed Stage2: never insert Odin into ikdtree (map pollution).
+        if (is_odin_pt && (!odin_pose_update_allowed() || !last_odin_iekf_ok))
             continue;
         const float bx = feats_down_body->points[i].x;
         const float by = feats_down_body->points[i].y;
@@ -1273,6 +1280,17 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
             if (s > s_thr)
             {
+                // Soft tight-couple: clip large Odin residuals so bad L2 cannot yank Mid.
+                if (is_odin && lidar2_max_residual > 0.0 &&
+                    std::fabs(pd2) > lidar2_max_residual)
+                {
+                    point_selected_surf[i] = false;
+                    #ifdef MP_EN
+                    #pragma omp atomic
+                    #endif
+                    n_odin_res_clip++;
+                    continue;
+                }
                 point_selected_surf[i] = true;
                 normvec->points[i].x = pabcd(0);
                 normvec->points[i].y = pabcd(1);
@@ -1397,6 +1415,7 @@ public:
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
+        this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
@@ -1473,6 +1492,7 @@ public:
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
+        this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
@@ -1611,6 +1631,7 @@ public:
                          : " rad/s (hold Odin IEKF above)")
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
+                 << " max_odin_res=" << lidar2_max_residual << "m"
                  << " pitch_gyr=" << lidar2_pitch_gyr_gate
                  << " vz=" << lidar2_vz_gate
                  << " pitch_deg=" << lidar2_pitch_gate_deg
@@ -1804,6 +1825,7 @@ private:
                 Nearest_Points.resize(feats_down_size);
                 /*** iterated state estimation (two-stage tight couple) ***/
                 double solve_H_time = 0;
+                last_odin_iekf_ok = false;
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
@@ -1818,7 +1840,10 @@ private:
                     double solve2 = 0;
                     kf.update_iterated_dyn_share_modified(R_odin, solve2);
                     solve_H_time += solve2;
-                    n_odin_iekf_updates++;
+                    // Only allow Odin map insert when Stage2 had effective matches.
+                    last_odin_iekf_ok = (effect_feat_num > 0);
+                    if (last_odin_iekf_ok)
+                        n_odin_iekf_updates++;
                 }
                 else if (bundle_enabled && lidar2_update_en)
                     n_odin_hold_stairs++;

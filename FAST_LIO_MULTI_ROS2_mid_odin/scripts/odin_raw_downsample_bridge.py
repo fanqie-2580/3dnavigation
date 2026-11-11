@@ -7,12 +7,13 @@ Pipeline:
   2) Confidence filter when field exists.
   3) Voxel downsample; keep offset_time (s) when present (else 0).
   4) Optional ground-only keep (RANSAC plane in lidar frame) for L2 densify.
-  5) Restamp only to a Mid /Odometry stamp within mid_restamp_max_dt of the
-     *cloud* stamp (never latest Mid while geometry is seconds old).
-     Always enforce monotonic stamps to avoid L2 "loop back".
-  6) Rate-limit ~one cloud per Mid odom tick when Mid odom is flowing;
-     otherwise publish every Nth input (~10 Hz).
-  7) Drop clouds older than max_cloud_age_sec vs newest Mid (stale TCP backlog).
+  5) Viz: restamp to a Mid /Odometry stamp within mid_restamp_max_dt of the
+     *cloud* stamp (never latest Mid while geometry is old). Monotonic nudge
+     applies to viz only.
+  6) L2 body: unproject at geometry stamp; publish only when a Mid stamp is
+     within mid_restamp_max_dt (must match mapping.lidar2_max_sync_dt). Never
+     lie-restamp L2 outside the window.
+  7) Rate-limit / age-gate vs Mid to drop stale TCP backlog.
 """
 from __future__ import annotations
 
@@ -272,9 +273,10 @@ class OdinRawDownsampleBridge(Node):
         self._last_pub_key: Optional[Tuple[int, int]] = None
         self._last_pub_sec = -1.0
         self._pending: Optional[PointCloud2] = None
+        self._pending_wall = -1.0
         self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
-        # (t_sec, stamp_msg)
-        self._mid_stamps: Deque[Tuple[float, object]] = deque(maxlen=500)
+        # (t_stamp, stamp_msg, wall_sec) — wall used when Livox≠system timebase
+        self._mid_stamps: Deque[Tuple[float, object, float]] = deque(maxlen=500)
         self._warned_odom_cloud = False
         self._n_cloud = 0
         self._n_mid = 0
@@ -283,6 +285,7 @@ class OdinRawDownsampleBridge(Node):
         self._n_ground_pub = 0
         self._n_skip_unproj = 0
         self._n_skip_l2 = 0
+        self._n_skip_l2_sync = 0
         self._n_l2_pub = 0
         self._n_skip_empty = 0
         self._n_skip_age = 0
@@ -292,6 +295,8 @@ class OdinRawDownsampleBridge(Node):
         self._last_n_ground = 0
         self._last_n_l2 = 0
         self._last_mid_wall = -1.0
+        self._last_viz_pub_sec = -1.0
+        self._last_l2_match = '-'
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
         self.declare_parameter('mid_stall_fallback_sec', 0.5)
@@ -343,8 +348,9 @@ class OdinRawDownsampleBridge(Node):
             f'last_ground={self._last_n_ground} '
             f'mode={self._last_ground_mode} skip_ground={self._n_skip_ground} '
             f'skip_unproj={self._n_skip_unproj} skip_l2={self._n_skip_l2} '
-            f'skip_empty={self._n_skip_empty} '
-            f'skip_age={self._n_skip_age} pending={"Y" if self._pending is not None else "N"}'
+            f'skip_l2_sync={self._n_skip_l2_sync} skip_empty={self._n_skip_empty} '
+            f'skip_age={self._n_skip_age} l2_match={self._last_l2_match} '
+            f'pending={"Y" if self._pending is not None else "N"}'
         )
 
     def _voxel_downsample(self, arr: np.ndarray) -> np.ndarray:
@@ -413,23 +419,57 @@ class OdinRawDownsampleBridge(Node):
         self._odin_odom.append((t, _mat_from_odom(msg)))
 
     def _nearest_mid_stamp(self, t_cloud: float):
+        """Stamp-timebase match. Returns (t_stamp, stamp_msg, abs_dt) or None."""
         best = None
         best_dt = 1e9
-        for t, st in self._mid_stamps:
+        for t, st, _wall in self._mid_stamps:
             dt = abs(t - t_cloud)
             if dt < best_dt:
                 best_dt = dt
                 best = (t, st, dt)
         return best
 
+    def _nearest_mid_by_wall(self, wall_cloud: float):
+        """Arrival-time match for Livox-vs-system clock skew.
+
+        Returns (t_stamp, stamp_msg, abs_wall_dt) or None.
+        """
+        best = None
+        best_dt = 1e9
+        for t, st, wall in self._mid_stamps:
+            dt = abs(wall - wall_cloud)
+            if dt < best_dt:
+                best_dt = dt
+                best = (t, st, dt)
+        return best
+
+    def _match_mid_for_l2(self, t_cloud: float, wall_cloud: float):
+        """Prefer same-timebase stamp match; else pair by arrival within window.
+
+        L2 header becomes the matched Mid stamp so IEKF sync_dt≈0 while geometry
+        stays unprojected at the Odin/geometry stamp (no Mid-IMU re-deskew).
+        """
+        stamp_hit = self._nearest_mid_stamp(t_cloud)
+        if stamp_hit is not None and stamp_hit[2] <= self.mid_restamp_max_dt:
+            self._last_l2_match = f'stamp:{stamp_hit[2]*1000:.0f}ms'
+            return stamp_hit
+        if wall_cloud > 0.0:
+            wall_hit = self._nearest_mid_by_wall(wall_cloud)
+            if wall_hit is not None and wall_hit[2] <= self.mid_restamp_max_dt:
+                self._last_l2_match = f'wall:{wall_hit[2]*1000:.0f}ms'
+                return wall_hit
+        self._last_l2_match = 'none'
+        return None
+
     def on_mid_odom(self, msg: Odometry) -> None:
         self._n_mid += 1
-        self._last_mid_wall = self.get_clock().now().nanoseconds * 1e-9
+        wall = self.get_clock().now().nanoseconds * 1e-9
+        self._last_mid_wall = wall
         key = _stamp_key(msg.header.stamp)
         t = _stamp_sec(msg.header.stamp)
         self._mid_odom_stamp = msg.header.stamp
         self._mid_odom_key = key
-        self._mid_stamps.append((t, msg.header.stamp))
+        self._mid_stamps.append((t, msg.header.stamp, wall))
         if self.one_cloud_per_odom and self._pending is not None and self._last_pub_key != key:
             # Match Mid stamp to *pending cloud* time — not blindly latest Mid.
             if self._publish_from_msg(self._pending, None):
@@ -470,6 +510,7 @@ class OdinRawDownsampleBridge(Node):
         """
         self._n_cloud += 1
         self._pending = msg
+        self._pending_wall = self.get_clock().now().nanoseconds * 1e-9
 
     def _poll_pending(self) -> None:
         msg = self._pending
@@ -479,12 +520,13 @@ class OdinRawDownsampleBridge(Node):
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         if self._last_pub_sec >= 0.0 and (now_sec - self._last_pub_sec) < self.fallback_period:
             return
+        wall_cloud = self._pending_wall
         self._pending = None
+        self._pending_wall = -1.0
 
-        t_cloud = _stamp_sec(msg.header.stamp)
-        if self._mid_stamps and self.max_cloud_age_sec > 0.0:
-            newest_mid = self._mid_stamps[-1][0]
-            if (newest_mid - t_cloud) > self.max_cloud_age_sec:
+        # Age-gate by wall arrival (Livox stamp vs system restamp are not comparable).
+        if self.max_cloud_age_sec > 0.0 and wall_cloud > 0.0:
+            if (now_sec - wall_cloud) > self.max_cloud_age_sec:
                 self._n_skip_age += 1
                 return
 
@@ -496,20 +538,18 @@ class OdinRawDownsampleBridge(Node):
             # Align publish cadence to Mid odom when requested.
             if self._mid_odom_key is None or self._last_pub_key == self._mid_odom_key:
                 self._pending = msg  # wait for a new Mid tick
+                self._pending_wall = wall_cloud
                 return
-            if self._publish_from_msg(msg, None):
+            if self._publish_from_msg(msg, None, wall_cloud=wall_cloud):
                 self._last_pub_key = self._mid_odom_key
             return
 
-        self._publish_from_msg(msg, msg.header.stamp)
+        self._publish_from_msg(msg, msg.header.stamp, wall_cloud=wall_cloud)
 
-    def _publish_from_msg(self, msg: PointCloud2, stamp) -> bool:
+    def _publish_from_msg(self, msg: PointCloud2, stamp, wall_cloud: float = -1.0) -> bool:
         t_cloud = _stamp_sec(msg.header.stamp)
-        if self._mid_stamps and self.max_cloud_age_sec > 0.0:
-            newest_mid = self._mid_stamps[-1][0]
-            if (newest_mid - t_cloud) > self.max_cloud_age_sec:
-                self._n_skip_age += 1
-                return False
+        if wall_cloud < 0.0:
+            wall_cloud = self.get_clock().now().nanoseconds * 1e-9
 
         arr = _unpack_points(msg, self.min_confidence)
         if arr.size == 0:
@@ -569,67 +609,77 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_ground += 1
             return False
 
-        # Match Mid by cloud stamp; never force latest Mid onto old geometry.
+        # Match Mid for viz/L2: stamp timebase first, else arrival (clock skew).
         if stamp is None:
             stamp = msg.header.stamp
-        if self.restamp_from_odom and self._mid_stamps:
-            mid = self._nearest_mid_stamp(t_cloud)
-            if mid is not None and mid[2] <= self.mid_restamp_max_dt:
-                stamp = mid[1]
-            # else keep cloud stamp (better than lying with latest Mid)
-        pub_sec = _stamp_sec(stamp)
-        # Enforce monotonic stamps for L2 buffer.
-        if pub_sec + 1e-6 < self._last_pub_sec:
-            stamp = self.get_clock().now().to_msg()
-            pub_sec = _stamp_sec(stamp)
-        if pub_sec < self._last_pub_sec + 1e-4:
-            # Nudge forward by 1ms to keep strictly increasing.
-            pub_sec = self._last_pub_sec + 1e-3
-            sec = int(pub_sec)
-            nsec = int((pub_sec - sec) * 1e9)
-            stamp = type(stamp)(sec=sec, nanosec=nsec)
-        self._last_pub_sec = pub_sec
+        geom_stamp = msg.header.stamp
+        mid_match = self._match_mid_for_l2(t_cloud, wall_cloud) if self._mid_stamps else None
+        viz_stamp = stamp
+        if self.restamp_from_odom and mid_match is not None:
+            viz_stamp = mid_match[1]
+        viz_sec = _stamp_sec(viz_stamp)
+        # Monotonic nudge only for viz (not L2): avoids header loop-back spam.
+        if viz_sec + 1e-6 < self._last_viz_pub_sec:
+            viz_sec = self._last_viz_pub_sec + 1e-3
+            sec = int(viz_sec)
+            nsec = int((viz_sec - sec) * 1e9)
+            viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
+        elif viz_sec < self._last_viz_pub_sec + 1e-4:
+            viz_sec = self._last_viz_pub_sec + 1e-3
+            sec = int(viz_sec)
+            nsec = int((viz_sec - sec) * 1e9)
+            viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
+        self._last_viz_pub_sec = viz_sec
+        self._last_pub_sec = viz_sec
 
         header = Header()
-        header.stamp = stamp
+        header.stamp = viz_stamp
         header.frame_id = self._out_frame_id
 
-        # Viz / densify: Mid-restamped time on main topic.
+        # Viz / densify: Mid-associated time on main topic.
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:
             # B1 densify pairs with /odin1/odometry → keep original cloud stamp.
             g_header = Header()
-            g_header.stamp = msg.header.stamp
+            g_header.stamp = geom_stamp
             g_header.frame_id = 'odin_lidar'
             self.pub_ground.publish(self._make_cloud(g_header, ground))
             self._n_ground_pub += 1
         if self.pub_full is not None and len(arr) > 0:
             self.pub_full.publish(self._make_cloud(header, arr))
 
-        # Dual-stream L2 body for IEKF: unproject at original cloud stamp only.
-        # Failure skips L2 pub — never blocks viz main output.
+        # Dual-stream L2 body for IEKF: unproject at geometry stamp only.
+        # Require Mid association within mid_restamp_max_dt (stamp or wall).
         if self.pub_l2 is not None:
-            l2_arr = None
-            if in_odom:
-                if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
-                    # Main path already unprojected+voxelized.
-                    l2_arr = out_arr if not self.ground_only else arr
+            l2_ok = True
+            l2_stamp = geom_stamp
+            if self.restamp_from_odom:
+                if mid_match is None:
+                    self._n_skip_l2_sync += 1
+                    l2_ok = False
                 else:
-                    body = self._unproject_to_lidar(arr_raw, msg.header.stamp)
-                    if body is None:
-                        self._n_skip_l2 += 1
+                    l2_stamp = mid_match[1]
+            if l2_ok:
+                l2_arr = None
+                if in_odom:
+                    if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
+                        l2_arr = out_arr if not self.ground_only else arr
                     else:
-                        l2_arr = self._voxel_downsample(body)
-            else:
-                l2_arr = out_arr if not self.ground_only else arr
-            if l2_arr is not None and len(l2_arr) > 0:
-                l2_header = Header()
-                l2_header.stamp = stamp
-                l2_header.frame_id = 'odin_lidar'
-                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
-                self._n_l2_pub += 1
-                self._last_n_l2 = int(len(l2_arr))
+                        body = self._unproject_to_lidar(arr_raw, geom_stamp)
+                        if body is None:
+                            self._n_skip_l2 += 1
+                        else:
+                            l2_arr = self._voxel_downsample(body)
+                else:
+                    l2_arr = out_arr if not self.ground_only else arr
+                if l2_arr is not None and len(l2_arr) > 0:
+                    l2_header = Header()
+                    l2_header.stamp = l2_stamp
+                    l2_header.frame_id = 'odin_lidar'
+                    self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
+                    self._n_l2_pub += 1
+                    self._last_n_l2 = int(len(l2_arr))
         return True
 
 

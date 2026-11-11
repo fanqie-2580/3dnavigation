@@ -64,9 +64,12 @@
       lidar2_vz_gate: 0.12
       lidar2_pitch_gate_deg: 10.0
       # Drop L2 frames whose stamp is farther than this from paired Mid scan.
+      # Must match launch mid_restamp_max_dt (bridge skips L2 outside window).
       lidar2_max_sync_dt: 0.05
-      # Soft Odin stage: larger = weaker pull on Mid (40 ≈ safer on rough ground).
-      lidar2_residual_cov_scale: 40.0
+      # Soft Odin stage: larger = weaker pull on Mid (25 = tighter flat-ground).
+      lidar2_residual_cov_scale: 25.0
+      # Clip Odin point-to-plane |pd| above this (m) before Stage2 IEKF.
+      lidar2_max_residual: 0.12
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
