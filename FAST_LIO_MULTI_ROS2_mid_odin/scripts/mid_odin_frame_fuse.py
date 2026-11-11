@@ -171,12 +171,9 @@ class MidOdinFrameFuse(Node):
 
         self.pub_scan = self.create_publisher(PointCloud2, '/cloud_fused', 5)
         self.pub_accum = self.create_publisher(PointCloud2, '/viz/accum_fused', 1)
-        # Only advertise /viz/accum_odin when we own densify (else independent_accum).
-        self.pub_accum_odin = None
-        if self.accumulate_odin:
-            self.pub_accum_odin = self.create_publisher(
-                PointCloud2, str(self.get_parameter('odin_accum_topic').value), 1
-            )
+        self.pub_accum_odin = self.create_publisher(
+            PointCloud2, str(self.get_parameter('odin_accum_topic').value), 1
+        )
 
         self.create_subscription(
             PointCloud2,
@@ -328,12 +325,7 @@ class MidOdinFrameFuse(Node):
         h.stamp = stamp
         h.frame_id = self.map_frame
 
-        if (
-            self.accumulate_odin
-            and self.pub_accum_odin is not None
-            and odin_m is not None
-            and odin_m.size
-        ):
+        if self.accumulate_odin and odin_m is not None and odin_m.size:
             self.pub_accum_odin.publish(make_cloud(h, odin_m))
             self._dirty_odin = False
 

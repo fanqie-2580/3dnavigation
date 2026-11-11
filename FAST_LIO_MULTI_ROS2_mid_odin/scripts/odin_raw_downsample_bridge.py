@@ -304,13 +304,6 @@ class OdinRawDownsampleBridge(Node):
         self.mid_stall_fallback_sec = float(self.get_parameter('mid_stall_fallback_sec').value)
 
         reliable = QoSProfile(
-            depth=20,
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        # Depth 1: a depth-20 queue + slow voxel kept republishing ~3s-old
-        # cloud_slam, so densify landed where the robot used to be.
-        cloud_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -326,7 +319,7 @@ class OdinRawDownsampleBridge(Node):
         self.pub_l2 = None
         if self.l2_body_topic and self.l2_body_topic != out:
             self.pub_l2 = self.create_publisher(PointCloud2, self.l2_body_topic, reliable)
-        self.sub = self.create_subscription(PointCloud2, inn, self.cb, cloud_qos)
+        self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
         self.create_subscription(
             Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
         )
@@ -532,11 +525,11 @@ class OdinRawDownsampleBridge(Node):
         self._pending = None
         self._pending_wall = -1.0
 
-        # Drop scans that sat in the executor queue. Painting them stacks
-        # geometry from where the robot was, not where it is.
-        if wall_cloud > 0.0 and (now_sec - wall_cloud) > 0.35:
-            self._n_skip_age += 1
-            return
+        # Age-gate by wall arrival (Livox stamp vs system restamp are not comparable).
+        if self.max_cloud_age_sec > 0.0 and wall_cloud > 0.0:
+            if (now_sec - wall_cloud) > self.max_cloud_age_sec:
+                self._n_skip_age += 1
+                return
 
         if (
             self.one_cloud_per_odom
@@ -617,42 +610,33 @@ class OdinRawDownsampleBridge(Node):
             self._n_skip_ground += 1
             return False
 
-        # Main densify topic MUST keep Odin geometry/receive stamp.
-        # Mid-restamping odom-frame cloud_slam made /odin1/cloud_raw_ds ~1–2s
-        # behind /odin1/odometry (and Mid Livox stamps), so any stamp-paired
-        # path painted densify at the wrong pose. L2 body may still Mid-match.
+        # Both streams are stamped on the Livox clock at the TCP client.
+        # Copying a Mid header onto this cloud made /cloud_raw_ds seconds
+        # behind /odin1/odometry, so accum warped the scan to the wrong pose.
         if stamp is None:
             stamp = msg.header.stamp
         geom_stamp = msg.header.stamp
-        mid_match = self._match_mid_for_l2(t_cloud, wall_cloud) if self._mid_stamps else None
-        keep_odin_stamp = self._out_frame_id in ('odin_lidar', 'odom', 'map')
-        if keep_odin_stamp:
-            viz_stamp = geom_stamp
-        else:
-            viz_stamp = stamp
-            if self.restamp_from_odom and mid_match is not None:
-                viz_stamp = mid_match[1]
+        if self._mid_stamps:
+            self._match_mid_for_l2(t_cloud, wall_cloud)
+        viz_stamp = geom_stamp
         viz_sec = _stamp_sec(viz_stamp)
-        # Monotonic nudge for publish cadence only (keep ≤1ms so odom pair still works).
-        if viz_sec + 1e-6 < self._last_viz_pub_sec:
-            viz_sec = self._last_viz_pub_sec + 1e-3
-            sec = int(viz_sec)
-            nsec = int((viz_sec - sec) * 1e9)
-            viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
-        elif viz_sec < self._last_viz_pub_sec + 1e-4:
+        # Only nudge a sub-frame duplicate. A larger step back is a clock
+        # correction; crawling +1ms/frame froze the stamp seconds in the past.
+        if self._last_viz_pub_sec > 0.0 and 0.0 <= (self._last_viz_pub_sec - viz_sec) <= 0.02:
             viz_sec = self._last_viz_pub_sec + 1e-3
             sec = int(viz_sec)
             nsec = int((viz_sec - sec) * 1e9)
             viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
         self._last_viz_pub_sec = viz_sec
-        # Same clock as _poll_pending (ROS). time.time() made the rate gate lie.
+        # Rate-limit on the ROS clock. viz_sec is a Livox stamp and must not
+        # be mixed into this gate.
         self._last_pub_sec = self.get_clock().now().nanoseconds * 1e-9
 
         header = Header()
         header.stamp = viz_stamp
         header.frame_id = self._out_frame_id
 
-        # Main topic: Odin stamp (lidar or odom-frame densify).
+        # Main topic: geometry stamp when lidar-frame (raw densify).
         self.pub.publish(self._make_cloud(header, out_arr))
         self._n_pub += 1
         if self.pub_ground is not None and len(ground) > 0:
@@ -665,37 +649,29 @@ class OdinRawDownsampleBridge(Node):
         if self.pub_full is not None and len(arr) > 0:
             self.pub_full.publish(self._make_cloud(header, arr))
 
-        # Dual-stream L2 body for IEKF: unproject at geometry stamp only.
-        # Require Mid association within mid_restamp_max_dt (stamp or wall).
+        # L2 keeps the Livox-aligned geometry stamp. Copying the Mid header
+        # made sync_dt look like 0 while the points were from another instant.
         if self.pub_l2 is not None:
-            l2_ok = True
             l2_stamp = geom_stamp
-            if self.restamp_from_odom:
-                if mid_match is None:
-                    self._n_skip_l2_sync += 1
-                    l2_ok = False
-                else:
-                    l2_stamp = mid_match[1]
-            if l2_ok:
-                l2_arr = None
-                if in_odom:
-                    if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
-                        l2_arr = out_arr if not self.ground_only else arr
-                    else:
-                        body = self._unproject_to_lidar(arr_raw, geom_stamp)
-                        if body is None:
-                            self._n_skip_l2 += 1
-                        else:
-                            l2_arr = self._voxel_downsample(body)
-                else:
+            l2_arr = None
+            if in_odom:
+                if self.unproject_odom_clouds and self._out_frame_id == 'odin_lidar':
                     l2_arr = out_arr if not self.ground_only else arr
-                if l2_arr is not None and len(l2_arr) > 0:
-                    l2_header = Header()
-                    l2_header.stamp = l2_stamp
-                    l2_header.frame_id = 'odin_lidar'
-                    self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
-                    self._n_l2_pub += 1
-                    self._last_n_l2 = int(len(l2_arr))
+                else:
+                    body = self._unproject_to_lidar(arr_raw, geom_stamp)
+                    if body is None:
+                        self._n_skip_l2 += 1
+                    else:
+                        l2_arr = self._voxel_downsample(body)
+            else:
+                l2_arr = out_arr if not self.ground_only else arr
+            if l2_arr is not None and len(l2_arr) > 0:
+                l2_header = Header()
+                l2_header.stamp = l2_stamp
+                l2_header.frame_id = 'odin_lidar'
+                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
+                self._n_l2_pub += 1
+                self._last_n_l2 = int(len(l2_arr))
         return True
 
 

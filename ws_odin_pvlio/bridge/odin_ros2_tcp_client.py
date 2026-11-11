@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """TCP -> ROS2 (Jetson) bridge client for Odin imu/cloud_slam/odometry."""
 import socket
+import statistics
 import struct
 import threading
 import time
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2, PointField
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseWithCovariance, TwistWithCovariance
@@ -115,31 +118,91 @@ class OdinBridgeClient(Node):
         self.declare_parameter("imu_topic", "/odin1/imu")
         self.declare_parameter("cloud_topic", "/odin1/cloud_slam")
         self.declare_parameter("odom_topic", "/odin1/odometry")
-        # Dock host clock is often wrong (e.g. stuck in 1970). Restamp with Jetson
-        # ROS time so Mid/Odin fusion age gates and restamp matching work.
+        # Dock clock is often wrong. Restamp on receive, then subtract the
+        # offset of /Odometry (Livox scan time). /livox/imu is host time and
+        # sits ~1s ahead of the lidar stamp the pose factor compares against.
         self.declare_parameter("restamp_on_receive", True)
+        self.declare_parameter("sync_to_livox", True)
+        self.declare_parameter("livox_clock_topic", "/Odometry")
         self.host = self.get_parameter("server_host").value
         self.port = int(self.get_parameter("server_port").value)
         imu_topic = self.get_parameter("imu_topic").value
         cloud_topic = self.get_parameter("cloud_topic").value
         odom_topic = self.get_parameter("odom_topic").value
         self.restamp_on_receive = bool(self.get_parameter("restamp_on_receive").value)
+        self.sync_to_livox = bool(self.get_parameter("sync_to_livox").value)
+        self._offsets = deque(maxlen=40)
+        self._offset = None
+        self._offset_lock = threading.Lock()
 
         self.pub_imu = self.create_publisher(Imu, imu_topic, 200)
         self.pub_cloud = self.create_publisher(PointCloud2, cloud_topic, 10)
         # also republish as cloud_raw alias only if topic is slam (mapper may listen slam)
         self.pub_odom = self.create_publisher(Odometry, odom_topic, 50)
+        if self.sync_to_livox:
+            clock_qos = QoSProfile(
+                depth=50,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Odometry,
+                str(self.get_parameter("livox_clock_topic").value),
+                self._on_livox_clock,
+                clock_qos,
+            )
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self.get_logger().info(
             f"bridging tcp://{self.host}:{self.port} -> {imu_topic}, {cloud_topic}, {odom_topic} "
-            f"restamp={self.restamp_on_receive}"
+            f"restamp={self.restamp_on_receive} sync_to_livox={self.sync_to_livox}"
         )
 
+    def _on_livox_clock(self, msg: Odometry) -> None:
+        st = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        if st < 1.0e9:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        with self._offset_lock:
+            if self._offset is not None and len(self._offsets) >= 30:
+                return
+            self._offsets.append(now - st)
+            self._offset = float(statistics.median(self._offsets))
+            frozen = len(self._offsets) >= 30
+        if frozen:
+            self.get_logger().info(
+                f"Livox lidar clock offset frozen at {self._offset:.3f}s "
+                f"(from {self.get_parameter('livox_clock_topic').value})"
+            )
+
+    def _livox_stamp(self):
+        now = self.get_clock().now()
+        with self._offset_lock:
+            off = self._offset
+        if off is None:
+            return None
+        t = now.nanoseconds * 1e-9 - off
+        sec = int(t)
+        nsec = int(round((t - sec) * 1e9))
+        if nsec >= 1000000000:
+            sec += 1
+            nsec -= 1000000000
+        if nsec < 0:
+            sec -= 1
+            nsec += 1000000000
+        return Time(sec=sec, nanosec=nsec)
+
     def _maybe_restamp(self, msg):
-        if self.restamp_on_receive:
-            msg.header.stamp = self.get_clock().now().to_msg()
+        if not self.restamp_on_receive:
+            return msg
+        if self.sync_to_livox:
+            stamp = self._livox_stamp()
+            if stamp is None:
+                return None
+            msg.header.stamp = stamp
+            return msg
+        msg.header.stamp = self.get_clock().now().to_msg()
         return msg
 
     def destroy_node(self):
@@ -174,11 +237,17 @@ class OdinBridgeClient(Node):
                 msg_type, length = struct.unpack("<BI", hdr)
                 payload = recv_exact(sock, length)
                 if msg_type == TYPE_IMU:
-                    self.pub_imu.publish(self._maybe_restamp(decode_imu(payload)))
+                    msg = self._maybe_restamp(decode_imu(payload))
+                    if msg is not None:
+                        self.pub_imu.publish(msg)
                 elif msg_type == TYPE_CLOUD:
-                    self.pub_cloud.publish(self._maybe_restamp(decode_cloud(payload)))
+                    msg = self._maybe_restamp(decode_cloud(payload))
+                    if msg is not None:
+                        self.pub_cloud.publish(msg)
                 elif msg_type == TYPE_ODOM:
-                    self.pub_odom.publish(self._maybe_restamp(decode_odom(payload)))
+                    msg = self._maybe_restamp(decode_odom(payload))
+                    if msg is not None:
+                        self.pub_odom.publish(msg)
         finally:
             try:
                 sock.close()

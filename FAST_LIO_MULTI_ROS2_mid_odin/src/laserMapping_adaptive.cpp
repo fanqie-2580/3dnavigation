@@ -165,11 +165,18 @@ bool lidar2_pose_factor_en = true;
 double lidar2_pose_alpha = 0.12;   // blend weight on relative innov [0,1]
 double lidar2_pose_max_dt = 0.20;  // s vs Mid scan time
 std::string odin_odom_topic = "/odin1/odometry";
+struct OdinPoseSample
+{
+    double t;
+    Eigen::Vector3d p;
+    Eigen::Matrix3d R;
+};
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 Eigen::Vector3d odin_odom_pos = Eigen::Vector3d::Zero();
 Eigen::Matrix3d odin_odom_rot = Eigen::Matrix3d::Identity();
 bool odin_odom_have = false;
+std::deque<OdinPoseSample> odin_pose_hist;
 bool odin_pose_align_init = false;
 double odin_yaw_align = 0.0; // Mid_yaw - Odin_yaw at lock
 Eigen::Vector3d last_pf_mid_pos = Eigen::Vector3d::Zero();
@@ -245,6 +252,14 @@ void odin_odom_cb(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_pos << p.x, p.y, p.z;
     odin_odom_rot = qq.toRotationMatrix();
     odin_odom_have = true;
+    OdinPoseSample sample;
+    sample.t = odin_odom_stamp;
+    sample.p = odin_odom_pos;
+    sample.R = odin_odom_rot;
+    odin_pose_hist.push_back(sample);
+    const double keep_from = odin_odom_stamp - 2.0;
+    while (!odin_pose_hist.empty() && odin_pose_hist.front().t < keep_from)
+        odin_pose_hist.pop_front();
 }
 
 // Scheme ②: Mid owns point IEKF; Odin contributes a soft relative-pose factor.
@@ -257,15 +272,33 @@ void apply_odin_pose_factor()
     Eigen::Matrix3d R_o = Eigen::Matrix3d::Identity();
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
-        if (!odin_odom_have)
+        if (!odin_odom_have || odin_pose_hist.empty())
             return;
-        t_o = odin_odom_stamp;
-        p_o = odin_odom_pos;
-        R_o = odin_odom_rot;
+        // Pair the Odin pose whose stamp is closest to this Mid scan, not the
+        // newest packet. Newest-only was ~0.2–1.5s off the Livox scan time.
+        size_t best = 0;
+        double best_dt = std::fabs(odin_pose_hist[0].t - publish_lidar_time);
+        for (size_t i = 1; i < odin_pose_hist.size(); ++i)
+        {
+            const double dt = std::fabs(odin_pose_hist[i].t - publish_lidar_time);
+            if (dt < best_dt)
+            {
+                best_dt = dt;
+                best = i;
+            }
+        }
+        if (lidar2_pose_max_dt > 0.0 && best_dt > lidar2_pose_max_dt)
+        {
+            static int n_pf_dt = 0;
+            if (++n_pf_dt % 20 == 1)
+                std::cout << "\033[33;1mOdin pose-factor dt reject "
+                          << best_dt * 1000.0 << " ms\033[0m" << std::endl;
+            return;
+        }
+        t_o = odin_pose_hist[best].t;
+        p_o = odin_pose_hist[best].p;
+        R_o = odin_pose_hist[best].R;
     }
-    if (lidar2_pose_max_dt > 0.0 &&
-        std::fabs(t_o - publish_lidar_time) > lidar2_pose_max_dt)
-        return;
 
     state_ikfom s = kf.get_x();
     const M3D R_m = s.rot.toRotationMatrix();
@@ -510,6 +543,8 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        time_buffer.clear();
+        lidar_pushed = false;
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
@@ -546,6 +581,8 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer2.clear();
+        time_buffer2.clear();
+        lidar_pushed = false;
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
@@ -570,6 +607,8 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        time_buffer.clear();
+        lidar_pushed = false;
     }
     last_timestamp_lidar = rclcpp::Time(msg->header.stamp).seconds();
 
@@ -590,6 +629,8 @@ void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer2.clear();
+        time_buffer2.clear();
+        lidar_pushed = false;
     }
     last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
     

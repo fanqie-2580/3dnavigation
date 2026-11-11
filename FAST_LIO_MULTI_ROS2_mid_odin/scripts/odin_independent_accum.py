@@ -205,11 +205,6 @@ class OdinIndependentAccum(Node):
         #   off / yaw_xy / icp_yaw_xy / full : alternatives
         self.declare_parameter('align_mode', 'extrinsic')
         self.declare_parameter('align_delay_sec', 4.0)
-        # true: refresh yaw+xy when Mid/Odin move enough (see align_min_*).
-        # false: one-shot lock — live Odin scan stays rock-steady when still.
-        self.declare_parameter('align_continuous', False)
-        self.declare_parameter('align_min_trans', 0.03)  # m; ignore Mid IEKF noise
-        self.declare_parameter('align_min_rot_deg', 1.0)
         self.declare_parameter('mid_accum_topic', '/viz/accum_mid360')
         # Same numbers as mid360_odin1.yaml mapping.extrinsic_* (mode0 calibration)
         self.declare_parameter('extrinsic_T', [-0.011, -0.02329, 0.04412])
@@ -254,9 +249,6 @@ class OdinIndependentAccum(Node):
         self._n_motion_hold = 0
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
-        self.align_continuous = bool(self.get_parameter('align_continuous').value)
-        self.align_min_trans = float(self.get_parameter('align_min_trans').value)
-        self.align_min_rot_deg = float(self.get_parameter('align_min_rot_deg').value)
         self.mid_accum_topic = str(self.get_parameter('mid_accum_topic').value)
         self.align_to_mid_once = self.align_mode not in ('off', 'none', 'identity', 'false', '0')
         self._t0 = time.time()
@@ -267,11 +259,7 @@ class OdinIndependentAccum(Node):
         self._n_skip_odom = 0
         self._n_skip_align = 0
         self._n_motion_sync = 0
-        self._n_align_hold = 0
-        self._n_align_refresh = 0
         self._last_sync_dt = 0.0
-        self._align_mid_T: Optional[np.ndarray] = None
-        self._align_odin_T: Optional[np.ndarray] = None
 
         xyz = list(self.get_parameter('imu_to_lidar_xyz').value)
         rpy = list(self.get_parameter('imu_to_lidar_rpy_deg').value)
@@ -327,16 +315,7 @@ class OdinIndependentAccum(Node):
                 )
         if not self.align_only:
             # Prefer RELIABLE (ground bridge); also OK for most Odin TCP republish.
-            self.create_subscription(
-                PointCloud2,
-                self.cloud_topic,
-                self.on_cloud,
-                QoSProfile(
-                    depth=1,
-                    reliability=ReliabilityPolicy.RELIABLE,
-                    history=HistoryPolicy.KEEP_LAST,
-                ),
-            )
+            self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, reliable)
             self.create_timer(max(0.2, period), self.publish_accum)
             self.create_timer(2.0, self._status)
             self.create_service(Trigger, '~/clear_accum', self.on_clear)
@@ -347,8 +326,6 @@ class OdinIndependentAccum(Node):
             f'INDEPENDENT Odin: cloud={self.cloud_topic} odom={self.odom_topic} '
             f'frame={self.map_frame} already_in_odom={self.cloud_already_in_odom} '
             f'align_only={self.align_only} align_mode={self.align_mode} '
-            f'align_continuous={self.align_continuous} '
-            f'align_min_trans={self.align_min_trans:.3f}m '
             f'publish_in_parent={self.publish_in_parent_frame} '
             f'motion_sync_to_mid={self.motion_sync_to_mid} '
             f'out_scan={self.out_scan_topic} (no Mid pose for points)'
@@ -360,7 +337,6 @@ class OdinIndependentAccum(Node):
             f'skip_align={self._n_skip_align} aligned={self._aligned} '
             f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)} '
             f'motion_sync={self._n_motion_sync} hold={self._n_motion_hold} '
-            f'align_refresh={self._n_align_refresh} align_hold={self._n_align_hold} '
             f'sync_dt={self._last_sync_dt*1000:.0f}ms mid_odom_buf={len(self._mid_odom_buf)}'
         )
 
@@ -430,8 +406,6 @@ class OdinIndependentAccum(Node):
         cutoff = t - self.odom_buffer_sec
         while self._mid_odom_buf and self._mid_odom_buf[0][0] < cutoff:
             self._mid_odom_buf.popleft()
-        if self.align_continuous and self._aligned:
-            self._refresh_yaw_xy_align(publish_tf=False)
 
     def _nearest_mid_odom(self, t_query: float) -> Optional[Tuple[float, np.ndarray]]:
         if not self._mid_odom_buf:
@@ -491,9 +465,8 @@ class OdinIndependentAccum(Node):
         cutoff = t - self.odom_buffer_sec
         while self._odom_buf and self._odom_buf[0][0] < cutoff:
             self._odom_buf.popleft()
-        self._odin_T = T
-        if self.align_continuous and self._aligned:
-            self._refresh_yaw_xy_align(publish_tf=False)
+        if not self._aligned:
+            self._odin_T = T
 
     def on_mid_accum(self, msg: PointCloud2) -> None:
         if self._aligned:
@@ -506,62 +479,6 @@ class OdinIndependentAccum(Node):
     def _horiz_yaw(T: np.ndarray) -> float:
         """Yaw of body X projected onto horizontal plane (immune to pitch)."""
         return math.atan2(float(T[1, 0]), float(T[0, 0]))
-
-    def _yaw_xy_T(self, T_mid: np.ndarray, T_odin: np.ndarray) -> np.ndarray:
-        """Level map←odin_map: Rz(yaw_m-yaw_o) + xy so origins coincide."""
-        yaw = self._horiz_yaw(T_mid) - self._horiz_yaw(T_odin)
-        c, s = math.cos(yaw), math.sin(yaw)
-        R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
-        t = T_mid[:3, 3] - R @ T_odin[:3, 3]
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R
-        T[0, 3] = float(t[0])
-        T[1, 3] = float(t[1])
-        T[2, 3] = 0.0
-        return T
-
-    def _pose_delta(self, T_a: np.ndarray, T_b: np.ndarray) -> Tuple[float, float]:
-        """Return (trans_m, rot_deg) between two SE3 poses."""
-        dp = T_a[:3, 3] - T_b[:3, 3]
-        trans = float(np.linalg.norm(dp))
-        R = T_a[:3, :3] @ T_b[:3, :3].T
-        cos_a = 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)
-        cos_a = max(-1.0, min(1.0, cos_a))
-        rot_deg = math.degrees(math.acos(cos_a))
-        return trans, rot_deg
-
-    def _refresh_yaw_xy_align(self, publish_tf: bool = False, force: bool = False) -> bool:
-        if self._mid_T is None or self._odin_T is None:
-            return False
-        if self.align_mode in ('extrinsic', 'mode0', 'calib', 'full', 'se3') or \
-                self.align_mode.startswith('icp'):
-            return False
-        # Freeze T while Mid IEKF noise is the only motion — that noise was
-        # shaking /odin1/cloud_in_map every Mid odom tick.
-        if (
-            not force
-            and self._aligned
-            and self._align_mid_T is not None
-            and self._align_odin_T is not None
-        ):
-            dt_m, dr_m = self._pose_delta(self._mid_T, self._align_mid_T)
-            dt_o, dr_o = self._pose_delta(self._odin_T, self._align_odin_T)
-            if (
-                dt_m < self.align_min_trans
-                and dr_m < self.align_min_rot_deg
-                and dt_o < self.align_min_trans
-                and dr_o < self.align_min_rot_deg
-            ):
-                self._n_align_hold += 1
-                return True
-        T = self._yaw_xy_T(self._mid_T, self._odin_T)
-        self._T_parent_child = T
-        self._align_mid_T = self._mid_T.copy()
-        self._align_odin_T = self._odin_T.copy()
-        self._n_align_refresh += 1
-        if publish_tf:
-            self._publish_align_tf(T)
-        return True
 
     def _icp_yaw_xy(self, mid: np.ndarray, odin: np.ndarray) -> np.ndarray:
         """Coarse 2D yaw+xy that maximizes near-neighbor hits (visual only)."""
@@ -653,18 +570,20 @@ class OdinIndependentAccum(Node):
                 return
             T_map_odinmap = self._mid_T @ se3_inv(self._odin_T)
         else:
-            if not self._refresh_yaw_xy_align(publish_tf=False, force=True):
+            if self._mid_T is None or self._odin_T is None:
                 return
-            T_map_odinmap = self._T_parent_child
-            self.get_logger().info(
-                f'Align yaw+xy continuous={self.align_continuous} '
-                f'min_trans={self.align_min_trans:.3f}m '
-                f'(hold when Mid/Odin still → no live shake)'
-            )
+            yaw = self._horiz_yaw(self._mid_T) - self._horiz_yaw(self._odin_T)
+            c, s = math.cos(yaw), math.sin(yaw)
+            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+            t = self._mid_T[:3, 3] - R @ self._odin_T[:3, 3]
+            T_map_odinmap = np.eye(4, dtype=np.float64)
+            T_map_odinmap[:3, :3] = R
+            T_map_odinmap[0, 3] = float(t[0])
+            T_map_odinmap[1, 3] = float(t[1])
+            T_map_odinmap[2, 3] = 0.0
         self._T_parent_child = T_map_odinmap
         self._publish_align_tf(T_map_odinmap)
         self._aligned = True
-        # No periodic TF spam — refresh only from odom when motion gate opens.
 
     def _nearest_odom(self, t_cloud: float) -> Optional[np.ndarray]:
         """Nearest by stamp. Prefer nearest over 'latest' when cloud is delayed."""
@@ -764,10 +683,8 @@ class OdinIndependentAccum(Node):
             self._n_pub += 1
 
         if (time.time() - self._t0) >= self.accum_skip_sec:
-            # Store in Odin odom/map_frame ONLY. Baking time-varying map←odin
-            # align into voxels was the "accum to wrong place" bug: each refresh
-            # of T_parent_child painted new walls beside old ones.
-            if self._accum.add(world):
+            # Accum always stores output-frame points (parent map when B1).
+            if self._accum.add(out):
                 self._dirty = True
 
     def publish_accum(self) -> None:
@@ -777,15 +694,10 @@ class OdinIndependentAccum(Node):
             return
         if self.publish_in_parent_frame and self.wait_align_for_parent and not self._aligned:
             return
-        pts = self._accum.numpy()
-        # Rigid map←odin applied at publish so Odin self-map stays consistent.
-        out = self._to_output_frame(pts)
-        if out is None:
-            return
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = self._output_frame()
-        self.pub_accum.publish(make_cloud(header, out))
+        self.pub_accum.publish(make_cloud(header, self._accum.numpy()))
         self._dirty = False
 
 
