@@ -164,7 +164,10 @@ double last_imu_gyr_norm = 0.0;
 double lidar2_pose_gyr_gate = 0.35; // rad/s; above => Odin densify-off + no pose update
 // Reject L2 IEKF/bundle pair when |t_L2 - t_Mid| exceeds this (TCP lag gate).
 double lidar2_max_sync_dt = 0.08;
+// Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
+double lidar2_residual_cov_scale = 25.0;
 long long n_skip_l2_sync = 0;
+long long n_odin_iekf_updates = 0;
 // Mid-only Odin viz: buffer latest body cloud; pose with the SAME Mid
 // state_point right after IEKF. Stamp-based lookup failed in practice:
 // /cloud_odin_registered stamps lagged /Odometry by ~5s → old yaw × new body
@@ -173,6 +176,8 @@ PointCloudXYZI::Ptr odin_pending_body;
 bool odin_pending_ready = false;
 bool odin_mid_pose_ready = false;
 constexpr float kOdinIntensityTag = 100.0f;
+// 0=unused, 1=Mid residuals only, 2=Odin residuals only (two-stage tight couple)
+int residual_select = 1;
 
 inline bool odin_pose_update_allowed()
 {
@@ -182,6 +187,17 @@ inline bool odin_pose_update_allowed()
     if (lidar2_pose_gyr_gate <= 0.0)
         return true;
     return last_imu_gyr_norm < lidar2_pose_gyr_gate;
+}
+
+// Gravity-leveled cloud_slam: apply CAD translation only for IEKF (no Ry(-13°)),
+// same rationale as viz yaw-align — remount pitch re-tilts already-level geometry.
+inline Eigen::Matrix4d T_L2_for_iekf()
+{
+    if (!extrinsic_L2_gravity_frame)
+        return LiDAR2_wrt_LiDAR1;
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3, 1>(0, 3) = LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3);
+    return T;
 }
 int current_lidar_num = 1;
 double lidar_mean_scantime = 0.0;
@@ -566,7 +582,7 @@ bool sync_packages_async(MeasureGroup &meas)
             }
             meas.lidar2 = lidar_buffer2.front();
             meas.lidar_beg_time2 = time_buffer2.front();
-            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1);
+            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             if (async_debug) cout << "\033[32;1mSecond LiDAR!, " << meas.lidar2->points.size() << "\033[0m" << endl;
             current_lidar_num = 2;
 
@@ -676,7 +692,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
 
             meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
-            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1); //lidar2 data to lidar1 frame, not use lidar2-imu tf as state
+            // L2 → Mid lidar frame for IEKF (gravity_frame: translation-only).
+            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             meas.lidar_beg_time2 = time_buffer2[best_i];
             if (meas.lidar2->points.size() <= 1) // time too little
             {
@@ -1175,10 +1192,18 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
-        // True tight couple (gated): Odin residuals allowed only in bundle when
-        // odin_pose_update_allowed() (gyr + lidar2_update_en). Async Odin-only
-        // never updates Mid. Deskew/time-base fixes keep Mid from twisting.
+        // Two-stage tight couple: residual_select 1=Mid, 2=Odin (weak cov).
         const bool is_odin = point_body.intensity >= kOdinIntensityTag;
+        if (residual_select == 1 && is_odin)
+        {
+            point_selected_surf[i] = false;
+            continue;
+        }
+        if (residual_select == 2 && !is_odin)
+        {
+            point_selected_surf[i] = false;
+            continue;
+        }
         if (is_odin)
         {
             if (!bundle_enabled || !odin_pose_update_allowed())
@@ -1348,6 +1373,7 @@ public:
         this->declare_parameter<bool>("mapping.lidar2_update_en", false);
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
+        this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<bool>("mapping.extrinsic_L2_gravity_frame", false);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", true);
 
@@ -1420,6 +1446,7 @@ public:
         this->get_parameter_or("mapping.lidar2_update_en", lidar2_update_en, false);
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
+        this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.extrinsic_L2_gravity_frame", extrinsic_L2_gravity_frame, false);
         this->get_parameter_or("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, true);
 
@@ -1554,6 +1581,7 @@ public:
                          ? " (disabled → full-time tight coupling)"
                          : " rad/s (hold Odin IEKF above)")
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
+                 << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
@@ -1742,9 +1770,24 @@ private:
                 normvec->resize(feats_down_size);
                 feats_down_world->resize(feats_down_size);
                 Nearest_Points.resize(feats_down_size);
-                /*** iterated state estimation ***/
+                /*** iterated state estimation (two-stage tight couple) ***/
                 double solve_H_time = 0;
+                // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
+                residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+                // Stage 2: soft Odin residuals into the same IEKF when gated.
+                if (bundle_enabled && odin_pose_update_allowed() &&
+                    lidar2_residual_cov_scale > 0.0)
+                {
+                    residual_select = 2;
+                    const double R_odin =
+                        LASER_POINT_COV * std::max(1.0, lidar2_residual_cov_scale);
+                    double solve2 = 0;
+                    kf.update_iterated_dyn_share_modified(R_odin, solve2);
+                    solve_H_time += solve2;
+                    n_odin_iekf_updates++;
+                }
+                residual_select = 1;
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 geoQuat.x = state_point.rot.coeffs()[0];
