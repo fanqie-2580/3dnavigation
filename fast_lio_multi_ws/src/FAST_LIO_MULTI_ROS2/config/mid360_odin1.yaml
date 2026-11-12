@@ -75,9 +75,8 @@
       lidar2_max_sync_dt: 0.10
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      # Still-frame Mid↔Odin wall NN~0.14m / ground Δz~-0.13m → extrinsic, not stamp.
-      # Keep Odin out of ikdtree until extrinsic verified (avoid double walls).
-      lidar2_map_insert_en: false
+      # Odin → official ikdtree (/Laser_map) after successful Bundle IEKF.
+      lidar2_map_insert_en: true
       lidar2_map_insert_gyr_gate: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
