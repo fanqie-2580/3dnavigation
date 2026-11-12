@@ -81,8 +81,8 @@
       lidar2_stamp_bias_sec: 0.065
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      # Odin → ikdtree: strict |dt| while moving; near-still allow full couple window
-      # so accum is dense (ω·ε≈0). Hard-turn same-frame block, no cooldown.
+      # Odin → ikdtree / Stage2: same quality bar. Hard-turn also freezes
+      # /cloud_odin_registered on last map snapshot (no live deskew smear).
       lidar2_map_insert_en: true
       lidar2_map_insert_max_sync_dt: 0.018
       lidar2_map_insert_max_sync_dt_still: 0.055

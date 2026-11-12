@@ -1324,10 +1324,28 @@ void publish_odin_from_undistorted(
     const PointCloudXYZI::Ptr &undistorted)
 {
     // Fresh Odin → map + cache. Mid-only → republish last map snapshot (no re-pose).
+    // Hard turn: keep last good map snapshot (deskew residual still smears live Odin).
     if (!pubOdin || !scan_pub_en)
         return;
     if (!p_imu->IMU_inited())
         return;
+    const bool hard_turn =
+        (lidar2_map_insert_gyr_gate > 0.0) &&
+        (gate_gyr_norm() >= lidar2_map_insert_gyr_gate);
+    auto pub_hold = [&]() {
+        if (!odin_hold_map_have || !odin_hold_map || odin_hold_map->empty())
+            return;
+        sensor_msgs::msg::PointCloud2 laserCloudmsg;
+        pcl::toROSMsg(*odin_hold_map, laserCloudmsg);
+        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+        laserCloudmsg.header.frame_id = map_frame;
+        pubOdin->publish(laserCloudmsg);
+    };
+    if (hard_turn)
+    {
+        pub_hold();
+        return;
+    }
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
     if (undistorted && !undistorted->empty())
     {
@@ -1355,14 +1373,7 @@ void publish_odin_from_undistorted(
         pubOdin->publish(laserCloudmsg);
         return;
     }
-    if (odin_hold_map_have && odin_hold_map && !odin_hold_map->empty())
-    {
-        sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*odin_hold_map, laserCloudmsg);
-        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
-        laserCloudmsg.header.frame_id = map_frame;
-        pubOdin->publish(laserCloudmsg);
-    }
+    pub_hold();
 }
 
 void publish_mid_from_undistorted(
@@ -2275,12 +2286,28 @@ private:
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-                // Optional Stage 2 point residuals (usually OFF — prefer pose-factor).
-                // Wait-align: fused frames always have Odin; Mid-only (dt<0) skips Stage2.
+                // Stage2: same quality bar as map insert — hard turn / loose sync
+                // must not yank shared IEKF yaw (live overshoot then snap).
+                const double gyr_n = gate_gyr_norm();
+                const bool stage2_near_still =
+                    (lidar2_map_insert_still_gyr <= 0.0) ||
+                    (gyr_n < lidar2_map_insert_still_gyr);
+                const double stage2_dt_lim =
+                    stage2_near_still
+                        ? ((lidar2_map_insert_max_sync_dt_still > 0.0)
+                               ? lidar2_map_insert_max_sync_dt_still
+                               : lidar2_max_sync_dt)
+                        : lidar2_map_insert_max_sync_dt;
+                const bool stage2_sync_ok =
+                    bundle_pair_dt_ >= 0.0 &&
+                    (stage2_dt_lim <= 0.0 || bundle_pair_dt_ <= stage2_dt_lim);
+                const bool stage2_gyr_ok =
+                    (lidar2_map_insert_gyr_gate <= 0.0) ||
+                    (gyr_n < lidar2_map_insert_gyr_gate);
                 const bool odin_ok = lidar2_point_update_en && bundle_enabled &&
                                      odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0 &&
-                                     bundle_pair_dt_ >= 0.0;
+                                     stage2_sync_ok && stage2_gyr_ok;
                 if (odin_ok)
                 {
                     residual_select = 2;
