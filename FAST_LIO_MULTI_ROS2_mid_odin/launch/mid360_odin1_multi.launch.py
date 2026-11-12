@@ -65,7 +65,7 @@ def generate_launch_description():
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
-        default_value='0.12',
+        default_value='0.08',
         description='Voxel size for Odin C++ bridge/densify (larger = lower latency)',
     )
 
@@ -154,11 +154,11 @@ def generate_launch_description():
                     'l2_mid_pose_topic': '/odin1/l2_mid_pose',
                     'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'voxel_size': float(
-                        context.launch_configurations.get('odin_voxel', '0.12')
+                        context.launch_configurations.get('odin_voxel', '0.08')
                     ),
-                    # 2k pts: keep proc_ms << 50 on Jetson.
-                    'max_points': 2000,
-                    'pre_decimate_max': 2000,
+                    # 8k pts: denser /cloud_odin_registered for RViz (was 2k).
+                    'max_points': 8000,
+                    'pre_decimate_max': 8000,
                     'min_confidence': 30.0,
                     # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
@@ -343,7 +343,7 @@ def generate_launch_description():
                             'out_accum_topic': '/viz/accum_odin',
                             'map_frame': 'map',
                             'voxel_size': float(
-                                context.launch_configurations.get('odin_voxel', '0.12')
+                                context.launch_configurations.get('odin_voxel', '0.08')
                             ),
                             'max_accum_points': 400000,
                             'accum_skip_sec': 2.0,

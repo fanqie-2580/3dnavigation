@@ -28,8 +28,8 @@
       # Smaller leaf → denser /Laser_map (ikdtree).
       filter_size_surf: 0.15
       point_filter_num: 2
-      # Odin is dense (~240x180); lighter stride so more Odin enters map when still.
-      point_filter_num2: 2
+      # Odin is dense (~240x180); stride 1 keeps nearly all bridge points for viz/IEKF.
+      point_filter_num2: 1
       lidar_type: 1                   # Livox CustomMsg (Mid360)
       lidar_type2: 4                  # XYZ_ONLY / Odin1 PointCloud2 (+offset_time)
       scan_line: 4
