@@ -57,10 +57,10 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Tight couple (official): Odin residuals update IEKF. Pose-factor OFF
-      # (Odin /odometry soft-pull made Mid /Odometry jitter on slight motion).
-      # map_insert OFF until stamp sync is clean — bad L2 must not stain ikdtree
-      # (Python densify AccumFused is soft viz only; official map = C++).
+      # Official FAST_LIO_MULTI tight couple: Odin point residuals → IEKF,
+      # and successful Odin IEKF frames also insert into ikdtree (/Laser_map).
+      # Pose-factor stays OFF (soft /odin1/odometry pull caused Mid jitter).
+      # Soft densify (/viz/accum_*) is optional viz only — truth map = /Laser_map.
       lidar2_update_en: true
       lidar2_point_update_en: true
       lidar2_pose_factor_en: false
@@ -74,7 +74,7 @@
       lidar2_max_sync_dt: 0.08
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      lidar2_map_insert_en: false
+      lidar2_map_insert_en: true
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

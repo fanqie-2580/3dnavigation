@@ -459,7 +459,15 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | `_match_mid_for_l2` 仅 causal Mid（禁 before/after 插值） | `odin_raw_downsample_bridge.py` | 消除转过头再回弹 |
 | `deskew_odin=false`；accum 仅 still（≤3°/s 且 ≤still_trans_vel） | launch + `odin_independent_accum.py` | 微转不拧 wedge、不写 keep-first |
 | fuse `accum_gyr_gate=0.05` | launch | Mid 体素也不在微转时堆 |
-| `lidar2_map_insert_en=false`；point/IEKF 仍开 | `mid360_odin1.yaml` | 紧耦合保留，坏 L2 不进 ikdtree |
+| `lidar2_map_insert_en=false`；point/IEKF 仍开 | `mid360_odin1.yaml` | 紧耦合保留，坏 L2 不进 ikdtree（过渡） |
+
+### 10b. 全面官方建图（2026-11-12）
+
+| 项 | 内容 |
+|----|------|
+| `lidar2_map_insert_en=true` | Bundle + `last_odin_iekf_ok` 时 Odin 写入 C++ ikdtree |
+| RViz | 主图 `/Laser_map`；`/cloud_odin_registered` 官方 Odin 实时；软 `/viz/accum_*` 默认关 |
+| 真值 | 地图=`/Laser_map`；位姿=`/Odometry`（IEKF）；densify 仅可选可视化 |
 
 ### 11. C++ 降延时（2026-11-12）
 
