@@ -403,6 +403,12 @@ Bridge 重发布 L2 时保留 `offset_time`（s）；若字段丢失则填 0 →
 正确做法：`T_stamp · T_ext · p_odin`，live 再 `T_latest · inv(T_stamp)` SE3 warp；且 **warp 的 T_src 必须等于投影用的 T_stamp**（不能再 nearest 查另一帧 Mid）。
 
 相关提交：`0cc1703`、随后 warp-T_src 对齐修复。
+### 补充：live vs AccumFused 不一致
+
+`motion_sync_to_mid=True` 时 `/odin1/cloud_in_map` 被 warp 到最新 Mid，而 `/viz/accum_odin`（进 AccumFused）保持 stamp 投影。  
+机器人稍动 → 橙色 live 相对融合图墙体滑动，表现为「融合图上 Odin 在晃」。  
+修复：关闭 motion_sync，live 与 accum 共用同一 deadband 后的 stamp Mid 位姿。
+
 
 
 ---

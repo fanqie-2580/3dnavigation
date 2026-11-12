@@ -964,20 +964,15 @@ class OdinIndependentAccum(Node):
         ):
             arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
 
-        # Project with stamp-locked Mid (L2 geom stamp lags ~0.15–0.30s vs now).
-        # Live: SE3-warp using the *same* T_proj as source (not a second Mid lookup).
-        # Accum: deadband T_proj so Mid IEKF noise does not thicken voxels.
-        T_proj = self._ema_mid_pose(T_locked)
+        # Live and accum MUST share the same Mid pose. motion_sync warp on live
+        # only made /odin1/cloud_in_map drift ahead of /viz/accum_odin → orange
+        # Odin shakes on the fusion map while AccumFused stays put.
+        T_proj = self._deadband_densify_pose(self._ema_mid_pose(T_locked))
         T_map = T_proj @ self.T_body_odin_lidar
         out = (arr @ T_map[:3, :3].T) + T_map[:3, 3]
         self._n_locked_viz += 1
         self._publish_live(msg.header.stamp, out, T_proj)
-        T_acc = self._deadband_densify_pose(T_proj)
-        if np.allclose(T_acc, T_proj, atol=1e-9):
-            self._accum_locked(out)
-        else:
-            T_map_a = T_acc @ self.T_body_odin_lidar
-            self._accum_locked((arr @ T_map_a[:3, :3].T) + T_map_a[:3, 3])
+        self._accum_locked(out)
 
     def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
         """Hold densify Mid pose under TF-like deadband; soft-track above it."""

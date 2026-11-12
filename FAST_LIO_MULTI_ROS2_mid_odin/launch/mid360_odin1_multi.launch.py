@@ -348,8 +348,10 @@ def generate_launch_description():
                         'align_mode': 'off' if not use_ct else 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
-                        # Warp stamp-projected Odin to latest Mid (L2 geom ~0.25s old).
-                        'motion_sync_to_mid': True,
+                        # OFF: warp-to-latest made /odin1/cloud_in_map disagree with
+                        # stamp-locked /viz/accum_odin inside AccumFused → live Odin
+                        # shakes against the fusion map on any Mid motion.
+                        'motion_sync_to_mid': False,
                         'motion_sync_min_trans': 0.015,
                         'motion_sync_min_rot_deg': 0.35,
                         'mid_wall_pair_max_dt': 0.20,
