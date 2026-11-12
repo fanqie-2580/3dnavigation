@@ -91,8 +91,10 @@
       #   T_go2IMU_midL (Unitree official) t=[0.187,0,0.0803] Ry(+13°)
       #   T_base_go2IMU (URDF) t=[-0.02557,0,0.04232] R=I
       #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
-      # cloud_slam densify is gravity-level; L2 point residuals currently off.
-      extrinsic_L2_gravity_frame: true
+      # MUST be false for /odin1/cloud_l2_body (lidar frame). true was for
+      # gravity-leveled cloud_slam and dropped Ry(-13°) → stage-2 "No Effective
+      # Points" + map_insert gated off + densify/IEKF extrinsic mismatch.
+      extrinsic_L2_gravity_frame: false
       extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
       # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
       # Keep CAD translation. (ICP -10.15° was pre-unproject; under-pitched ~3.6°.)
