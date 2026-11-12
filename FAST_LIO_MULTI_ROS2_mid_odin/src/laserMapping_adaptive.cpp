@@ -91,9 +91,6 @@ bool extrinsic_imu_to_lidars = false;
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
 size_t bundle_pair_index_ = 0;
 double bundle_pair_dt_ = 0.0;
-// Only use Odin (IEKF/insert/fresh publish) when |Bundle dt| is this small.
-// Larger residual is Mid/Odin phase sawtooth — showing those frames = wrong-then-jump.
-constexpr double kOdinUseMaxBundleDt = 0.015; // s
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -833,68 +830,56 @@ bool sync_packages_bundle(MeasureGroup &meas)
 {
     if (multi_lidar)
     {
-        // Mid can proceed without L2 (Mid-only). L2 alone never drives Mid IEKF.
+        // Wait-align Bundle: only fuse when |(L2+bias)-Mid| <= tight_dt.
+        // No quality-gate after the fact — either wait/drop until aligned, or
+        // Mid-only fallback if Odin stream stalls.
         if (lidar_buffer.empty() || imu_buffer.empty()) {
             return false;
         }
-        /*** push a lidar scan ***/
-        if(!lidar_pushed)
+        const double tight_dt =
+            (lidar2_max_sync_dt > 0.0) ? lidar2_max_sync_dt : 0.015;
+
+        if (!lidar_pushed)
         {
-            // Causal Mid-front pair: L2 with (L2+bias) <= Mid_beg, smallest lag.
-            // Absolute nearest early/late flip was feeding deskew residual sawtooth.
-            const double max_bundle_dt =
-                (lidar2_max_sync_dt > 0.0) ? lidar2_max_sync_dt : 0.08;
-            meas.lidar = lidar_buffer.front();
-            meas.lidar_beg_time = time_buffer.front();
-            if (meas.lidar->points.size() <= 1) // time too little
-            {
-                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-                std::cerr << "Too few input point cloud!\n";
-            }
-            else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
-            {
-                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-            }
-            else
-            {
-                scan_num ++;
-                lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-                lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
-            }
-            meas.lidar_end_time = lidar_end_time;
-
-            // Absolute nearest (L2+bias vs Mid). Deskew intentionally IGNORS the
-            // leftover residual (center-align offsets) so the 0↔50ms phase sawtooth
-            // cannot ω·ε-snap the Odin cloud. IEKF/map_insert still gate on |dt|.
-            size_t best_i = 0;
-            double best_dt = 1e9;
-            bool found = false;
-            for (size_t i = 0; i < time_buffer2.size(); i++)
-            {
-                const double dt = std::fabs(
-                    (time_buffer2[i] + lidar2_stamp_bias_sec) - meas.lidar_beg_time);
-                if (dt > max_bundle_dt)
-                    continue;
-                if (dt < best_dt)
+            auto fill_mid_end = [&]() {
+                meas.lidar = lidar_buffer.front();
+                meas.lidar_beg_time = time_buffer.front();
+                if (meas.lidar->points.size() <= 1)
                 {
-                    best_dt = dt;
-                    best_i = i;
-                    found = true;
+                    lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+                    std::cerr << "Too few input point cloud!\n";
                 }
-            }
+                else if (meas.lidar->points.back().curvature / double(1000) <
+                         0.5 * lidar_mean_scantime)
+                {
+                    lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+                }
+                else
+                {
+                    scan_num++;
+                    lidar_end_time = meas.lidar_beg_time +
+                                     meas.lidar->points.back().curvature / double(1000);
+                    lidar_mean_scantime +=
+                        (meas.lidar->points.back().curvature / double(1000) -
+                         lidar_mean_scantime) /
+                        scan_num;
+                }
+                meas.lidar_end_time = lidar_end_time;
+            };
 
-            if (found)
-            {
+            auto attach_l2 = [&](size_t best_i, double best_dt) {
                 meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
                 pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
                 meas.lidar_beg_time2 = time_buffer2[best_i];
                 double odin_span = 0.0;
                 for (const auto &pt : meas.lidar2->points)
-                    odin_span = std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
+                    odin_span =
+                        std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
                 if (odin_span > 1e-4)
                 {
                     scan_num2++;
-                    lidar_mean_scantime2 += (odin_span - lidar_mean_scantime2) / scan_num2;
+                    lidar_mean_scantime2 +=
+                        (odin_span - lidar_mean_scantime2) / scan_num2;
                 }
                 else if (lidar_mean_scantime2 > 1e-4)
                     odin_span = lidar_mean_scantime2;
@@ -906,29 +891,77 @@ bool sync_packages_bundle(MeasureGroup &meas)
                 meas.lidar_end_time2 = lidar_end_time2;
                 bundle_pair_index_ = best_i;
                 bundle_pair_dt_ = best_dt;
-            }
-            else
+            };
+
+            // Odin stalled: keep Mid alive (rare).
+            if (lidar_buffer2.empty())
             {
-                // No L2 in window: Mid-only.
+                if (lidar_buffer.size() < 2)
+                    return false;
+                fill_mid_end();
                 n_skip_l2_sync++;
                 meas.lidar2.reset(new PointCloudXYZI());
                 meas.lidar_beg_time2 = meas.lidar_beg_time;
                 lidar_end_time2 = lidar_end_time;
                 meas.lidar_end_time2 = lidar_end_time2;
                 bundle_pair_index_ = 0;
-                bundle_pair_dt_ = -1.0; // sentinel: Mid-only
-                while (!time_buffer2.empty() &&
-                       std::fabs((time_buffer2.front() + lidar2_stamp_bias_sec) -
-                                 meas.lidar_beg_time) > max_bundle_dt &&
-                       (time_buffer2.front() + lidar2_stamp_bias_sec) < meas.lidar_beg_time)
-                {
-                    lidar_buffer2.pop_front();
-                    time_buffer2.pop_front();
-                }
+                bundle_pair_dt_ = -1.0;
+                publish_lidar_time = lidar_end_time;
+                lidar_pushed = true;
             }
+            else
+            {
+                // Drop Mid (too old) or L2 (too old) until |dt|<=tight_dt.
+                while (!lidar_buffer.empty() && !lidar_buffer2.empty())
+                {
+                    fill_mid_end();
 
-            publish_lidar_time = lidar_end_time;
-            lidar_pushed = true;
+                    size_t best_i = 0;
+                    double best_dt = 1e9;
+                    double best_signed = 0.0; // (L2+bias) - Mid
+                    for (size_t i = 0; i < time_buffer2.size(); i++)
+                    {
+                        const double signed_res =
+                            (time_buffer2[i] + lidar2_stamp_bias_sec) -
+                            meas.lidar_beg_time;
+                        const double dt = std::fabs(signed_res);
+                        if (dt < best_dt)
+                        {
+                            best_dt = dt;
+                            best_i = i;
+                            best_signed = signed_res;
+                        }
+                    }
+
+                    if (best_dt <= tight_dt)
+                    {
+                        attach_l2(best_i, best_dt);
+                        publish_lidar_time = lidar_end_time;
+                        lidar_pushed = true;
+                        break;
+                    }
+
+                    if (best_signed < 0.0)
+                    {
+                        // Nearest L2 still older than Mid — drop it, wait for newer L2.
+                        for (size_t i = 0; i <= best_i && !lidar_buffer2.empty(); i++)
+                        {
+                            lidar_buffer2.pop_front();
+                            time_buffer2.pop_front();
+                        }
+                        n_skip_l2_sync++;
+                        return false;
+                    }
+
+                    // Nearest L2 newer than Mid — Mid too old, drop Mid, retry.
+                    lidar_buffer.pop_front();
+                    time_buffer.pop_front();
+                    n_skip_l2_sync++;
+                }
+
+                if (!lidar_pushed)
+                    return false;
+            }
         }
 
         if (last_timestamp_imu < lidar_end_time || last_timestamp_imu < lidar_end_time2)
@@ -942,14 +975,14 @@ bool sync_packages_bundle(MeasureGroup &meas)
         while ((!imu_buffer.empty()) && (imu_time < lidar_end_time || imu_time < lidar_end_time2))
         {
             imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-            if(imu_time > lidar_end_time && imu_time > lidar_end_time2) break;
+            if (imu_time > lidar_end_time && imu_time > lidar_end_time2)
+                break;
             meas.imu.push_back(imu_buffer.front());
             imu_buffer.pop_front();
         }
 
         lidar_buffer.pop_front();
         time_buffer.pop_front();
-        // Drop Odin frames up to and including the paired one (only if paired).
         if (bundle_pair_dt_ >= 0.0)
         {
             for (size_t i = 0; i <= bundle_pair_index_ && !lidar_buffer2.empty(); i++)
@@ -961,9 +994,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
 
         lidar_pushed = false;
         if (bundle_pair_dt_ >= 0.0)
-            cout << "\033[36;1mBundle update! dt=" << bundle_pair_dt_ * 1000.0 << "ms\033[0m" << endl;
+            cout << "\033[36;1mBundle wait-align dt=" << bundle_pair_dt_ * 1000.0
+                 << "ms\033[0m" << endl;
         else
-            cout << "\033[33;1mBundle Mid-only (no causal L2)\033[0m" << endl;
+            cout << "\033[33;1mBundle Mid-only (Odin stalled)\033[0m" << endl;
         return true;
     }
     else
@@ -1038,13 +1072,13 @@ void map_incremental()
     }
     // Sync-quality gate (not turn cooldown): Bundle Mid↔L2 |dt| too large means
     // Odin world pose is unreliable — do not lock into ikdtree.
+        // Wait-align Bundle already enforces tight Mid↔L2; Mid-only (dt<0) skips Odin.
         const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
          last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until ||
-        (bundle_enabled &&
-         (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt));
+        (bundle_enabled && bundle_pair_dt_ < 0.0);
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1193,12 +1227,8 @@ void publish_odin_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &undistorted)
 {
-    // Publish Odin only on tight Bundle sync. Loose/Mid-only frames would be
-    // ω·ε-wrong during turns then snap back — leave last good cloud in RViz.
+    // Wait-align Bundle: every fused frame is already tight; Mid-only has no Odin pts.
     if (!pubOdin || !undistorted || undistorted->empty() || !scan_pub_en)
-        return;
-    if (bundle_enabled &&
-        (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt))
         return;
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
     odin_body->reserve(undistorted->size());
@@ -2021,21 +2051,6 @@ private:
                 return;
             }
 
-            // Drop Odin from this Mid frame when Bundle sync is loose / Mid-only.
-            // Prevents IEKF/map/viz from consuming ω·ε-wrong L2 during phase sawtooth.
-            if (bundle_enabled &&
-                (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt))
-            {
-                PointCloudXYZI::Ptr mid_only(new PointCloudXYZI());
-                mid_only->reserve(feats_undistort->size());
-                for (const auto &pt : feats_undistort->points)
-                {
-                    if (pt.intensity < kOdinIntensityTag)
-                        mid_only->push_back(pt);
-                }
-                feats_undistort.swap(mid_only);
-            }
-
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
 
@@ -2127,12 +2142,11 @@ private:
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 // Optional Stage 2 point residuals (usually OFF — prefer pose-factor).
-                // Skip Stage2 on Mid-only / loose Bundle — bad sync yanks Mid.
+                // Wait-align: fused frames always have Odin; Mid-only (dt<0) skips Stage2.
                 const bool odin_ok = lidar2_point_update_en && bundle_enabled &&
                                      odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0 &&
-                                     bundle_pair_dt_ >= 0.0 &&
-                                     bundle_pair_dt_ <= kOdinUseMaxBundleDt;
+                                     bundle_pair_dt_ >= 0.0;
                 if (odin_ok)
                 {
                     residual_select = 2;
