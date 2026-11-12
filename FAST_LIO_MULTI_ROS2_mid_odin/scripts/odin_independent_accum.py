@@ -637,20 +637,27 @@ class OdinIndependentAccum(Node):
         return T
 
     def _warp_to_latest_mid(
-        self, pts: np.ndarray, t_cloud: float
+        self,
+        pts: np.ndarray,
+        t_cloud: float,
+        T_src: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[object], float]:
-        """Warp map-frame points from pose@t_cloud to latest Mid pose (SE3).
+        """Warp map-frame points from projection Mid pose to latest Mid (SE3).
 
-        p_dst = T_mid(t_now) * inv(T_mid(t_cloud)) * p_src
-        Same idea as Autoware concatenate motion compensation / LIO-SAM deskew
-        relative transform, applied to a delayed second LiDAR.
+        p_dst = T_mid(t_now) * inv(T_src) * p_src
+
+        T_src MUST be the same Mid pose used to project `pts`. Looking up a
+        different Mid by stamp made warp inconsistent with densify → residual shake.
         """
         if (not self.motion_sync_to_mid) or pts.size == 0 or not self._mid_odom_buf:
             return pts, None, 0.0
-        src = self._nearest_mid_odom(t_cloud)
-        if src is None:
-            return pts, None, 0.0
-        t_src, T_src = src
+        if T_src is None:
+            src = self._nearest_mid_odom(t_cloud)
+            if src is None:
+                return pts, None, 0.0
+            t_src, T_src = src
+        else:
+            t_src = t_cloud
         t_dst, _wall_dst, T_dst = self._mid_odom_buf[-1]
         dt = float(t_dst - t_src)
         if abs(dt) < 1e-4:
@@ -659,12 +666,10 @@ class OdinIndependentAccum(Node):
         R = T[:3, :3]
         tr = T[:3, 3]
         trans = float(np.linalg.norm(tr))
-        # Rotation angle from trace(R): stable for small Mid noise.
         cos_a = 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)
         cos_a = max(-1.0, min(1.0, cos_a))
         rot_deg = math.degrees(math.acos(cos_a))
         if trans < self.motion_sync_min_trans and rot_deg < self.motion_sync_min_rot_deg:
-            # Stationary (or Mid noise only): keep Odin pose frozen.
             self._n_motion_hold += 1
             self._last_sync_dt = dt
             return pts, None, dt
@@ -934,16 +939,20 @@ class OdinIndependentAccum(Node):
         ):
             arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
 
-        # ROOT CAUSE FIX: Odin L2 geometry stamp lags receive by ~200–300ms.
-        # Painting that cloud with *latest* Mid pose makes it swing on any motion
-        # (δθ ≈ ω·Δt; at 5°/s × 0.28s ≈ 1.4° → ~12cm @5m). Always project with
-        # stamp-locked Mid; live then SE3-warps to current Mid (motion_sync).
-        T_stamp = self._deadband_densify_pose(self._ema_mid_pose(T_locked))
-        T_map = T_stamp @ self.T_body_odin_lidar
+        # Project with stamp-locked Mid (L2 geom stamp lags ~0.15–0.30s vs now).
+        # Live: SE3-warp using the *same* T_proj as source (not a second Mid lookup).
+        # Accum: deadband T_proj so Mid IEKF noise does not thicken voxels.
+        T_proj = self._ema_mid_pose(T_locked)
+        T_map = T_proj @ self.T_body_odin_lidar
         out = (arr @ T_map[:3, :3].T) + T_map[:3, 3]
         self._n_locked_viz += 1
-        self._publish_live(msg.header.stamp, out)  # warps if motion_sync_to_mid
-        self._accum_locked(out)  # accum stays at stamp pose (no warp)
+        self._publish_live(msg.header.stamp, out, T_proj)
+        T_acc = self._deadband_densify_pose(T_proj)
+        if np.allclose(T_acc, T_proj, atol=1e-9):
+            self._accum_locked(out)
+        else:
+            T_map_a = T_acc @ self.T_body_odin_lidar
+            self._accum_locked((arr @ T_map_a[:3, :3].T) + T_map_a[:3, 3])
 
     def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
         """Hold densify Mid pose under TF-like deadband; soft-track above it."""
@@ -964,10 +973,17 @@ class OdinIndependentAccum(Node):
         self._hold_T_mid = self._lerp_se3(self._hold_T_mid, T_locked, a)
         return self._hold_T_mid
 
-    def _publish_live(self, stamp, out_live_pts: np.ndarray) -> None:
+    def _publish_live(
+        self,
+        stamp,
+        out_live_pts: np.ndarray,
+        T_proj: Optional[np.ndarray] = None,
+    ) -> None:
         # Warp stamp-projected map points to latest Mid (correct for delayed geom).
         t_cloud = stamp_sec(stamp)
-        out_live, sync_stamp, sync_dt = self._warp_to_latest_mid(out_live_pts, t_cloud)
+        out_live, sync_stamp, sync_dt = self._warp_to_latest_mid(
+            out_live_pts, t_cloud, T_src=T_proj
+        )
         self._last_sync_dt = sync_dt
         if sync_stamp is not None or (self.restamp_scan_to_now and self.project_with_mid):
             pub_stamp = self.get_clock().now().to_msg()

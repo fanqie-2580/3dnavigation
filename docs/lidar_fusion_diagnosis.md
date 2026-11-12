@@ -384,6 +384,27 @@ Bridge 重发布 L2 时保留 `offset_time`（s）；若字段丢失则填 0 →
 1. bridge 实验分支加 per-frame 耗时与 `queue lag` 日志；  
 2. 临时 `latest-only`（深度 1 + 丢旧）验证拖影是否立刻消失（**属改代码，需你点头再动**）。
 
+
+## 9. 2026-11-12 补充：Odin live「稍微动就晃」根因
+
+实测（host ROS time）：
+
+| topic | stamp_lag med |
+|-------|----------------|
+| `/odin1/cloud_raw` | ~150 ms |
+| `/odin1/cloud_l2_body` | ~180–220 ms |
+| `/cloud_registered` | ~50 ms |
+| Mid stamp − L2 stamp | ~200 ms |
+
+**根因**：Odin 几何时间戳比 Mid 当前位姿旧约 0.2 s。若用**最新 Mid**去投旧几何，转动时  
+`δθ ≈ ω·Δt`（例：5°/s × 0.28 s ≈ 1.4° → 5 m 处约 12 cm）→ 肉眼「很晃」。
+
+错误做法：`T_latest · T_ext · p_odin`  
+正确做法：`T_stamp · T_ext · p_odin`，live 再 `T_latest · inv(T_stamp)` SE3 warp；且 **warp 的 T_src 必须等于投影用的 T_stamp**（不能再 nearest 查另一帧 Mid）。
+
+相关提交：`0cc1703`、随后 warp-T_src 对齐修复。
+
+
 ---
 
 *报告路径：`/home/ll/3dnavigation/docs/lidar_fusion_diagnosis.md`*
