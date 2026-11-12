@@ -72,8 +72,9 @@
       lidar2_pitch_gyr_gate: 0.0
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
-      # Wait-align Bundle: only fuse when |(L2+bias)-Mid| <= this (else wait/drop).
-      lidar2_max_sync_dt: 0.015
+      # Tight Odin attach window. Mid always runs; outside window = Mid-only + hold viz.
+      # 15ms couple~15% sparse map; 30ms denser fuse (deskew residual still small).
+      lidar2_max_sync_dt: 0.030
       # USB L2 stamp leads Mid by ~−65ms at same wall; bias recenters Bundle dt.
       lidar2_stamp_bias_sec: 0.065
       lidar2_residual_cov_scale: 50.0

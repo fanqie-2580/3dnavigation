@@ -508,9 +508,10 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 | 修复 | |
 |------|--|
-| deskew | **忽略** Bundle stamp 残差；Odin `offset` **中心对齐**到 Mid scan |
-| **等齐再融** | 仅当 `|(L2+bias)-Mid|≤15ms` 才弹出 Mid+L2 进 IEKF；L2 偏旧则丢 L2 等待，Mid 偏旧则丢 Mid。无事后质量门 |
-| Odin 停滞 | L2 缓冲空且 Mid 积压时才 Mid-only 保活 |
+| **Mid 不停** | 每帧处理 Mid；仅 `|dt|≤30ms` 时挂上 Odin 紧耦合（等齐曾卡住 0.5s+ → 跳变） |
+| Mid-only 间隙 | `/cloud_odin_registered` 用**当前 Mid 位姿**重投影上一帧 Odin body（不冻结） |
+| deskew | 紧配对时用 `(L2+bias−Mid)+offset` |
+| 验证 | Odin Δt max ~200ms（原 wait-align ~600ms）；couple_rate 随窗口 15→30ms 提高 |
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 

@@ -487,24 +487,16 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
 
-  // Odin dToF: offset_time is relative to USB header (span ~0..94ms).
-  // Bundle already selected an L2 near Mid via (L2+stamp_bias)≈Mid_beg.
-  // Do NOT fold the leftover Bundle residual into deskew time: that residual
-  // sawtooths 0→50ms as Mid/Odin phase walks, so ω·ε produces turn smear that
-  // snaps back when the pair flips ("wrong then jump"). Trust the pair and
-  // place Odin offsets on the Mid scan timeline (center-align spans).
+  // Odin dToF: offset_time relative to USB header. Mapping only attaches L2 when
+  // |(L2+stamp_bias)-Mid| is tight, so folding that small residual into deskew
+  // is safe. Mid-only ticks leave pcl_2 empty (viz holds last body cloud).
   if (!pcl_2_out.points.empty())
   {
-    double odin_span = 0.0;
-    for (const auto &pt : pcl_2_out.points)
-      odin_span = std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
-    const double mid_span =
-        std::max(0.0, meas.lidar_end_time - meas.lidar_beg_time);
-    // Align frame centers; ignore stamp residual (pairing already enforced).
-    const double t0 = 0.5 * mid_span - 0.5 * odin_span;
+    const double header_off =
+        (meas.lidar_beg_time2 + lidar2_stamp_bias_) - meas.lidar_beg_time;
     for (auto &pt : pcl_2_out.points)
     {
-      double t_rel = t0 + static_cast<double>(pt.curvature) / 1000.0;
+      double t_rel = header_off + static_cast<double>(pt.curvature) / 1000.0;
       if (t_rel < -kMaxBundleSpan)
         t_rel = -kMaxBundleSpan;
       if (t_rel > kMaxBundleSpan + 0.12)
