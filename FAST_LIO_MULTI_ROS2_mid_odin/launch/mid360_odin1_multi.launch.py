@@ -65,8 +65,8 @@ def generate_launch_description():
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
-        default_value='0.10',
-        description='Voxel size for Odin bridge/accum (0.10 keeps Jetson Python densify realtime)',
+        default_value='0.12',
+        description='Voxel size for Odin bridge/accum (0.12 keeps Jetson densify low-latency)',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -152,11 +152,11 @@ def generate_launch_description():
                     # launch/mid360_odin1_multi_ground_only.launch.py).
                     'output_topic': '/odin1/cloud_raw_ds',
                     'voxel_size': float(
-                        context.launch_configurations.get('odin_voxel', '0.10')
+                        context.launch_configurations.get('odin_voxel', '0.12')
                     ),
-                    # Keep densify/L2 light: 49k raw + Python voxel was ~2s/frame.
-                    'max_points': 8000,
-                    'pre_decimate_max': 16000,
+                    # Tight latency: unpack ≤4k from 49k raw (skip heavy voxel unique).
+                    'max_points': 4000,
+                    'pre_decimate_max': 4000,
                     'min_confidence': 30.0,
                     'restamp_from_odom': True,
                     # False: do not wait for Mid odom tick (was adding ~100ms+
@@ -170,9 +170,9 @@ def generate_launch_description():
                     # Must match mapping.lidar2_max_sync_dt: never restamp L2
                     # outside this window (lying stamps twist Mid IEKF).
                     'mid_restamp_max_dt': 0.05,
-                    'max_cloud_age_sec': 0.35,
-                    # ~10 Hz ceiling; latest-only pending drops extras.
-                    'fallback_period': 0.08,
+                    'max_cloud_age_sec': 0.25,
+                    # 0: no artificial rate floor (latest-only already drops extras).
+                    'fallback_period': 0.0,
                     'ground_only': False,
                     # raw is lidar-frame: no odom unproject on main or L2.
                     'unproject_odom_clouds': False,
@@ -350,9 +350,11 @@ def generate_launch_description():
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
                         'mid_wall_pair_max_dt': 0.20,
-                        # 0 lookback + no EMA: wall-sync L2/Mid; lag caused turn fan.
+                        # 0 lookback + no EMA; latest Mid for snappy viz (locked on turns).
                         'mid_pose_lookback_sec': 0.0,
                         'mid_pose_ema': 1.0,
+                        'prefer_latest_mid_pose': True,
+                        'restamp_scan_to_now': True,
                         'accum_max_yaw_rate_deg': 25.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],

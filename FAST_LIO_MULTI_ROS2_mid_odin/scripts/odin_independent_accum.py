@@ -212,6 +212,11 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('accum_max_yaw_rate_deg', 25.0)
         # Bridge-published Mid pose locked to each L2 cloud (empty = wall pair only).
         self.declare_parameter('l2_mid_pose_topic', '/odin1/l2_mid_pose')
+        # True: live densify uses *latest* Mid wall pose (snappier vs Mid cloud).
+        # False: prefer stamp-locked /odin1/l2_mid_pose (less turn smear, more lag).
+        self.declare_parameter('prefer_latest_mid_pose', True)
+        # Stamp /odin1/cloud_in_map with now so RViz tracks live (geom still from L2).
+        self.declare_parameter('restamp_scan_to_now', True)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -267,10 +272,13 @@ class OdinIndependentAccum(Node):
         self.mid_pose_ema = float(np.clip(self.get_parameter('mid_pose_ema').value, 0.01, 1.0))
         self.accum_max_yaw_rate_deg = float(self.get_parameter('accum_max_yaw_rate_deg').value)
         self.l2_mid_pose_topic = str(self.get_parameter('l2_mid_pose_topic').value or '').strip()
+        self.prefer_latest_mid_pose = bool(self.get_parameter('prefer_latest_mid_pose').value)
+        self.restamp_scan_to_now = bool(self.get_parameter('restamp_scan_to_now').value)
         self._ema_mid_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
         self._n_skip_accum_turn = 0
         self._n_l2_pose_hit = 0
+        self._n_latest_mid_hit = 0
         self._mid_yaw_rate_deg = 0.0
         self._mid_yaw_prev: Optional[Tuple[float, float]] = None  # (wall, yaw_rad)
         # (cloud_stamp_sec, T_map_body) from downsample bridge
@@ -377,7 +385,7 @@ class OdinIndependentAccum(Node):
             f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)} '
             f'motion_sync={self._n_motion_sync} hold={self._n_motion_hold} '
             f'skip_accum_turn={self._n_skip_accum_turn} '
-            f'l2_pose_hit={self._n_l2_pose_hit} '
+            f'l2_pose_hit={self._n_l2_pose_hit} latest_mid={self._n_latest_mid_hit} '
             f'yaw_rate={self._mid_yaw_rate_deg:.1f}deg/s '
             f'sync_dt={self._last_sync_dt*1000:.0f}ms mid_odom_buf={len(self._mid_odom_buf)}'
         )
@@ -801,12 +809,17 @@ class OdinIndependentAccum(Node):
             return
 
         if self.project_with_mid:
-            # Prefer bridge-locked Mid pose (same geom stamp as L2). Fallback:
-            # wall-time Mid interp (lookback=0). Never stamp-pair across clocks.
+            # Snappy viz: prefer latest Mid wall pose. On fast yaw, fall back to
+            # stamp-locked l2_mid_pose to reduce turn fan. Never stamp-pair clocks.
             T_mid = None
             dt_mid = 0.0
             t_cloud = stamp_sec(msg.header.stamp)
-            if self._l2_mid_pose_buf:
+            turning = (
+                self.accum_max_yaw_rate_deg > 0.0
+                and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
+            )
+            use_locked = (not self.prefer_latest_mid_pose) or turning
+            if use_locked and self._l2_mid_pose_buf:
                 best = None
                 best_dt = 1e9
                 for t_p, T_p in self._l2_mid_pose_buf:
@@ -814,7 +827,6 @@ class OdinIndependentAccum(Node):
                     if dt < best_dt:
                         best_dt = dt
                         best = T_p
-                # Same stamp key from bridge → dt≈0; allow small float noise.
                 if best is not None and best_dt <= 0.05:
                     T_mid = best
                     dt_mid = best_dt
@@ -826,6 +838,7 @@ class OdinIndependentAccum(Node):
                     self._n_skip_odom += 1
                     return
                 T_mid, dt_mid = mid_hit
+                self._n_latest_mid_hit += 1
             self._last_sync_dt = dt_mid
             T_mid = self._ema_mid_pose(T_mid)
             T_map = T_mid @ self.T_body_odin_lidar
@@ -857,7 +870,12 @@ class OdinIndependentAccum(Node):
         # Live scan: optional warp to latest Mid (disabled when project_with_mid).
         t_cloud = stamp_sec(stamp)
         out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out, t_cloud)
-        pub_stamp = self.get_clock().now().to_msg() if sync_stamp is not None else stamp
+        if sync_stamp is not None:
+            pub_stamp = self.get_clock().now().to_msg()
+        elif self.restamp_scan_to_now and self.project_with_mid:
+            pub_stamp = self.get_clock().now().to_msg()
+        else:
+            pub_stamp = stamp
 
         if self.pub_scan is not None:
             header = Header()

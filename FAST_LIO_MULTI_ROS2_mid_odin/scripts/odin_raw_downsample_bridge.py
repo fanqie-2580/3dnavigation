@@ -340,6 +340,7 @@ class OdinRawDownsampleBridge(Node):
         self._last_l2_match = '-'
         self._n_drop_pending = 0
         self._last_proc_ms = -1.0
+        self._busy = False
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
         self.declare_parameter('mid_stall_fallback_sec', 0.5)
@@ -380,8 +381,8 @@ class OdinRawDownsampleBridge(Node):
             self.create_subscription(
                 Odometry, self.get_parameter('odom_topic').value, self.on_mid_odom, reliable
             )
-        # Latest-cloud publisher: avoid processing a backlog of stale frames.
-        self.create_timer(0.02, self._poll_pending)
+        # Backup poll if cb deferred while busy (prefer immediate process in cb).
+        self.create_timer(0.01, self._poll_pending)
         self.create_timer(2.0, self._status)
         self.get_logger().info(
             f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
@@ -413,18 +414,10 @@ class OdinRawDownsampleBridge(Node):
     def _voxel_downsample(self, arr: np.ndarray) -> np.ndarray:
         if arr.size == 0:
             return arr
-        if len(arr) > self.max_points * 2:
-            step0 = int(np.ceil(len(arr) / float(self.max_points * 2)))
-            arr = arr[::step0]
-        if self.voxel > 0 and len(arr) > 0:
-            # Pack voxel indices into one int64 key — cheaper than structured view.
-            q = np.floor(arr[:, :3] / self.voxel).astype(np.int64)
-            key = q[:, 0] + (q[:, 1] << 20) + (q[:, 2] << 40)
-            _, idx = np.unique(key, return_index=True)
-            arr = arr[idx]
+        # Pre-decimate already limits count; stride only (skip unique voxel cost).
         if len(arr) > self.max_points:
-            step = int(np.ceil(len(arr) / self.max_points))
-            arr = arr[::step]
+            step0 = int(np.ceil(len(arr) / float(self.max_points)))
+            arr = arr[::step0]
         return arr
 
     def _unproject_to_lidar(self, arr: np.ndarray, stamp) -> Optional[np.ndarray]:
@@ -560,30 +553,46 @@ class OdinRawDownsampleBridge(Node):
         return fid in ('odom', 'map', 'odin_odom', 'odin_map')
 
     def cb(self, msg: PointCloud2) -> None:
-        """Keep only the newest cloud. Overwrite pending; poll timer publishes.
-
-        With slow Python unpack, processing every queued RELIABLE frame used to
-        build a ~2s pipeline. depth=1 + overwrite keeps lag ≈ one frame cost.
-        """
+        """Latest-only: process immediately when idle to cut timer wait (~10–80ms)."""
         self._n_cloud += 1
-        if self._pending is not None:
-            self._n_drop_pending += 1
-        self._pending = msg
-        self._pending_wall = self.get_clock().now().nanoseconds * 1e-9
+        wall = time.time()
+        if self._busy:
+            if self._pending is not None:
+                self._n_drop_pending += 1
+            self._pending = msg
+            self._pending_wall = wall
+            return
+        # Optional rate floor (0 = every frame we can take).
+        if (
+            self.fallback_period > 0.0
+            and self._last_pub_sec >= 0.0
+            and (wall - self._last_pub_sec) < self.fallback_period
+        ):
+            if self._pending is not None:
+                self._n_drop_pending += 1
+            self._pending = msg
+            self._pending_wall = wall
+            return
+        self._process_cloud(msg, wall)
 
     def _poll_pending(self) -> None:
-        msg = self._pending
-        if msg is None:
+        if self._busy or self._pending is None:
             return
-        # Drop if we are still inside fallback_period (rate limit, wall clock).
         now_sec = time.time()
-        if self._last_pub_sec >= 0.0 and (now_sec - self._last_pub_sec) < self.fallback_period:
+        if (
+            self.fallback_period > 0.0
+            and self._last_pub_sec >= 0.0
+            and (now_sec - self._last_pub_sec) < self.fallback_period
+        ):
             return
+        msg = self._pending
         wall_cloud = self._pending_wall
         self._pending = None
         self._pending_wall = -1.0
+        self._process_cloud(msg, wall_cloud)
 
-        # Age-gate by wall arrival (Livox stamp vs system restamp are not comparable).
+    def _process_cloud(self, msg: PointCloud2, wall_cloud: float) -> None:
+        now_sec = time.time()
         if self.max_cloud_age_sec > 0.0 and wall_cloud > 0.0:
             if (now_sec - wall_cloud) > self.max_cloud_age_sec:
                 self._n_skip_age += 1
@@ -594,16 +603,25 @@ class OdinRawDownsampleBridge(Node):
             and self._mid_odom_stamp is not None
             and not self._mid_stalled()
         ):
-            # Align publish cadence to Mid odom when requested.
             if self._mid_odom_key is None or self._last_pub_key == self._mid_odom_key:
-                self._pending = msg  # wait for a new Mid tick
+                if self._pending is not None:
+                    self._n_drop_pending += 1
+                self._pending = msg
                 self._pending_wall = wall_cloud
                 return
-            if self._publish_from_msg(msg, None, wall_cloud=wall_cloud):
-                self._last_pub_key = self._mid_odom_key
+            self._busy = True
+            try:
+                if self._publish_from_msg(msg, None, wall_cloud=wall_cloud):
+                    self._last_pub_key = self._mid_odom_key
+            finally:
+                self._busy = False
             return
 
-        self._publish_from_msg(msg, msg.header.stamp, wall_cloud=wall_cloud)
+        self._busy = True
+        try:
+            self._publish_from_msg(msg, msg.header.stamp, wall_cloud=wall_cloud)
+        finally:
+            self._busy = False
 
     def _publish_from_msg(self, msg: PointCloud2, stamp, wall_cloud: float = -1.0) -> bool:
         t0 = time.perf_counter()
