@@ -163,11 +163,13 @@ def generate_launch_description():
                     # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
-                    # Root cause of turn swing: L2 stamp is USB receive (~150ms),
-                    # Mid/odom stamp lag ~70–90ms → relative ~80–100ms. Mid-IMU
-                    # deskew of Odin then uses future Mid poses; stop→snap back.
-                    # Compensate by relative lag (NOT full 150ms — that overshot).
-                    'stamp_latency_comp_sec': 0.08,
+                    # Live data (2026-11-12): stamp_comp=0.08 made L2~175ms
+                    # earlier than Odom at same wall → Bundle dt mean~85ms,
+                    # 80% >80ms / many ~100ms (max_sync edge) → Odin pose flicker.
+                    # Keep 0 so Bundle Mid↔L2 stays tight (|dt|~20ms).
+                    # Turn smear root fix = disable Mid-IMU deskew on USB Odin
+                    # (offset_time ≠ host-receive clock), not stamp rewriting.
+                    'stamp_latency_comp_sec': 0.0,
                     'densify_mid_lag_comp_sec': 0.0,
                     'publish_ds_topic': True,
                 }],

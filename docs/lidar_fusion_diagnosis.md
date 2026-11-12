@@ -494,8 +494,18 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | 正确做法（非冷却） | |
 |--------------------|--|
 | **禁止**对 Odin 做 Mid-IMU deskew | 清零 L2 curvature；整帧刚性进 Bundle |
-| `stamp_latency_comp_sec≈0.08` | 整帧 stamp 与 Mid 相对对齐 |
-| `map_insert` 门限/冷却 | 关掉 |
+| `stamp_latency_comp_sec=0` | **不要**为相对时延改 L2 stamp |
+
+**运行反证（stamp_comp=0.08 后更差）**
+
+| 指标 | 值 |
+|------|----|
+| L2 = raw − 0.08 | 成立（补偿确实生效） |
+| 同 wall 下 L2−Odom stamp | **≈ −0.175 s**（L2 过早） |
+| Bundle dt | mean≈85ms，**80% >80ms**，多帧 ~95–100ms（贴 `max_sync_dt`） |
+| 后果 | Mid↔L2 配对在窗口边缘抖动 → Odin 整帧跟着跳/更不对 |
+
+相对采集时延仍在，但不改 stamp；靠关 deskew 去掉“错位→ω=0 弹回”的主机制。
 
 ### 10e. 转动时 Odin 左右摆（2026-11-12）
 
