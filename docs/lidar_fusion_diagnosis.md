@@ -423,6 +423,44 @@ Bridge 重发布 L2 时保留 `offset_time`（s）；若字段丢失则填 0 →
 **根因**：densify `hold_trans=0.03`/`hold_rot=1.2°`/`α=0.06` 让 Odin 投影 Mid 落后于 `/cloud_registered`；keep-first voxel 把这段错位永久写进 accum → RViz 双墙。  
 **修复**：hold=0、α=1（与 Mid 1:1）；`accum_max_yaw_rate_deg` 25→12；清空 `/odin_independent_accum/clear_accum` 与 fuse `~/clear_accum`。
 
+### 补充：微转仍严重晃 + 写进图（源码根因，未上电复核）
+
+RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_with_mid`）。  
+累积图 = `/viz/accum_odin` → `mid_odin_frame_fuse` → `/viz/accum_fused`（keep-first voxel）。
+
+**主因（位姿时间）**
+
+1. Bridge `_match_mid_for_l2`（`odin_raw_downsample_bridge.py`）在因果 Mid 之外仍做  
+   `before/after` **插值**（半窗 `interp_dt≤0.08s`），显式用到 **未来 Mid**。  
+   转弯时未来 Mid yaw 已超前 → 投影 Odin「转过头」；下一帧只剩 causal → **回弹**。  
+   Launch 注释写 “never future”，与实现不一致。
+2. 几何上 Odin stamp_lag 仍常比 Mid 大约 0.15–0.22s。任何偏新的 Mid（插值/窗口）在微转时  
+   `δθ≈ω·Δt` 被距离放大（5°/s×0.2s≈1° → 5m 处约 9cm），表现为「稍微转就很晃」。
+
+**放大（同一 `_project_odin_cloud`）**
+
+3. `deskew_odin=True` 且 `|yaw_rate|≥still_yaw_rate_deg(3°)` 时，用 **当前墙钟 Mid yaw rate** 去 deskew 本帧 Odin；微转刚好跨过门限，rate 噪声会整扇拧动 wedge。
+4. 当前 launch `densify_hold_*=0`、`α=1`：Mid IEKF 每帧位姿变化 **100%** 进 densify（关 deadband 是为消双墙，但把微抖重新暴露给远点）。
+
+**为何晃动点进图**
+
+5. `VoxelAccum.add` **keep-first**：错位点一旦写入永不覆盖。  
+6. `accum_max_yaw_rate_deg=12` 只挡大转；**3–12°/s 微转仍 `_accum_locked(out)`**，live 与 accum 共用同一错误投影。  
+7. 另路：`mapping.lidar2_map_insert_en: true` 在 bundle + `last_odin_iekf_ok` 时还可把 Odin 点写入 C++ `ikdtree`（与 Python AccumFused 独立）。
+
+**结论**：晃 = densify Mid 相对 Odin 几何偏新（尤以 bridge 未来插值为源码级确定缺陷）+ deskew/无 deadband 放大；进图 = keep-first accum 门限过宽（及可选 ikdtree insert）。
+
+### 10. 按官方 FAST_LIO_MULTI 的改动（2026-11-12）
+
+原则：**紧耦合真值 = C++ stamp 同步 + IEKF**；Python densify 只做软可视化。
+
+| 改动 | 文件 | 效果 |
+|------|------|------|
+| `_match_mid_for_l2` 仅 causal Mid（禁 before/after 插值） | `odin_raw_downsample_bridge.py` | 消除转过头再回弹 |
+| `deskew_odin=false`；accum 仅 still（≤3°/s 且 ≤still_trans_vel） | launch + `odin_independent_accum.py` | 微转不拧 wedge、不写 keep-first |
+| fuse `accum_gyr_gate=0.05` | launch | Mid 体素也不在微转时堆 |
+| `lidar2_map_insert_en=false`；point/IEKF 仍开 | `mid360_odin1.yaml` | 紧耦合保留，坏 L2 不进 ikdtree |
+
 
 
 ---

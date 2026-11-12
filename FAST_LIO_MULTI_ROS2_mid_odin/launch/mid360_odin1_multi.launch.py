@@ -169,7 +169,7 @@ def generate_launch_description():
                     'odin_odom_max_dt': 1.0,
                     # Must match mapping.lidar2_max_sync_dt: never restamp L2
                     # outside this window (lying stamps twist Mid IEKF).
-                    # Causal Mid densify pose window (interp/before only; never future).
+                        # Causal Mid only (stamp<=Odin); no future interp (official sync).
                     # Mid odom ~10Hz → allow up to one period so we rarely skip.
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
@@ -369,10 +369,12 @@ def generate_launch_description():
                         'densify_hold_trans': 0.0,
                         'densify_hold_rot_deg': 0.0,
                         'densify_track_alpha': 1.0,
-                        'deskew_odin': True,
+                        # OFF: live Mid yaw-rate deskew twisted Odin wedge on slight turns.
+                        'deskew_odin': False,
                         'restamp_scan_to_now': True,
-                        # Tighter: keep-first voxels permanently store turn smear.
-                        'accum_max_yaw_rate_deg': 12.0,
+                        # Still-only Python accum (official map = C++ ikdtree).
+                        # Keep-first voxels must not store micro-turn densify smear.
+                        'accum_max_yaw_rate_deg': 3.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
@@ -433,7 +435,8 @@ def generate_launch_description():
                         ),
                         'max_accum_points': 400000,
                         'accum_skip_sec': 2.0,
-                        'accum_gyr_gate': 0.35,
+                        # Match densify still-only (~3 deg/s ≈ 0.05 rad/s).
+                        'accum_gyr_gate': 0.05,
                         'accum_gyr_cooldown_sec': 1.0,
                         # Allow residual dock TCP lag so fuse does not starve.
                         'max_scan_age_sec': 1.50,

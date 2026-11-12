@@ -571,18 +571,18 @@ class OdinRawDownsampleBridge(Node):
         return best
 
     def _match_mid_for_l2(self, t_cloud: float, wall_cloud: float):
-        """Causal Mid pose at Odin cloud stamp (never a future Mid alone).
+        """Official-style: Mid pose with stamp <= Odin stamp only (causal).
 
-        Nearest-stamp matching picked Mid *after* Odin ~50% of frames. During
-        turns that projects Odin with a yaw that has already advanced → RViz
-        "overshoots then snaps back". Prefer:
-          1) SE3 interpolate Mid before/after bracketing t_cloud
-          2) else Mid with stamp <= t_cloud within mid_restamp_max_dt
-        Never fall back to wall/latest Mid for densify pose.
+        FAST_LIO_MULTI syncs by header time and drops unmatched L2 — it never
+        paints with a *future* Mid. Interpolating before/after Odin stamp used
+        Mid yaw that had already advanced → densify overshoot then snap-back
+        on slight turns. Match:
+          - Mid with stamp <= t_cloud and (t_cloud - t_mid) <= mid_restamp_max_dt
+          - else refuse (no wall/latest/future Mid for densify or IEKF stamp)
         """
         del wall_cloud  # kept in signature for callers
         before = None  # max t <= t_cloud
-        after = None  # min t > t_cloud
+        after = None  # min t > t_cloud (diagnostics only)
         for t, st, _wall, pose in self._mid_stamps:
             if t <= t_cloud:
                 if before is None or t > before[0]:
@@ -592,28 +592,16 @@ class OdinRawDownsampleBridge(Node):
                     after = (t, st, pose)
 
         max_dt = self.mid_restamp_max_dt
-        # Interp only when both sides are close (tight half-window).
-        interp_dt = min(max_dt, 0.08)
-        if before is not None and after is not None:
-            dt_span = after[0] - before[0]
-            if (
-                dt_span > 1e-6
-                and (t_cloud - before[0]) <= interp_dt
-                and (after[0] - t_cloud) <= interp_dt
-            ):
-                a = (t_cloud - before[0]) / dt_span
-                pose = _slerp_pose(before[2], after[2], a)
-                self._last_l2_match = f'interp:{a:.2f}'
-                return (t_cloud, _stamp_msg(t_cloud), 0.0, pose)
-
         if before is not None:
             dt = t_cloud - before[0]
             if dt <= max_dt:
                 self._last_l2_match = f'causal:{dt*1000:.0f}ms'
                 return (before[0], before[1], dt, before[2])
 
-        # Future-only Mid would overshoot on turns — refuse.
-        if after is not None:
+        # Future-only / too-old Mid — refuse (official drops unmatched L2).
+        if before is not None:
+            self._last_l2_match = f'causal_old:{(t_cloud-before[0])*1000:.0f}ms'
+        elif after is not None:
             self._last_l2_match = f'future_only:{(after[0]-t_cloud)*1000:.0f}ms'
         else:
             self._last_l2_match = 'none'

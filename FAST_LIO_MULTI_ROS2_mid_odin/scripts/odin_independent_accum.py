@@ -955,8 +955,9 @@ class OdinIndependentAccum(Node):
 
         self._pending_l2 = None
         self._last_sync_dt = dt_locked
-        # Deskew only when truly turning. Near-zero Mid yaw noise was rotating
-        # the Odin wedge every frame → "slight motion, huge shake".
+        # Deskew OFF by default (launch): live Mid yaw-rate on delayed Odin
+        # twisted the wedge on slight turns. Official path uses Mid IMU undistort
+        # inside C++ IEKF, not Python densify deskew.
         if (
             self.deskew_odin
             and off_t.size == len(arr)
@@ -1029,12 +1030,17 @@ class OdinIndependentAccum(Node):
 
     def _accum_locked(self, out: np.ndarray) -> None:
         # IMPORTANT: `out` must be stamp-pose projected (not motion-synced live).
+        # Soft viz only: keep-first voxels permanently store turn smear, so only
+        # accumulate when Mid is still (official map truth is C++ ikdtree).
         if (time.time() - self._t0) < self.accum_skip_sec:
             return
-        if (
-            self.accum_max_yaw_rate_deg > 0.0
-            and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
-        ):
+        yaw_lim = self.accum_max_yaw_rate_deg
+        if yaw_lim <= 0.0:
+            yaw_lim = self.still_yaw_rate_deg
+        if yaw_lim > 0.0 and self._mid_yaw_rate_deg > yaw_lim:
+            self._n_skip_accum_turn += 1
+            return
+        if self.still_trans_vel > 0.0 and self._mid_trans_vel > self.still_trans_vel:
             self._n_skip_accum_turn += 1
             return
         if self._accum.add(out):
@@ -1090,11 +1096,13 @@ class OdinIndependentAccum(Node):
             self._n_pub += 1
 
         if out is not None and (time.time() - self._t0) >= self.accum_skip_sec:
-            # Fast yaw: keep-first voxels would lock a fan trail into accum.
-            if (
-                self.accum_max_yaw_rate_deg > 0.0
-                and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
-            ):
+            # Still-only: keep-first voxels would lock a fan trail into accum.
+            yaw_lim = self.accum_max_yaw_rate_deg
+            if yaw_lim <= 0.0:
+                yaw_lim = self.still_yaw_rate_deg
+            if yaw_lim > 0.0 and self._mid_yaw_rate_deg > yaw_lim:
+                self._n_skip_accum_turn += 1
+            elif self.still_trans_vel > 0.0 and self._mid_trans_vel > self.still_trans_vel:
                 self._n_skip_accum_turn += 1
             elif self._accum.add(out):  # stamp-locked Mid pose only
                 self._dirty = True
