@@ -27,7 +27,7 @@ from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Pose, TransformStamped
+from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
@@ -202,7 +202,16 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('motion_sync_min_rot_deg', 0.5)
         self.declare_parameter('mid_wall_pair_max_dt', 0.08)
         # Odin geometry is older than arrival; look up Mid this many seconds earlier.
-        self.declare_parameter('mid_pose_lookback_sec', 0.12)
+        # Wall arrivals of L2 vs Mid are ~aligned on USB; lookback>0 painted with
+        # an older Mid yaw and caused turn fan-smear. Keep 0 unless measured lag.
+        self.declare_parameter('mid_pose_lookback_sec', 0.0)
+        # 1.0 = off. EMA lags Mid yaw on turns → densify fan smear.
+        self.declare_parameter('mid_pose_ema', 1.0)
+        # Skip voxel accum above this Mid yaw rate (live scan still publishes).
+        # Keep-first voxels permanently fan if pose lags while turning.
+        self.declare_parameter('accum_max_yaw_rate_deg', 25.0)
+        # Bridge-published Mid pose locked to each L2 cloud (empty = wall pair only).
+        self.declare_parameter('l2_mid_pose_topic', '/odin1/l2_mid_pose')
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -255,7 +264,17 @@ class OdinIndependentAccum(Node):
         self.motion_sync_min_rot_deg = float(self.get_parameter('motion_sync_min_rot_deg').value)
         self.mid_wall_pair_max_dt = float(self.get_parameter('mid_wall_pair_max_dt').value)
         self.mid_pose_lookback_sec = float(self.get_parameter('mid_pose_lookback_sec').value)
+        self.mid_pose_ema = float(np.clip(self.get_parameter('mid_pose_ema').value, 0.01, 1.0))
+        self.accum_max_yaw_rate_deg = float(self.get_parameter('accum_max_yaw_rate_deg').value)
+        self.l2_mid_pose_topic = str(self.get_parameter('l2_mid_pose_topic').value or '').strip()
+        self._ema_mid_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
+        self._n_skip_accum_turn = 0
+        self._n_l2_pose_hit = 0
+        self._mid_yaw_rate_deg = 0.0
+        self._mid_yaw_prev: Optional[Tuple[float, float]] = None  # (wall, yaw_rad)
+        # (cloud_stamp_sec, T_map_body) from downsample bridge
+        self._l2_mid_pose_buf: Deque[Tuple[float, np.ndarray]] = deque(maxlen=200)
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
         self.align_delay_sec = float(self.get_parameter('align_delay_sec').value)
         self.mid_accum_topic = str(self.get_parameter('mid_accum_topic').value)
@@ -306,6 +325,11 @@ class OdinIndependentAccum(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
+        cloud_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
         self.pub_scan = None
         self.pub_accum = None
@@ -324,9 +348,13 @@ class OdinIndependentAccum(Node):
                 self.create_subscription(
                     PointCloud2, self.mid_accum_topic, self.on_mid_accum, 1
                 )
+            if self.project_with_mid and self.l2_mid_pose_topic:
+                self.create_subscription(
+                    PoseStamped, self.l2_mid_pose_topic, self.on_l2_mid_pose, 50
+                )
         if not self.align_only:
-            # Prefer RELIABLE (ground bridge); also OK for most Odin TCP republish.
-            self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, reliable)
+            # depth=1: drop DDS backlog so densify tracks live L2, not stale queue.
+            self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, cloud_qos)
             self.create_timer(max(0.2, period), self.publish_accum)
             self.create_timer(2.0, self._status)
             self.create_service(Trigger, '~/clear_accum', self.on_clear)
@@ -348,6 +376,9 @@ class OdinIndependentAccum(Node):
             f'skip_align={self._n_skip_align} aligned={self._aligned} '
             f'accum_n={len(self._accum)} odom_buf={len(self._odom_buf)} '
             f'motion_sync={self._n_motion_sync} hold={self._n_motion_hold} '
+            f'skip_accum_turn={self._n_skip_accum_turn} '
+            f'l2_pose_hit={self._n_l2_pose_hit} '
+            f'yaw_rate={self._mid_yaw_rate_deg:.1f}deg/s '
             f'sync_dt={self._last_sync_dt*1000:.0f}ms mid_odom_buf={len(self._mid_odom_buf)}'
         )
 
@@ -402,9 +433,14 @@ class OdinIndependentAccum(Node):
         self._accum.clear()
         self._dirty = True
         self._t0 = time.time()
+        self._ema_mid_T = None
         resp.success = True
         resp.message = 'cleared independent Odin accum'
         return resp
+
+    def on_l2_mid_pose(self, msg: PoseStamped) -> None:
+        t = stamp_sec(msg.header.stamp)
+        self._l2_mid_pose_buf.append((t, se3_from_pose(msg.pose)))
 
     def on_mid_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
@@ -413,9 +449,17 @@ class OdinIndependentAccum(Node):
         self._mid_T = T
         self._mid_stamp_latest = msg.header.stamp
         self._mid_odom_buf.append((t, wall, T))
-        cutoff = t - self.odom_buffer_sec
-        while self._mid_odom_buf and self._mid_odom_buf[0][0] < cutoff:
+        # Prune by wall — Mid/Odin stamps are not a shared timebase on USB.
+        cutoff_wall = wall - self.odom_buffer_sec
+        while self._mid_odom_buf and self._mid_odom_buf[0][1] < cutoff_wall:
             self._mid_odom_buf.popleft()
+        yaw = math.atan2(float(T[1, 0]), float(T[0, 0]))
+        if self._mid_yaw_prev is not None:
+            dw = wall - self._mid_yaw_prev[0]
+            if dw > 1e-3:
+                dy = (yaw - self._mid_yaw_prev[1] + math.pi) % (2.0 * math.pi) - math.pi
+                self._mid_yaw_rate_deg = abs(dy) / dw * (180.0 / math.pi)
+        self._mid_yaw_prev = (wall, yaw)
 
     def _nearest_mid_odom(self, t_query: float, max_dt: Optional[float] = None):
         if not self._mid_odom_buf:
@@ -433,14 +477,15 @@ class OdinIndependentAccum(Node):
         return best
 
     def _mid_pose_by_wall(self, wall_cloud: float):
-        """Mid pose for Odin geometry time ≈ arrival - lookback.
+        """Mid pose at Odin cloud arrival (wall) − optional lookback.
 
-        Pairing at raw arrival uses a newer Mid yaw than the Odin points
-        (USB/unproject lag) and fans the densify map while turning.
+        Interpolate on Mid *arrival* timeline — stamp clocks differ by seconds.
         """
         if not self._mid_odom_buf:
             return None
         target = wall_cloud - max(0.0, self.mid_pose_lookback_sec)
+        prev = None
+        nxt = None
         best = None
         best_dt = 1e9
         for _t, wall, T in self._mid_odom_buf:
@@ -448,9 +493,38 @@ class OdinIndependentAccum(Node):
             if dt < best_dt:
                 best_dt = dt
                 best = T
+            if wall <= target and (prev is None or wall > prev[0]):
+                prev = (wall, T)
+            if wall >= target and (nxt is None or wall < nxt[0]):
+                nxt = (wall, T)
+        if prev is not None and nxt is not None and prev[0] != nxt[0]:
+            gap = nxt[0] - prev[0]
+            if gap <= max(0.35, self.mid_wall_pair_max_dt):
+                a = (target - prev[0]) / gap
+                return self._lerp_se3(prev[1], nxt[1], a), 0.0
         if best is None or best_dt > self.mid_wall_pair_max_dt:
             return None
         return best, best_dt
+
+    def _ema_mid_pose(self, T_mid: np.ndarray) -> np.ndarray:
+        """Optional Mid pose smooth for densify. Disabled when mid_pose_ema≥1."""
+        if self.mid_pose_ema >= 0.999:
+            self._ema_mid_T = T_mid
+            return T_mid
+        if self._ema_mid_T is None:
+            self._ema_mid_T = T_mid.copy()
+            return self._ema_mid_T
+        T_rel = se3_inv(self._ema_mid_T) @ T_mid
+        trans = float(np.linalg.norm(T_rel[:3, 3]))
+        R = T_rel[:3, :3]
+        cos_a = max(-1.0, min(1.0, 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)))
+        rot_deg = math.degrees(math.acos(cos_a))
+        if trans > 0.03 or rot_deg > 0.8:
+            a = max(self.mid_pose_ema, 0.65)
+        else:
+            a = min(self.mid_pose_ema, 0.12)
+        self._ema_mid_T = self._lerp_se3(self._ema_mid_T, T_mid, a)
+        return self._ema_mid_T
 
     def _pose_at(self, buf, t_query: float):
         """Pose at t_query. Interpolate inside ≤0.35s bracket, else nearest ≤80ms."""
@@ -727,17 +801,33 @@ class OdinIndependentAccum(Node):
             return
 
         if self.project_with_mid:
-            # Lidar-frame densify into Mid map — no Odin SLAM / cloud_slam.
-            # Mid Livox stamps and Odin host stamps differ by ~1s; pairing by
-            # header stamp painted fresh geometry with an old Mid yaw (fan smear).
-            # Use arrival-time association instead.
-            wall_cloud = self.get_clock().now().nanoseconds * 1e-9
-            mid_hit = self._mid_pose_by_wall(wall_cloud)
-            if mid_hit is None:
-                self._n_skip_odom += 1
-                return
-            T_mid, dt_mid = mid_hit
+            # Prefer bridge-locked Mid pose (same geom stamp as L2). Fallback:
+            # wall-time Mid interp (lookback=0). Never stamp-pair across clocks.
+            T_mid = None
+            dt_mid = 0.0
+            t_cloud = stamp_sec(msg.header.stamp)
+            if self._l2_mid_pose_buf:
+                best = None
+                best_dt = 1e9
+                for t_p, T_p in self._l2_mid_pose_buf:
+                    dt = abs(t_p - t_cloud)
+                    if dt < best_dt:
+                        best_dt = dt
+                        best = T_p
+                # Same stamp key from bridge → dt≈0; allow small float noise.
+                if best is not None and best_dt <= 0.05:
+                    T_mid = best
+                    dt_mid = best_dt
+                    self._n_l2_pose_hit += 1
+            if T_mid is None:
+                wall_cloud = self.get_clock().now().nanoseconds * 1e-9
+                mid_hit = self._mid_pose_by_wall(wall_cloud)
+                if mid_hit is None:
+                    self._n_skip_odom += 1
+                    return
+                T_mid, dt_mid = mid_hit
             self._last_sync_dt = dt_mid
+            T_mid = self._ema_mid_pose(T_mid)
             T_map = T_mid @ self.T_body_odin_lidar
             R, t = T_map[:3, :3], T_map[:3, 3]
             world = (arr @ R.T) + t
@@ -777,7 +867,13 @@ class OdinIndependentAccum(Node):
             self._n_pub += 1
 
         if (time.time() - self._t0) >= self.accum_skip_sec:
-            if self._accum.add(out):
+            # Fast yaw: keep-first voxels would lock a fan trail into accum.
+            if (
+                self.accum_max_yaw_rate_deg > 0.0
+                and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
+            ):
+                self._n_skip_accum_turn += 1
+            elif self._accum.add(out):
                 self._dirty = True
 
     def publish_accum(self) -> None:

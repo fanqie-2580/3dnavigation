@@ -90,6 +90,18 @@ densify 日志：`l2_pose_hit` 有命中；`l2_match=stamp:〜ms`；`project_wit
 4. **P1**：重建 `laserMapping_adaptive` 使 C++ 改动生效  
 5. **P2**：Odin 点云未按时间排序时的扫尾；mode 0/1/2 细调（当前 mode 2 与 Mid IMU 已 ~10 ms 级对齐，**不是**本轮 2 s 滞后主因）
 
+### 0.8 2026-11-12 修复后复测（已改代码）
+
+改动：`odin_raw_downsample_bridge` 预抽稀 + 加速解包/体素、cloud QoS depth=1、launch `max_points=8000`/`pre_decimate_max=16000`/`voxel=0.10`；`odin_independent_accum` cloud depth=1；重建 `laserMapping_adaptive`。
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| bridge `proc_ms` | ~2000（隐含） | **~45–52** |
+| raw→L2 同 stamp 墙钟 | med **2028 ms** | med **~60–80 ms**（量级） |
+| `/odin1/cloud_l2_body` delay | **~2.19 s** | **~0.22 s** |
+| `/odin1/cloud_in_map` delay | **~2.4 s** | **~0.22 s** |
+| `/cloud_registered` delay | ~0.045 s | ~0.05 s（不变） |
+
 ---
 
 ## 1. 实际运行架构

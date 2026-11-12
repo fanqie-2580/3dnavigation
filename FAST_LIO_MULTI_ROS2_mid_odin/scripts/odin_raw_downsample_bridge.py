@@ -25,6 +25,7 @@ from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -133,8 +134,14 @@ def _mat_from_odom(msg: Odometry) -> np.ndarray:
     return T
 
 
-def _unpack_points(msg: PointCloud2, min_conf: float) -> np.ndarray:
-    """Nx5: x,y,z,intensity,offset_time_sec (vectorized)."""
+def _unpack_points(
+    msg: PointCloud2, min_conf: float, max_read: int = 0
+) -> np.ndarray:
+    """Nx5: x,y,z,intensity,offset_time_sec (strided views + optional pre-decimate).
+
+    max_read>0: stride-subsample *before* field extract so 49k USB frames
+    do not burn ~1–2s/frame on Jetson (was the densify 2s pipeline lag).
+    """
     fm = _field_map(msg)
     if not all(k in fm for k in ('x', 'y', 'z')):
         return np.zeros((0, 5), dtype=np.float32)
@@ -143,54 +150,79 @@ def _unpack_points(msg: PointCloud2, min_conf: float) -> np.ndarray:
     if n <= 0:
         return np.zeros((0, 5), dtype=np.float32)
     step = int(msg.point_step)
-    raw = np.frombuffer(msg.data, dtype=np.uint8)
-    if raw.size < n * step:
-        n = raw.size // step
+    buf = memoryview(msg.data)
+    nbytes = n * step
+    if len(buf) < nbytes:
+        n = len(buf) // step
+        nbytes = n * step
     if n <= 0:
         return np.zeros((0, 5), dtype=np.float32)
-    arr = raw[: n * step].reshape(n, step)
 
-    def col_f32(name: str) -> np.ndarray:
-        o = fm[name].offset
-        return arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+    stride_pts = 1
+    if max_read > 0 and n > max_read:
+        stride_pts = int(math.ceil(n / float(max_read)))
+    # Point stride in bytes for np.ndarray views into the raw cloud.
+    byte_stride = step * stride_pts
+    n_use = (n + stride_pts - 1) // stride_pts
 
-    xyz = np.column_stack([col_f32('x'), col_f32('y'), col_f32('z')])
+    def col_f32(offset: int) -> np.ndarray:
+        return np.ndarray(
+            n_use, dtype=np.float32, buffer=buf, offset=int(offset), strides=(byte_stride,)
+        ).copy()
+
+    def col_u8(offset: int) -> np.ndarray:
+        return np.ndarray(
+            n_use, dtype=np.uint8, buffer=buf, offset=int(offset), strides=(byte_stride,)
+        ).astype(np.float32)
+
+    def col_u16(offset: int) -> np.ndarray:
+        return np.ndarray(
+            n_use, dtype=np.uint16, buffer=buf, offset=int(offset), strides=(byte_stride,)
+        ).astype(np.float32)
+
+    xyz = np.column_stack(
+        [col_f32(fm['x'].offset), col_f32(fm['y'].offset), col_f32(fm['z'].offset)]
+    )
     finite = np.isfinite(xyz).all(axis=1)
 
-    intensity = np.zeros(n, dtype=np.float32)
+    intensity = np.zeros(n_use, dtype=np.float32)
     if 'intensity' in fm:
         f = fm['intensity']
-        o = f.offset
         if f.datatype == PointField.FLOAT32:
-            intensity = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+            intensity = col_f32(f.offset)
         elif f.datatype == PointField.UINT8:
-            intensity = arr[:, o].astype(np.float32)
+            intensity = col_u8(f.offset)
         elif f.datatype == PointField.UINT16:
-            intensity = arr[:, o : o + 2].copy().view(np.uint16).reshape(-1).astype(np.float32)
+            intensity = col_u16(f.offset)
 
     if 'confidence' in fm and min_conf > 0.0:
         f = fm['confidence']
-        o = f.offset
         if f.datatype == PointField.FLOAT32:
-            conf = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+            conf = col_f32(f.offset)
         elif f.datatype == PointField.UINT16:
-            conf = arr[:, o : o + 2].copy().view(np.uint16).reshape(-1).astype(np.float32)
+            conf = col_u16(f.offset)
         elif f.datatype == PointField.UINT8:
-            conf = arr[:, o].astype(np.float32)
+            conf = col_u8(f.offset)
         else:
-            conf = np.full(n, 1e9, dtype=np.float32)
+            conf = np.full(n_use, 1e9, dtype=np.float32)
         finite &= conf >= min_conf
 
-    offset_time = np.zeros(n, dtype=np.float32)
+    offset_time = np.zeros(n_use, dtype=np.float32)
     tname = next((k for k in ('offset_time', 'time', 't') if k in fm), None)
     if tname is not None:
         f = fm[tname]
-        o = f.offset
         if f.datatype == PointField.FLOAT32:
-            offset_time = arr[:, o : o + 4].copy().view(np.float32).reshape(-1)
+            offset_time = col_f32(f.offset)
         elif f.datatype == PointField.UINT32:
             offset_time = (
-                arr[:, o : o + 4].copy().view(np.uint32).reshape(-1).astype(np.float32) * 1e-9
+                np.ndarray(
+                    n_use,
+                    dtype=np.uint32,
+                    buffer=buf,
+                    offset=int(f.offset),
+                    strides=(byte_stride,),
+                ).astype(np.float32)
+                * 1e-9
             )
 
     xyz = xyz[finite]
@@ -208,6 +240,9 @@ class OdinRawDownsampleBridge(Node):
         self.declare_parameter('output_topic', '/odin1/cloud_raw_ds')
         self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('max_points', 20000)
+        # Cap points read from each raw frame *before* voxel (0 = no cap).
+        # 49k USB frames otherwise spend ~1–2s/frame in Python on Jetson.
+        self.declare_parameter('pre_decimate_max', 16000)
         self.declare_parameter('min_confidence', 30.0)
         self.declare_parameter('restamp_from_odom', True)
         self.declare_parameter('one_cloud_per_odom', True)
@@ -229,6 +264,8 @@ class OdinRawDownsampleBridge(Node):
         # Main output_topic stays odom-frame when unproject_odom_clouds=False
         # (stable viz); this topic unprojects with Odin odom at cloud stamp.
         self.declare_parameter('l2_body_topic', '')
+        # Mid pose at L2 publish wall-time — densify uses this to avoid re-pair smear.
+        self.declare_parameter('l2_mid_pose_topic', '/odin1/l2_mid_pose')
         self.declare_parameter('ground_only', False)
         self.declare_parameter('ground_topic', '/odin1/cloud_ground')
         self.declare_parameter('publish_ground_topic', True)
@@ -242,6 +279,7 @@ class OdinRawDownsampleBridge(Node):
 
         self.voxel = float(self.get_parameter('voxel_size').value)
         self.max_points = int(self.get_parameter('max_points').value)
+        self.pre_decimate_max = int(self.get_parameter('pre_decimate_max').value)
         self.min_confidence = float(self.get_parameter('min_confidence').value)
         self.restamp_from_odom = bool(self.get_parameter('restamp_from_odom').value)
         self.one_cloud_per_odom = bool(self.get_parameter('one_cloud_per_odom').value)
@@ -251,6 +289,7 @@ class OdinRawDownsampleBridge(Node):
         self.fallback_period = float(self.get_parameter('fallback_period').value)
         self.unproject_odom_clouds = bool(self.get_parameter('unproject_odom_clouds').value)
         self.l2_body_topic = str(self.get_parameter('l2_body_topic').value or '').strip()
+        self.l2_mid_pose_topic = str(self.get_parameter('l2_mid_pose_topic').value or '').strip()
         self.ground_only = bool(self.get_parameter('ground_only').value)
         self._out_frame_id = 'odin_lidar'
         self.publish_ground_topic = bool(self.get_parameter('publish_ground_topic').value)
@@ -276,8 +315,9 @@ class OdinRawDownsampleBridge(Node):
         self._pending: Optional[PointCloud2] = None
         self._pending_wall = -1.0
         self._odin_odom: Deque[Tuple[float, np.ndarray]] = deque(maxlen=2000)
-        # (t_stamp, stamp_msg, wall_sec) — wall used when Livox≠system timebase
-        self._mid_stamps: Deque[Tuple[float, object, float]] = deque(maxlen=500)
+        # (t_stamp, stamp_msg, wall_sec, pose) — wall used when Livox≠system timebase
+        self._mid_stamps: Deque[Tuple[float, object, float, object]] = deque(maxlen=500)
+        self._last_mid_pose = None
         self._warned_odom_cloud = False
         self._n_cloud = 0
         self._n_mid = 0
@@ -298,13 +338,21 @@ class OdinRawDownsampleBridge(Node):
         self._last_mid_wall = -1.0
         self._last_viz_pub_sec = -1.0
         self._last_l2_match = '-'
+        self._n_drop_pending = 0
+        self._last_proc_ms = -1.0
         # If Mid /Odometry stalls (bundle waiting on L2), keep publishing L2 with
         # cloud stamps so laserMapping can exit the Mid↔L2 chicken-egg deadlock.
         self.declare_parameter('mid_stall_fallback_sec', 0.5)
         self.mid_stall_fallback_sec = float(self.get_parameter('mid_stall_fallback_sec').value)
 
+        # depth=1 on cloud sub: DDS-side latest-only (pairs with pending overwrite).
         reliable = QoSProfile(
             depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        cloud_qos = QoSProfile(
+            depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
@@ -319,7 +367,12 @@ class OdinRawDownsampleBridge(Node):
         self.pub_l2 = None
         if self.l2_body_topic and self.l2_body_topic != out:
             self.pub_l2 = self.create_publisher(PointCloud2, self.l2_body_topic, reliable)
-        self.sub = self.create_subscription(PointCloud2, inn, self.cb, reliable)
+        self.pub_l2_mid_pose = None
+        if self.l2_mid_pose_topic and self.pub_l2 is not None:
+            self.pub_l2_mid_pose = self.create_publisher(
+                PoseStamped, self.l2_mid_pose_topic, reliable
+            )
+        self.sub = self.create_subscription(PointCloud2, inn, self.cb, cloud_qos)
         self.create_subscription(
             Odometry, self.get_parameter('odin_odom_topic').value, self.on_odin_odom, reliable
         )
@@ -332,13 +385,15 @@ class OdinRawDownsampleBridge(Node):
         self.create_timer(2.0, self._status)
         self.get_logger().info(
             f'downsample {inn} -> {out} voxel={self.voxel}m max={self.max_points} '
+            f'pre_decimate={self.pre_decimate_max} '
             f'conf>={self.min_confidence} restamp={self.restamp_from_odom} '
             f'mid_dt<={self.mid_restamp_max_dt:.3f}s max_age={self.max_cloud_age_sec:.2f}s '
             f'one_per_odom={self.one_cloud_per_odom} ground_only={self.ground_only} '
             f'ground_topic={ground_topic if self.publish_ground_topic else "off"} '
             f'full_topic={self.publish_full_topic or "off"} '
-            f'l2_body={self.l2_body_topic or "off"} qos=RELIABLE '
-            f'(viz odom passthrough; L2 body unproject at cloud stamp)'
+            f'l2_body={self.l2_body_topic or "off"} '
+            f'l2_mid_pose={self.l2_mid_pose_topic if self.pub_l2_mid_pose else "off"} '
+            f'qos=RELIABLE depth1 (latest-only; L2 keeps geometry stamp)'
         )
 
     def _status(self) -> None:
@@ -350,25 +405,23 @@ class OdinRawDownsampleBridge(Node):
             f'mode={self._last_ground_mode} skip_ground={self._n_skip_ground} '
             f'skip_unproj={self._n_skip_unproj} skip_l2={self._n_skip_l2} '
             f'skip_l2_sync={self._n_skip_l2_sync} skip_empty={self._n_skip_empty} '
-            f'skip_age={self._n_skip_age} l2_match={self._last_l2_match} '
+            f'skip_age={self._n_skip_age} drop_pending={self._n_drop_pending} '
+            f'proc_ms={self._last_proc_ms:.0f} l2_match={self._last_l2_match} '
             f'pending={"Y" if self._pending is not None else "N"}'
         )
 
     def _voxel_downsample(self, arr: np.ndarray) -> np.ndarray:
         if arr.size == 0:
             return arr
-        if len(arr) > self.max_points * 3:
-            step0 = int(np.ceil(len(arr) / float(self.max_points * 3)))
+        if len(arr) > self.max_points * 2:
+            step0 = int(np.ceil(len(arr) / float(self.max_points * 2)))
             arr = arr[::step0]
         if self.voxel > 0 and len(arr) > 0:
-            keys = np.ascontiguousarray(
-                np.floor(arr[:, :3] / self.voxel).astype(np.int32)
-            )
-            flat = keys.view(
-                [('', keys.dtype), ('', keys.dtype), ('', keys.dtype)]
-            ).reshape(-1)
-            _, idx = np.unique(flat, return_index=True)
-            arr = arr[np.sort(idx)]
+            # Pack voxel indices into one int64 key — cheaper than structured view.
+            q = np.floor(arr[:, :3] / self.voxel).astype(np.int64)
+            key = q[:, 0] + (q[:, 1] << 20) + (q[:, 2] << 40)
+            _, idx = np.unique(key, return_index=True)
+            arr = arr[idx]
         if len(arr) > self.max_points:
             step = int(np.ceil(len(arr) / self.max_points))
             arr = arr[::step]
@@ -382,8 +435,9 @@ class OdinRawDownsampleBridge(Node):
         T_oL = T_oi @ self.T_imu_L
         R = T_oL[:3, :3]
         t = T_oL[:3, 3]
+        # p_odom = R p_lidar + t  →  p_lidar = R^T (p_odom - t)
         xyz = arr[:, :3].astype(np.float64)
-        xyz = (xyz - t) @ R
+        xyz = (xyz - t) @ R  # row-vector form of R.T @ (p - t)
         return np.column_stack([xyz, arr[:, 3], arr[:, 4]]).astype(np.float32)
 
     def _make_cloud(self, header: Header, arr: np.ndarray) -> PointCloud2:
@@ -420,28 +474,28 @@ class OdinRawDownsampleBridge(Node):
         self._odin_odom.append((t, _mat_from_odom(msg)))
 
     def _nearest_mid_stamp(self, t_cloud: float):
-        """Stamp-timebase match. Returns (t_stamp, stamp_msg, abs_dt) or None."""
+        """Stamp-timebase match. Returns (t_stamp, stamp_msg, abs_dt, pose) or None."""
         best = None
         best_dt = 1e9
-        for t, st, _wall in self._mid_stamps:
+        for t, st, _wall, pose in self._mid_stamps:
             dt = abs(t - t_cloud)
             if dt < best_dt:
                 best_dt = dt
-                best = (t, st, dt)
+                best = (t, st, dt, pose)
         return best
 
     def _nearest_mid_by_wall(self, wall_cloud: float):
         """Arrival-time match for Livox-vs-system clock skew.
 
-        Returns (t_stamp, stamp_msg, abs_wall_dt) or None.
+        Returns (t_stamp, stamp_msg, abs_wall_dt, pose) or None.
         """
         best = None
         best_dt = 1e9
-        for t, st, wall in self._mid_stamps:
+        for t, st, wall, pose in self._mid_stamps:
             dt = abs(wall - wall_cloud)
             if dt < best_dt:
                 best_dt = dt
-                best = (t, st, dt)
+                best = (t, st, dt, pose)
         return best
 
     def _match_mid_for_l2(self, t_cloud: float, wall_cloud: float):
@@ -470,7 +524,8 @@ class OdinRawDownsampleBridge(Node):
         t = _stamp_sec(msg.header.stamp)
         self._mid_odom_stamp = msg.header.stamp
         self._mid_odom_key = key
-        self._mid_stamps.append((t, msg.header.stamp, wall))
+        self._last_mid_pose = msg.pose.pose
+        self._mid_stamps.append((t, msg.header.stamp, wall, msg.pose.pose))
         if self.one_cloud_per_odom and self._pending is not None and self._last_pub_key != key:
             # Match Mid stamp to *pending cloud* time — not blindly latest Mid.
             if self._publish_from_msg(self._pending, None):
@@ -505,11 +560,14 @@ class OdinRawDownsampleBridge(Node):
         return fid in ('odom', 'map', 'odin_odom', 'odin_map')
 
     def cb(self, msg: PointCloud2) -> None:
-        """Keep only the newest cloud. Processing backlog was the main Odin lag
-        (~250ms): each frame ~80ms, so a queued 3-frame backlog looked like delay
-        vs Mid/robot motion. Overwrite pending and let the poll timer publish.
+        """Keep only the newest cloud. Overwrite pending; poll timer publishes.
+
+        With slow Python unpack, processing every queued RELIABLE frame used to
+        build a ~2s pipeline. depth=1 + overwrite keeps lag ≈ one frame cost.
         """
         self._n_cloud += 1
+        if self._pending is not None:
+            self._n_drop_pending += 1
         self._pending = msg
         self._pending_wall = self.get_clock().now().nanoseconds * 1e-9
 
@@ -517,8 +575,8 @@ class OdinRawDownsampleBridge(Node):
         msg = self._pending
         if msg is None:
             return
-        # Drop if we are still inside fallback_period (rate limit).
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        # Drop if we are still inside fallback_period (rate limit, wall clock).
+        now_sec = time.time()
         if self._last_pub_sec >= 0.0 and (now_sec - self._last_pub_sec) < self.fallback_period:
             return
         wall_cloud = self._pending_wall
@@ -548,11 +606,12 @@ class OdinRawDownsampleBridge(Node):
         self._publish_from_msg(msg, msg.header.stamp, wall_cloud=wall_cloud)
 
     def _publish_from_msg(self, msg: PointCloud2, stamp, wall_cloud: float = -1.0) -> bool:
+        t0 = time.perf_counter()
         t_cloud = _stamp_sec(msg.header.stamp)
         if wall_cloud < 0.0:
             wall_cloud = self.get_clock().now().nanoseconds * 1e-9
 
-        arr = _unpack_points(msg, self.min_confidence)
+        arr = _unpack_points(msg, self.min_confidence, self.pre_decimate_max)
         if arr.size == 0:
             self._n_skip_empty += 1
             return False
@@ -637,7 +696,9 @@ class OdinRawDownsampleBridge(Node):
             nsec = int((viz_sec - sec) * 1e9)
             viz_stamp = type(viz_stamp)(sec=sec, nanosec=nsec)
         self._last_viz_pub_sec = viz_sec
-        self._last_pub_sec = time.time() if use_geom_for_main else viz_sec
+        # Always wall-clock for rate limit (never geometry stamp — that made
+        # fallback_period compare against a ~2s-old axis and flood-publish).
+        self._last_pub_sec = time.time()
 
         header = Header()
         header.stamp = viz_stamp
@@ -679,6 +740,19 @@ class OdinRawDownsampleBridge(Node):
                 self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
                 self._n_l2_pub += 1
                 self._last_n_l2 = int(len(l2_arr))
+                # Same Mid pose densify must use — stamped with geom_stamp for pairing.
+                pose = None
+                if mid_match is not None and len(mid_match) >= 4:
+                    pose = mid_match[3]
+                if pose is None:
+                    pose = self._last_mid_pose
+                if self.pub_l2_mid_pose is not None and pose is not None:
+                    ps = PoseStamped()
+                    ps.header.stamp = geom_stamp
+                    ps.header.frame_id = 'map'
+                    ps.pose = pose
+                    self.pub_l2_mid_pose.publish(ps)
+        self._last_proc_ms = (time.perf_counter() - t0) * 1e3
         return True
 
 
