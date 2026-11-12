@@ -204,7 +204,11 @@ double lidar2_max_residual = 0.12;
 bool lidar2_map_insert_en = false;
 // Skip Odin → ikdtree while |ω| high (stamp residual / extrinsic smear).
 // IEKF point update can stay on; only map insert is gated.
-double lidar2_map_insert_gyr_gate = 0.25;
+double lidar2_map_insert_gyr_gate = 0.20;
+// After a turn, keep blocking Odin insert briefly while pose/sync settles
+// (avoids "wrong then snap back" points already locked in ikdtree).
+double lidar2_map_insert_cooldown_sec = 0.8;
+double odin_map_insert_block_until = 0.0;
 // True only after a successful Stage2 Odin update this frame (gates map insert).
 bool last_odin_iekf_ok = false;
 long long n_skip_l2_sync = 0;
@@ -997,17 +1001,27 @@ void map_incremental()
     PointToAdd.reserve(feats_down_size);
     PointNoNeedDownsample.reserve(feats_down_size);
     const float det_r2 = DET_RANGE * DET_RANGE;
+    const double now_ros = rclcpp::Clock(RCL_ROS_TIME).now().seconds();
+    if (lidar2_map_insert_gyr_gate > 0.0 &&
+        last_imu_gyr_norm >= lidar2_map_insert_gyr_gate)
+    {
+        odin_map_insert_block_until =
+            std::max(odin_map_insert_block_until,
+                     now_ros + lidar2_map_insert_cooldown_sec);
+    }
+    const bool block_odin_insert =
+        !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
+        (lidar2_map_insert_gyr_gate > 0.0 &&
+         last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
+        now_ros < odin_map_insert_block_until;
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
             feats_down_body->points[i].intensity >= kOdinIntensityTag ||
             (!bundle_enabled && current_lidar_num == 2);
-        // Tight-couple pose via residuals, but keep Mid map clean unless enabled.
-        // Still-ish insert: fast yaw often pairs Odin with a slightly wrong Mid.
-        if (is_odin_pt &&
-            (!lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
-             (lidar2_map_insert_gyr_gate > 0.0 &&
-              last_imu_gyr_norm >= lidar2_map_insert_gyr_gate)))
+        // Turn + cooldown: stamp lag makes Odin look wrong then snap — do not
+        // lock those frames into ikdtree (ikdtree won't undo bad inserts).
+        if (is_odin_pt && block_odin_insert)
             continue;
         const float bx = feats_down_body->points[i].x;
         const float by = feats_down_body->points[i].y;
@@ -1627,7 +1641,8 @@ public:
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
-        this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.25);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.20);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_cooldown_sec", 0.8);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
@@ -1712,7 +1727,8 @@ public:
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
-        this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.25);
+        this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.20);
+        this->get_parameter_or("mapping.lidar2_map_insert_cooldown_sec", lidar2_map_insert_cooldown_sec, 0.8);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
@@ -1860,7 +1876,7 @@ public:
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
                  << " insert_gyr_gate=" << lidar2_map_insert_gyr_gate
-                 << "rad/s"
+                 << "rad/s cooldown=" << lidar2_map_insert_cooldown_sec << "s"
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl
