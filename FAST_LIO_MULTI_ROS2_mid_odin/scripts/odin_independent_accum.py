@@ -212,10 +212,13 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('accum_max_yaw_rate_deg', 25.0)
         # Bridge-published Mid pose locked to each L2 cloud (empty = wall pair only).
         self.declare_parameter('l2_mid_pose_topic', '/odin1/l2_mid_pose')
-        # True: live densify uses *latest* Mid wall pose (snappier vs Mid cloud).
-        # False: prefer stamp-locked /odin1/l2_mid_pose (less turn smear, more lag).
-        self.declare_parameter('prefer_latest_mid_pose', True)
-        # Stamp /odin1/cloud_in_map with now so RViz tracks live (geom still from L2).
+        # Live scan only: use latest Mid when translating/turning above gates.
+        # Accum ALWAYS uses stamp-locked Mid (l2_mid_pose) — latest Mid while
+        # still paints IEKF noise into voxels and ruins the densify map.
+        self.declare_parameter('prefer_latest_mid_pose', False)
+        self.declare_parameter('latest_mid_min_trans_vel', 0.08)  # m/s
+        self.declare_parameter('latest_mid_min_yaw_rate_deg', 8.0)
+        # Stamp /odin1/cloud_in_map with now (map-frame draw; TF deadband handles still).
         self.declare_parameter('restamp_scan_to_now', True)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
@@ -273,14 +276,22 @@ class OdinIndependentAccum(Node):
         self.accum_max_yaw_rate_deg = float(self.get_parameter('accum_max_yaw_rate_deg').value)
         self.l2_mid_pose_topic = str(self.get_parameter('l2_mid_pose_topic').value or '').strip()
         self.prefer_latest_mid_pose = bool(self.get_parameter('prefer_latest_mid_pose').value)
+        self.latest_mid_min_trans_vel = float(self.get_parameter('latest_mid_min_trans_vel').value)
+        self.latest_mid_min_yaw_rate_deg = float(self.get_parameter('latest_mid_min_yaw_rate_deg').value)
         self.restamp_scan_to_now = bool(self.get_parameter('restamp_scan_to_now').value)
         self._ema_mid_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
         self._n_skip_accum_turn = 0
         self._n_l2_pose_hit = 0
         self._n_latest_mid_hit = 0
+        self._n_locked_viz = 0
+        self._n_skip_no_locked = 0
         self._mid_yaw_rate_deg = 0.0
+        self._mid_trans_vel = 0.0
         self._mid_yaw_prev: Optional[Tuple[float, float]] = None  # (wall, yaw_rad)
+        self._mid_pos_prev: Optional[Tuple[float, np.ndarray]] = None  # (wall, xyz)
+        # Cloud often arrives before matching l2_mid_pose in the same executor turn.
+        self._pending_l2: Optional[Tuple[PointCloud2, np.ndarray, float]] = None
         # (cloud_stamp_sec, T_map_body) from downsample bridge
         self._l2_mid_pose_buf: Deque[Tuple[float, np.ndarray]] = deque(maxlen=200)
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
@@ -386,7 +397,8 @@ class OdinIndependentAccum(Node):
             f'motion_sync={self._n_motion_sync} hold={self._n_motion_hold} '
             f'skip_accum_turn={self._n_skip_accum_turn} '
             f'l2_pose_hit={self._n_l2_pose_hit} latest_mid={self._n_latest_mid_hit} '
-            f'yaw_rate={self._mid_yaw_rate_deg:.1f}deg/s '
+            f'locked_viz={self._n_locked_viz} skip_nolock={self._n_skip_no_locked} '
+            f'yaw_rate={self._mid_yaw_rate_deg:.1f}deg/s v={self._mid_trans_vel:.2f}m/s '
             f'sync_dt={self._last_sync_dt*1000:.0f}ms mid_odom_buf={len(self._mid_odom_buf)}'
         )
 
@@ -449,6 +461,12 @@ class OdinIndependentAccum(Node):
     def on_l2_mid_pose(self, msg: PoseStamped) -> None:
         t = stamp_sec(msg.header.stamp)
         self._l2_mid_pose_buf.append((t, se3_from_pose(msg.pose)))
+        # Retry densify if cloud arrived before this pose (same stamp).
+        if self._pending_l2 is not None:
+            pmsg, parr, pwall = self._pending_l2
+            if abs(stamp_sec(pmsg.header.stamp) - t) <= 0.05:
+                self._pending_l2 = None
+                self._project_odin_cloud(pmsg, parr, pwall)
 
     def on_mid_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
@@ -462,12 +480,18 @@ class OdinIndependentAccum(Node):
         while self._mid_odom_buf and self._mid_odom_buf[0][1] < cutoff_wall:
             self._mid_odom_buf.popleft()
         yaw = math.atan2(float(T[1, 0]), float(T[0, 0]))
+        pos = T[:3, 3].copy()
         if self._mid_yaw_prev is not None:
             dw = wall - self._mid_yaw_prev[0]
             if dw > 1e-3:
                 dy = (yaw - self._mid_yaw_prev[1] + math.pi) % (2.0 * math.pi) - math.pi
                 self._mid_yaw_rate_deg = abs(dy) / dw * (180.0 / math.pi)
         self._mid_yaw_prev = (wall, yaw)
+        if self._mid_pos_prev is not None:
+            dw = wall - self._mid_pos_prev[0]
+            if dw > 1e-3:
+                self._mid_trans_vel = float(np.linalg.norm(pos - self._mid_pos_prev[1]) / dw)
+        self._mid_pos_prev = (wall, pos)
 
     def _nearest_mid_odom(self, t_query: float, max_dt: Optional[float] = None):
         if not self._mid_odom_buf:
@@ -803,49 +827,105 @@ class OdinIndependentAccum(Node):
             xyz = xyz[:: int(self.stride)]
         return xyz
 
+    def _lookup_l2_mid(self, t_cloud: float):
+        best = None
+        best_dt = 1e9
+        for t_p, T_p in self._l2_mid_pose_buf:
+            dt = abs(t_p - t_cloud)
+            if dt < best_dt:
+                best_dt = dt
+                best = T_p
+        if best is not None and best_dt <= 0.05:
+            return best, best_dt
+        return None, best_dt
+
+    def _project_odin_cloud(
+        self, msg: PointCloud2, arr: np.ndarray, wall_cloud: float
+    ) -> None:
+        """project_with_mid path (also used when l2_mid_pose arrives after cloud)."""
+        t_cloud = stamp_sec(msg.header.stamp)
+        T_locked, dt_locked = self._lookup_l2_mid(t_cloud)
+        if T_locked is not None:
+            self._n_l2_pose_hit += 1
+        T_wall = None
+        dt_wall = 0.0
+        mid_hit = self._mid_pose_by_wall(wall_cloud)
+        if mid_hit is not None:
+            T_wall, dt_wall = mid_hit
+        if T_locked is None and T_wall is None:
+            self._n_skip_odom += 1
+            return
+        if T_locked is None:
+            # Hold cloud briefly for matching pose (on_l2_mid_pose retries).
+            self._pending_l2 = (msg, arr, wall_cloud)
+            self._n_skip_no_locked += 1
+            # Still publish live with wall Mid so RViz is not blank.
+            T_viz = self._ema_mid_pose(T_wall)
+            T_map = T_viz @ self.T_body_odin_lidar
+            out_live_pts = (arr @ T_map[:3, :3].T) + T_map[:3, 3]
+            self._publish_live(msg.header.stamp, out_live_pts)
+            return
+
+        self._pending_l2 = None
+        self._last_sync_dt = dt_locked
+        T_locked = self._ema_mid_pose(T_locked)
+        moving = (
+            self._mid_trans_vel >= self.latest_mid_min_trans_vel
+            or self._mid_yaw_rate_deg >= self.latest_mid_min_yaw_rate_deg
+        )
+        T_viz = T_locked
+        self._n_locked_viz += 1
+        if self.prefer_latest_mid_pose and moving and T_wall is not None:
+            T_viz = T_wall
+            self._n_latest_mid_hit += 1
+
+        def _project(T_mid: np.ndarray) -> np.ndarray:
+            T_map = T_mid @ self.T_body_odin_lidar
+            R, t = T_map[:3, :3], T_map[:3, 3]
+            return (arr @ R.T) + t
+
+        out = _project(T_locked)
+        out_live_pts = _project(T_viz)
+        self._publish_live(msg.header.stamp, out_live_pts)
+        self._accum_locked(out)
+
+    def _publish_live(self, stamp, out_live_pts: np.ndarray) -> None:
+        t_cloud = stamp_sec(stamp)
+        out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out_live_pts, t_cloud)
+        if sync_stamp is not None:
+            pub_stamp = self.get_clock().now().to_msg()
+        elif self.restamp_scan_to_now and self.project_with_mid:
+            pub_stamp = self.get_clock().now().to_msg()
+        else:
+            pub_stamp = stamp
+        if self.pub_scan is not None:
+            header = Header()
+            header.stamp = pub_stamp
+            header.frame_id = self._output_frame()
+            self.pub_scan.publish(make_cloud(header, out_live))
+            self._n_pub += 1
+
+    def _accum_locked(self, out: np.ndarray) -> None:
+        if (time.time() - self._t0) < self.accum_skip_sec:
+            return
+        if (
+            self.accum_max_yaw_rate_deg > 0.0
+            and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
+        ):
+            self._n_skip_accum_turn += 1
+            return
+        if self._accum.add(out):
+            self._dirty = True
+
     def on_cloud(self, msg: PointCloud2) -> None:
         arr = self._xyz_stride(msg)
         if arr.size == 0:
             return
 
         if self.project_with_mid:
-            # Snappy viz: prefer latest Mid wall pose. On fast yaw, fall back to
-            # stamp-locked l2_mid_pose to reduce turn fan. Never stamp-pair clocks.
-            T_mid = None
-            dt_mid = 0.0
-            t_cloud = stamp_sec(msg.header.stamp)
-            turning = (
-                self.accum_max_yaw_rate_deg > 0.0
-                and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
-            )
-            use_locked = (not self.prefer_latest_mid_pose) or turning
-            if use_locked and self._l2_mid_pose_buf:
-                best = None
-                best_dt = 1e9
-                for t_p, T_p in self._l2_mid_pose_buf:
-                    dt = abs(t_p - t_cloud)
-                    if dt < best_dt:
-                        best_dt = dt
-                        best = T_p
-                if best is not None and best_dt <= 0.05:
-                    T_mid = best
-                    dt_mid = best_dt
-                    self._n_l2_pose_hit += 1
-            if T_mid is None:
-                wall_cloud = self.get_clock().now().nanoseconds * 1e-9
-                mid_hit = self._mid_pose_by_wall(wall_cloud)
-                if mid_hit is None:
-                    self._n_skip_odom += 1
-                    return
-                T_mid, dt_mid = mid_hit
-                self._n_latest_mid_hit += 1
-            self._last_sync_dt = dt_mid
-            T_mid = self._ema_mid_pose(T_mid)
-            T_map = T_mid @ self.T_body_odin_lidar
-            R, t = T_map[:3, :3], T_map[:3, 3]
-            world = (arr @ R.T) + t
-            stamp = msg.header.stamp
-            out = world
+            wall_cloud = self.get_clock().now().nanoseconds * 1e-9
+            self._project_odin_cloud(msg, arr, wall_cloud)
+            return
         elif self.cloud_already_in_odom:
             world = arr
             stamp = msg.header.stamp
@@ -853,6 +933,7 @@ class OdinIndependentAccum(Node):
             if out is None:
                 self._n_skip_align += 1
                 return
+            out_live_pts = out
         else:
             T_odom_imu = self._nearest_odom(stamp_sec(msg.header.stamp))
             if T_odom_imu is None:
@@ -866,10 +947,11 @@ class OdinIndependentAccum(Node):
             if out is None:
                 self._n_skip_align += 1
                 return
+            out_live_pts = out
 
         # Live scan: optional warp to latest Mid (disabled when project_with_mid).
         t_cloud = stamp_sec(stamp)
-        out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out, t_cloud)
+        out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out_live_pts, t_cloud)
         if sync_stamp is not None:
             pub_stamp = self.get_clock().now().to_msg()
         elif self.restamp_scan_to_now and self.project_with_mid:
@@ -884,14 +966,14 @@ class OdinIndependentAccum(Node):
             self.pub_scan.publish(make_cloud(header, out_live))
             self._n_pub += 1
 
-        if (time.time() - self._t0) >= self.accum_skip_sec:
+        if out is not None and (time.time() - self._t0) >= self.accum_skip_sec:
             # Fast yaw: keep-first voxels would lock a fan trail into accum.
             if (
                 self.accum_max_yaw_rate_deg > 0.0
                 and self._mid_yaw_rate_deg > self.accum_max_yaw_rate_deg
             ):
                 self._n_skip_accum_turn += 1
-            elif self._accum.add(out):
+            elif self._accum.add(out):  # stamp-locked Mid pose only
                 self._dirty = True
 
     def publish_accum(self) -> None:

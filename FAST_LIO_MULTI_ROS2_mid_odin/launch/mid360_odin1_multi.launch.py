@@ -350,10 +350,12 @@ def generate_launch_description():
                         'motion_sync_min_trans': 0.02,
                         'motion_sync_min_rot_deg': 0.5,
                         'mid_wall_pair_max_dt': 0.20,
-                        # 0 lookback + no EMA; latest Mid for snappy viz (locked on turns).
+                        # Accum always stamp-locked; latest Mid only when moving (see gates).
                         'mid_pose_lookback_sec': 0.0,
                         'mid_pose_ema': 1.0,
-                        'prefer_latest_mid_pose': True,
+                        'prefer_latest_mid_pose': False,
+                        'latest_mid_min_trans_vel': 0.08,
+                        'latest_mid_min_yaw_rate_deg': 8.0,
                         'restamp_scan_to_now': True,
                         'accum_max_yaw_rate_deg': 25.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',

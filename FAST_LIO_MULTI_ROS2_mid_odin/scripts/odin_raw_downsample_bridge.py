@@ -752,13 +752,8 @@ class OdinRawDownsampleBridge(Node):
             else:
                 l2_arr = out_arr if not self.ground_only else arr
             if l2_arr is not None and len(l2_arr) > 0:
-                l2_header = Header()
-                l2_header.stamp = geom_stamp
-                l2_header.frame_id = 'odin_lidar'
-                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
-                self._n_l2_pub += 1
-                self._last_n_l2 = int(len(l2_arr))
-                # Same Mid pose densify must use — stamped with geom_stamp for pairing.
+                # Publish Mid pose *before* L2 cloud so densify can stamp-match
+                # in the same spin (cloud-after-pose avoids wall-Mid fallback).
                 pose = None
                 if mid_match is not None and len(mid_match) >= 4:
                     pose = mid_match[3]
@@ -770,6 +765,12 @@ class OdinRawDownsampleBridge(Node):
                     ps.header.frame_id = 'map'
                     ps.pose = pose
                     self.pub_l2_mid_pose.publish(ps)
+                l2_header = Header()
+                l2_header.stamp = geom_stamp
+                l2_header.frame_id = 'odin_lidar'
+                self.pub_l2.publish(self._make_cloud(l2_header, l2_arr))
+                self._n_l2_pub += 1
+                self._last_n_l2 = int(len(l2_arr))
         self._last_proc_ms = (time.perf_counter() - t0) * 1e3
         return True
 

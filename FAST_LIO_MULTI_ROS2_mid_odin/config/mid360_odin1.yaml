@@ -9,7 +9,8 @@
       # Tight coupling: Mid IEKF owns system /Odometry + map→body TF.
       publish_odom_tf: true
       # Smooth map→body TF for RViz (1.0=off). /Odometry stays raw.
-      tf_pose_ema: 0.15
+      # Keep low; C++ also holds TF when |dp|<1.2cm and |dyaw|<0.4deg (still).
+      tf_pose_ema: 0.08
       max_iteration: 3
       map_frame: "map"
       # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)

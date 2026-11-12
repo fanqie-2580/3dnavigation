@@ -1353,15 +1353,24 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         {
             const double dp = (p - tf_ema_pos).norm();
             const double dang_deg = tf_ema_q.angularDistance(q) * (180.0 / M_PI);
-            // Track when clearly moving; heavy damp on cm-level IEKF jitter.
-            double a = tf_pose_ema;
-            if (dp > 0.03 || dang_deg > 0.8)
-                a = std::max(tf_pose_ema, 0.65);
+            // Deadband: while robot is still, IEKF still wanders ~mm — do NOT
+            // chase it or map→body / base_link shake in RViz.
+            if (dp < 0.012 && dang_deg < 0.40)
+            {
+                // hold tf_ema_*
+            }
             else
-                a = std::min(tf_pose_ema, 0.12);
-            a = std::clamp(a, 0.01, 1.0);
-            tf_ema_pos = (1.0 - a) * tf_ema_pos + a * p;
-            tf_ema_q = tf_ema_q.slerp(a, q).normalized();
+            {
+                // Track when clearly moving; heavy damp on small motions.
+                double a = tf_pose_ema;
+                if (dp > 0.03 || dang_deg > 0.8)
+                    a = std::max(tf_pose_ema, 0.65);
+                else
+                    a = std::min(tf_pose_ema, 0.08);
+                a = std::clamp(a, 0.01, 1.0);
+                tf_ema_pos = (1.0 - a) * tf_ema_pos + a * p;
+                tf_ema_q = tf_ema_q.slerp(a, q).normalized();
+            }
         }
 
         geometry_msgs::msg::TransformStamped trans;
