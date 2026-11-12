@@ -300,6 +300,7 @@ class OdinIndependentAccum(Node):
         )
         self.deskew_odin = bool(self.get_parameter('deskew_odin').value)
         self._ema_mid_T: Optional[np.ndarray] = None
+        self._warp_dst_hold: Optional[np.ndarray] = None
         self._mid_yaw_rate_rad = 0.0
         self._n_motion_hold = 0
         self._n_skip_accum_turn = 0
@@ -479,6 +480,8 @@ class OdinIndependentAccum(Node):
         self._dirty = True
         self._t0 = time.time()
         self._ema_mid_T = None
+        self._hold_T_mid = None
+        self._warp_dst_hold = None
         resp.success = True
         resp.message = 'cleared independent Odin accum'
         return resp
@@ -658,7 +661,10 @@ class OdinIndependentAccum(Node):
             t_src, T_src = src
         else:
             t_src = t_cloud
-        t_dst, _wall_dst, T_dst = self._mid_odom_buf[-1]
+        t_dst, _wall_dst, T_dst_raw = self._mid_odom_buf[-1]
+        # Deadband/smooth T_dst — raw Mid /Odometry still wanders ~0.1°/frame;
+        # warping to that noise is the remaining live Odin shimmer.
+        T_dst = self._smooth_warp_dst(T_dst_raw)
         dt = float(t_dst - t_src)
         if abs(dt) < 1e-4:
             return pts, None, dt
@@ -669,7 +675,8 @@ class OdinIndependentAccum(Node):
         cos_a = 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)
         cos_a = max(-1.0, min(1.0, cos_a))
         rot_deg = math.degrees(math.acos(cos_a))
-        if trans < self.motion_sync_min_trans and rot_deg < self.motion_sync_min_rot_deg:
+        # Only skip true numerical no-ops (not Mid IEKF noise band).
+        if trans < 0.005 and rot_deg < 0.15:
             self._n_motion_hold += 1
             self._last_sync_dt = dt
             return pts, None, dt
@@ -677,6 +684,24 @@ class OdinIndependentAccum(Node):
         self._n_motion_sync += 1
         self._last_sync_dt = dt
         return out, self._mid_stamp_latest, dt
+
+    def _smooth_warp_dst(self, T_raw: np.ndarray) -> np.ndarray:
+        """TF-like hold on warp destination so live Odin does not chase Mid noise."""
+        if self._warp_dst_hold is None:
+            self._warp_dst_hold = T_raw.copy()
+            return self._warp_dst_hold
+        T_rel = se3_inv(self._warp_dst_hold) @ T_raw
+        trans = float(np.linalg.norm(T_rel[:3, 3]))
+        R = T_rel[:3, :3]
+        cos_a = max(-1.0, min(1.0, 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)))
+        rot_deg = math.degrees(math.acos(cos_a))
+        if trans < self.densify_hold_trans and rot_deg < self.densify_hold_rot_deg:
+            return self._warp_dst_hold
+        a = self.densify_track_alpha
+        if trans > 0.20 or rot_deg > 5.0:
+            a = max(a, 0.5)
+        self._warp_dst_hold = self._lerp_se3(self._warp_dst_hold, T_raw, a)
+        return self._warp_dst_hold
 
     def on_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)

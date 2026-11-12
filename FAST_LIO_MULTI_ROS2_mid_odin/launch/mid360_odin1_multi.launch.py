@@ -361,10 +361,10 @@ def generate_launch_description():
                         'latest_mid_min_yaw_rate_deg': 8.0,
                         'still_trans_vel': 0.05,
                         'still_yaw_rate_deg': 3.0,
-                        # Hold Mid IEKF noise; soft-track only (no 0.65 snap on slight move).
-                        'densify_hold_trans': 0.025,
-                        'densify_hold_rot_deg': 1.0,
-                        'densify_track_alpha': 0.08,
+                        # Hold Mid IEKF noise for densify + warp T_dst (match TF feel).
+                        'densify_hold_trans': 0.03,
+                        'densify_hold_rot_deg': 1.2,
+                        'densify_track_alpha': 0.06,
                         'deskew_odin': True,
                         'restamp_scan_to_now': True,
                         'accum_max_yaw_rate_deg': 25.0,
