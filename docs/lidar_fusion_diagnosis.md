@@ -514,6 +514,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | 其余帧根因 | ① Odin 输入不稳 ~6–8Hz（非真 10Hz）② bridge 常比 Mid 晚到，不候就错过 ③ 旧硬门 30ms 丢相位差 |
 | 可解部分 | soft-wait 捞晚到帧；不可解：Odin 没出云的空洞（上限≈f_odin/f_mid） |
 
+### 10k. 紧耦合变密后 Odin 仍错位累积（2026-11-12）
+
+**现象**：couple~98% 后 `/Laser_map` / 融合图里 Odin 有时堆在错误位置。  
+**根因**：IEKF 窗 55ms 内的帧也 `map_insert`；`|dt|` 大时 deskew 残差在转动中把 Odin 写进 ikdtree，**无法撤销**。  
+**修复**：`lidar2_map_insert_max_sync_dt=18ms`（仅紧同步写图）；`insert_gyr_gate=0.35` 同帧挡硬转；IEKF `point_update` 仍可用到 55ms。重启清空旧错图。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

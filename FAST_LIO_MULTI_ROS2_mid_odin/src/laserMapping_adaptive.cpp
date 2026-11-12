@@ -213,6 +213,8 @@ double lidar2_residual_cov_scale = 25.0;
 double lidar2_max_residual = 0.12;
 // If false: Odin still updates IEKF (tight couple) but never enters ikdtree.
 bool lidar2_map_insert_en = false;
+// Only lock Odin into ikdtree when Bundle |dt| <= this (IEKF may use wider window).
+double lidar2_map_insert_max_sync_dt = 0.018;
 // Skip Odin → ikdtree while |ω| high (stamp residual / extrinsic smear).
 // IEKF point update can stay on; only map insert is gated.
 double lidar2_map_insert_gyr_gate = 0.20;
@@ -1097,15 +1099,18 @@ void map_incremental()
             std::max(odin_map_insert_block_until,
                      now_ros + lidar2_map_insert_cooldown_sec);
     }
-    // Sync-quality gate (not turn cooldown): Bundle Mid↔L2 |dt| too large means
-    // Odin world pose is unreliable — do not lock into ikdtree.
-        // Wait-align Bundle already enforces tight Mid↔L2; Mid-only (dt<0) skips Odin.
-        const bool block_odin_insert =
+    // IEKF may couple with |dt| up to max_sync_dt (~55ms). Map insert is stricter:
+    // large residual deskew still smears Odin into ikdtree permanently.
+    const bool sync_too_loose_for_map =
+        bundle_enabled &&
+        (bundle_pair_dt_ < 0.0 ||
+         (lidar2_map_insert_max_sync_dt > 0.0 &&
+          bundle_pair_dt_ > lidar2_map_insert_max_sync_dt));
+    const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
          last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
-        now_ros < odin_map_insert_block_until ||
-        (bundle_enabled && bundle_pair_dt_ < 0.0);
+        now_ros < odin_map_insert_block_until || sync_too_loose_for_map;
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1744,6 +1749,7 @@ public:
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt", 0.018);
         this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_map_insert_cooldown_sec", 0.8);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
@@ -1832,6 +1838,7 @@ public:
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
+        this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt", lidar2_map_insert_max_sync_dt, 0.018);
         this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_map_insert_cooldown_sec", lidar2_map_insert_cooldown_sec, 0.8);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
@@ -1984,6 +1991,7 @@ public:
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
+                 << " insert_max_dt=" << lidar2_map_insert_max_sync_dt * 1000.0 << "ms"
                  << " insert_gyr_gate=" << lidar2_map_insert_gyr_gate
                  << "rad/s cooldown=" << lidar2_map_insert_cooldown_sec << "s"
                  << endl
