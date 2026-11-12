@@ -76,11 +76,10 @@
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
       # Odin → official ikdtree (/Laser_map) after successful Bundle IEKF.
+      # Turn smear fixed by bridge stamp_latency_comp≈0.08 (relative lag), not gates.
       lidar2_map_insert_en: true
-      # While turning (and ~0.8s after), skip Odin insert so wrong transient
-      # points are not locked into /Laser_map; IEKF update still runs.
-      lidar2_map_insert_gyr_gate: 0.20
-      lidar2_map_insert_cooldown_sec: 0.8
+      lidar2_map_insert_gyr_gate: 0.0
+      lidar2_map_insert_cooldown_sec: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

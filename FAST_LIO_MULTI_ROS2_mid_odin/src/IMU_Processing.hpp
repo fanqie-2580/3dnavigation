@@ -458,8 +458,11 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // cloud_raw has offset_time → curvature>0: deskew Odin to Mid timebase with Mid IMU
-  // (scheme ①). cloud_slam (already motion-compensated) keeps curvature=0 → skip.
+  // Odin cloud_raw offset_time → deskew with Mid IMU (scheme ①).
+  // REQUIRES lidar_beg_time2 ≈ capture time on Mid/IMU clock. With
+  // use_host_ros_time=2, USB stamp is receive (~150ms late vs Mid ~80ms);
+  // bridge stamp_latency_comp_sec≈0.08 aligns L2 before this deskew — otherwise
+  // Mid poses from the future twist Odin during yaw (wrong→snap when ω→0).
   {
     bool has_odin_time = false;
     for (const auto &pt : pcl_2_out.points)
