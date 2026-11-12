@@ -458,28 +458,16 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // Odin cloud_raw offset_time → deskew with Mid IMU (scheme ①).
-  // REQUIRES lidar_beg_time2 ≈ capture time on Mid/IMU clock. With
-  // use_host_ros_time=2, USB stamp is receive (~150ms late vs Mid ~80ms);
-  // bridge stamp_latency_comp_sec≈0.08 aligns L2 before this deskew — otherwise
-  // Mid poses from the future twist Odin during yaw (wrong→snap when ω→0).
+  // Odin USB (use_host_ros_time=2): header stamp is HOST RECEIVE time, while
+  // offset_time is relative to DEVICE frame start. Treating
+  //   t = header_stamp + offset_time
+  // as Mid-IMU time is wrong → during yaw, deskew pulls Odin with future Mid
+  // poses (points swing to wrong place), then ω→0 makes deskew≈I (snap back).
+  // Do NOT Mid-IMU deskew Odin; keep rigid L2→body and let Bundle stamp_comp
+  // align the whole frame. Mid deskew above is unchanged.
   {
-    bool has_odin_time = false;
-    for (const auto &pt : pcl_2_out.points)
-    {
-      if (std::fabs(pt.curvature) > 1e-4f)
-      {
-        has_odin_time = true;
-        break;
-      }
-    }
-    if (has_odin_time)
-      deskew_cloud(pcl_2_out, meas.lidar_beg_time2);
-    else
-    {
-      for (auto &pt : pcl_2_out.points)
-        pt.curvature = 0.0f;
-    }
+    for (auto &pt : pcl_2_out.points)
+      pt.curvature = 0.0f;
   }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360

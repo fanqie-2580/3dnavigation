@@ -482,22 +482,20 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
-**机制**（代码 `UndistortPclMultiLiDAR`）：Odin `offset_time>0` → 用 **Mid IMU** 按 `lidar_beg_time2 + curvature` 去畸变。
+**根因**（`UndistortPclMultiLiDAR`）：Odin `offset_time` 相对**设备帧起点**，但 `use_host_ros_time=2` 时 header 是 **USB 接收时刻**。用  
+`t = header_stamp + offset_time` 去套 Mid IMU 去畸变 → 转动中用到偏新的 Mid 姿态（错位），ω→0 时去畸变≈恒等（弹回）。错位点一旦 `map_insert` 就留在 `/Laser_map`。
 
 | 量 | 实测 |
 |----|------|
-| Odin raw stamp lag | ~0.15–0.18 s（`use_host_ros_time=2` 接收时刻） |
+| Odin raw stamp lag | ~0.15–0.18 s |
 | Mid /Odometry lag | ~0.08–0.09 s |
-| **相对时延** | **≈0.08–0.10 s** |
+| 相对时延 | ≈0.08–0.10 s |
 
-未补偿时：去畸变取的是偏新的 Mid 姿态 → 转动中 Odin 偏到错误方位；**停下 ω≈0，去畸变近似恒等 → 突然看起来正确**（错位点若已 `map_insert` 则留在 `/Laser_map`）。
-
-此前 `stamp_comp=0.15` 按绝对 USB 延迟减，相对 Mid **减过头**，观感更差。
-
-| 正确做法 | |
-|----------|--|
-| `stamp_latency_comp_sec≈0.08` | 只对齐相对时延，L2 stamp/Bundle/deskew 一致 |
-| `map_insert` 门限/冷却 | **关掉**（治标）；根因用 stamp 对齐 |
+| 正确做法（非冷却） | |
+|--------------------|--|
+| **禁止**对 Odin 做 Mid-IMU deskew | 清零 L2 curvature；整帧刚性进 Bundle |
+| `stamp_latency_comp_sec≈0.08` | 整帧 stamp 与 Mid 相对对齐 |
+| `map_insert` 门限/冷却 | 关掉 |
 
 ### 10e. 转动时 Odin 左右摆（2026-11-12）
 
