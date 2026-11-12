@@ -91,6 +91,8 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  last_lidar_end_time_ = 0.0;
+  last_lidar_end_time_2 = 0.0;
   last_imu_.reset(new sensor_msgs::msg::Imu());
 }
 
@@ -344,20 +346,31 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   // ~0.15s; 0.12 was clipping (mixed deskewed/raw → turn snap).
   constexpr double kMaxUndistortDt = 0.20; // s
 
-  double pcl_beg_time = meas.lidar_beg_time;
-  // Cover Mid end and Odin span remapped onto Mid beg (see lidar_end_time2).
-  double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
-  if (pcl_end_time < pcl_beg_time)
-    std::swap(pcl_end_time, pcl_beg_time);
+  // KF + publish stay on Mid scan end. Odin deskew may need a longer IMU
+  // horizon (signed_dt + odin_span). Extending last_lidar_end_time_ past Mid
+  // end caused next-frame IMUpose[0] to be a future state labeled as t=0 →
+  // turn overshoot then snap on /cloud_odin_registered.
+  const double pcl_beg_time = meas.lidar_beg_time;
+  const double mid_end_time = meas.lidar_end_time;
+  const double deskew_end_time =
+      std::max(mid_end_time, meas.lidar_end_time2);
 
   PointCloudXYZI pcl_1_out = *(meas.lidar);
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
 
-  /*** Initialize IMU pose ***/
+  /*** Initialize IMU pose — label incoming KF at its true offset vs Mid beg ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+  double offs0 = 0.0;
+  if (last_lidar_end_time_ > 1.0)
+    offs0 = last_lidar_end_time_ - pcl_beg_time;
+  if (offs0 < -kMaxBundleSpan)
+    offs0 = -kMaxBundleSpan;
+  if (offs0 > kMaxBundleSpan)
+    offs0 = kMaxBundleSpan;
+  IMUpose.push_back(set_pose6d(offs0, acc_s_last, angvel_last, imu_state.vel,
+                               imu_state.pos, imu_state.rot.toRotationMatrix()));
 
   /*** forward propagation at each imu point ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
@@ -402,15 +415,45 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
   }
 
-  double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
-  dt = note * (pcl_end_time - imu_end_time);
-  if (std::fabs(dt) > kMaxBundleSpan)
-    dt = note * kMaxBundleSpan;
-  kf_state.predict(dt, Q, in);
+  // Extend trajectory to deskew horizon (may be past Mid end for +signed Odin).
+  {
+    double note = deskew_end_time > imu_end_time ? 1.0 : -1.0;
+    dt = note * (deskew_end_time - imu_end_time);
+    if (std::fabs(dt) > kMaxBundleSpan)
+      dt = note * kMaxBundleSpan;
+    if (std::fabs(dt) > 1e-6)
+    {
+      kf_state.predict(dt, Q, in);
+      imu_state = kf_state.get_x();
+      double offs_t = deskew_end_time - pcl_beg_time;
+      IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel,
+                                   imu_state.pos, imu_state.rot.toRotationMatrix()));
+    }
+  }
+
+  // Snap KF + deskew target back to Mid end (publish/IEKF anchor).
+  if (deskew_end_time > mid_end_time + 1e-6)
+  {
+    dt = mid_end_time - deskew_end_time; // negative rewind
+    if (dt < -kMaxBundleSpan)
+      dt = -kMaxBundleSpan;
+    kf_state.predict(dt, Q, in);
+  }
+  else if (deskew_end_time < mid_end_time - 1e-6)
+  {
+    dt = mid_end_time - deskew_end_time;
+    if (dt > kMaxBundleSpan)
+      dt = kMaxBundleSpan;
+    kf_state.predict(dt, Q, in);
+    imu_state = kf_state.get_x();
+    IMUpose.push_back(set_pose6d(mid_end_time - pcl_beg_time, acc_s_last,
+                                 angvel_last, imu_state.vel, imu_state.pos,
+                                 imu_state.rot.toRotationMatrix()));
+  }
 
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
-  last_lidar_end_time_ = pcl_end_time;
+  last_lidar_end_time_ = mid_end_time;
 
   // Deskew one cloud: point time = lidar_beg_offset + curvature_ms/1000, relative to pcl_beg.
   // Supports t < 0 (Odin USB header earlier than Mid beg after header remap).

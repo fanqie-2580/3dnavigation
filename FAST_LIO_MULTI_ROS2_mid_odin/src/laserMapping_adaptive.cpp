@@ -1067,10 +1067,17 @@ bool sync_packages_bundle(MeasureGroup &meas)
 
         lidar_pushed = false;
         if (bundle_pair_dt_ >= 0.0)
+        {
+            const double mid_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            const double odin_h =
+                std::max(0.0, meas.lidar_end_time2 - meas.lidar_beg_time);
+            const double extend_ms = std::max(0.0, odin_h - mid_span) * 1000.0;
             cout << "\033[36;1mBundle tight dt=" << bundle_pair_dt_ * 1000.0
                  << "ms signed=" << bundle_pair_signed_dt_ * 1000.0
+                 << "ms extend=" << extend_ms
                  << "ms gyr_scan=" << bundle_scan_gyr_norm_
                  << " gyr_latest=" << last_imu_gyr_norm << "\033[0m" << endl;
+        }
         else
             cout << "\033[33;1mBundle Mid-only (hold Odin viz) gyr_scan="
                  << bundle_scan_gyr_norm_ << "\033[0m" << endl;

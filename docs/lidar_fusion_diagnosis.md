@@ -530,7 +530,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 ### 10m. 脏运行 + hold 重投影（2026-11-12 现场）
 
 **现象**：双 `/mid_odin_frame_fuse` → `/viz/accum_fused` 在两套累积图间交替；大量遗留 static TF；load~8；`/cloud_odin_registered` 用**当前 Mid 位姿**重投旧 Odin body → 先错后跳。  
-**修复**：hold 改为缓存并重发 **map 系快照**（不改姿态）；`enable_frame_fuse` 默认 **false**；重启必须清孤儿 fuse/TF。 |
+**修复**：hold 改为缓存并重发 **map 系快照**（不改姿态）；`enable_frame_fuse` 默认 **false**；重启必须清孤儿 fuse/TF。
+
+### 10n. H2 后 KF 锚点越过 Mid end（2026-11-12）
+
+**根因**：`pcl_end=max(Mid_end, Mid+signed+span)` 把 `last_lidar_end_time_` 推过下一帧 Mid beg；`IMUpose[0]` 仍标 `t=0` → 转动超前，signed 回落时弹回。橙色 `/cloud_odin_registered`。  
+**修复**：deskew 仍可要更长 IMU；**KF/`last_lidar_end` 锁 Mid end**（必要时从 deskew horizon rewind）；`IMUpose[0]` 用真实 `last_end-beg` 偏移。 |
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
