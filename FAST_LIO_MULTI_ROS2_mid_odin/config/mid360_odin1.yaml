@@ -8,6 +8,8 @@
       publish_tf_results: false
       # Tight coupling: Mid IEKF owns system /Odometry + map→body TF.
       publish_odom_tf: true
+      # Smooth map→body TF for RViz (1.0=off). /Odometry stays raw.
+      tf_pose_ema: 0.15
       max_iteration: 3
       map_frame: "map"
       # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
@@ -57,8 +59,9 @@
       # Soft couple only: Odin point residuals shook Mid body TF and smeared densify.
       lidar2_update_en: true
       lidar2_point_update_en: false
-      lidar2_pose_factor_en: true
-      lidar2_pose_alpha: 0.12
+      # Soft pose-factor kept weak: stronger alpha pulled Mid body TF into a shake.
+      lidar2_pose_factor_en: false
+      lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
       odin_odom_topic: "/odin1/odometry"
       lidar2_pose_gyr_gate: 0.0

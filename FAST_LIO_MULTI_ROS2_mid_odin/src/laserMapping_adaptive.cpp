@@ -44,6 +44,7 @@
 #include <omp.h>
 /// Eigen
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 /// ros
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -80,6 +81,11 @@ const float MOV_THRESHOLD = 1.5f;
 
 string lid_topic, lid_topic2, imu_topic, map_frame = "map";
 bool multi_lidar = false, async_debug = false, publish_tf_results = false, publish_odom_tf = true, bundle_enabled = false;
+// Smooth map→body TF for RViz only; /Odometry stays raw IEKF pose.
+double tf_pose_ema = 0.15;
+bool tf_ema_inited = false;
+Eigen::Vector3d tf_ema_pos = Eigen::Vector3d::Zero();
+Eigen::Quaterniond tf_ema_q = Eigen::Quaterniond::Identity();
 bool extrinsic_imu_to_lidars = false;
 
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
@@ -1327,17 +1333,48 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     // B2: when Odin owns system TF (map→body), Mid must not broadcast the same frame.
     if (publish_odom_tf)
     {
+        Eigen::Vector3d p(
+            odomAftMapped.pose.pose.position.x,
+            odomAftMapped.pose.pose.position.y,
+            odomAftMapped.pose.pose.position.z);
+        Eigen::Quaterniond q(
+            odomAftMapped.pose.pose.orientation.w,
+            odomAftMapped.pose.pose.orientation.x,
+            odomAftMapped.pose.pose.orientation.y,
+            odomAftMapped.pose.pose.orientation.z);
+        q.normalize();
+        if (!tf_ema_inited || tf_pose_ema >= 0.999)
+        {
+            tf_ema_pos = p;
+            tf_ema_q = q;
+            tf_ema_inited = true;
+        }
+        else
+        {
+            const double dp = (p - tf_ema_pos).norm();
+            const double dang_deg = tf_ema_q.angularDistance(q) * (180.0 / M_PI);
+            // Track when clearly moving; heavy damp on cm-level IEKF jitter.
+            double a = tf_pose_ema;
+            if (dp > 0.03 || dang_deg > 0.8)
+                a = std::max(tf_pose_ema, 0.65);
+            else
+                a = std::min(tf_pose_ema, 0.12);
+            a = std::clamp(a, 0.01, 1.0);
+            tf_ema_pos = (1.0 - a) * tf_ema_pos + a * p;
+            tf_ema_q = tf_ema_q.slerp(a, q).normalized();
+        }
+
         geometry_msgs::msg::TransformStamped trans;
         trans.header.frame_id = map_frame;
         trans.header.stamp = odomAftMapped.header.stamp;
         trans.child_frame_id = "body";
-        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-        trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-        trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-        trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-        trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+        trans.transform.translation.x = tf_ema_pos.x();
+        trans.transform.translation.y = tf_ema_pos.y();
+        trans.transform.translation.z = tf_ema_pos.z();
+        trans.transform.rotation.w = tf_ema_q.w();
+        trans.transform.rotation.x = tf_ema_q.x();
+        trans.transform.rotation.y = tf_ema_q.y();
+        trans.transform.rotation.z = tf_ema_q.z();
         tf_br->sendTransform(trans);
     }
 }
@@ -1527,6 +1564,7 @@ public:
         this->declare_parameter<bool>("common.multi_lidar", true);
         this->declare_parameter<bool>("common.publish_tf_results", true);
         this->declare_parameter<bool>("common.publish_odom_tf", true);
+        this->declare_parameter<double>("common.tf_pose_ema", 0.15);
 
         this->declare_parameter<std::string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<std::string>("common.lid_topic2", "/livox/lidar");
@@ -1605,6 +1643,7 @@ public:
         this->get_parameter_or("common.multi_lidar", multi_lidar, true);
         this->get_parameter_or("common.publish_tf_results", publish_tf_results, true);
         this->get_parameter_or("common.publish_odom_tf", publish_odom_tf, true);
+        this->get_parameter_or("common.tf_pose_ema", tf_pose_ema, 0.15);
 
         this->get_parameter_or("common.lid_topic", lid_topic, std::string("/livox/lidar"));
         this->get_parameter_or("common.lid_topic2", lid_topic2, std::string("/livox/lidar"));
