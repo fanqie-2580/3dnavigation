@@ -29,8 +29,9 @@
   <!-- PCL -->
   <depend>pcl_conversions</depend>
   <depend>pcl_ros</depend>
+  <depend>std_srvs</depend>
 
-  <!-- Odin downsample bridge -->
+  <!-- Odin densify clear_accum; Python scripts remain as fallback -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

@@ -22,6 +22,8 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 
 # PCL (ROS2)
@@ -91,11 +93,26 @@ foreach(node IN ITEMS laserMapping_adaptive laserMapping_bundle laserMapping_asy
     )
 endforeach()
 
+# Low-latency Odin bridge + densify (C++ replaces Python hot paths)
+add_executable(odin_raw_downsample_bridge src/odin_raw_downsample_bridge.cpp)
+ament_target_dependencies(odin_raw_downsample_bridge
+    rclcpp sensor_msgs nav_msgs geometry_msgs std_msgs
+)
+target_include_directories(odin_raw_downsample_bridge PRIVATE ${EIGEN3_INCLUDE_DIR})
+
+add_executable(odin_mid_densify src/odin_mid_densify.cpp)
+ament_target_dependencies(odin_mid_densify
+    rclcpp sensor_msgs nav_msgs geometry_msgs std_msgs std_srvs
+)
+target_include_directories(odin_mid_densify PRIVATE ${EIGEN3_INCLUDE_DIR})
+
 # Install binaries & resources
 install(TARGETS
     laserMapping_adaptive
     laserMapping_bundle
     laserMapping_async
+    odin_raw_downsample_bridge
+    odin_mid_densify
     fastlio_preprocess
     DESTINATION lib/${PROJECT_NAME}
 )

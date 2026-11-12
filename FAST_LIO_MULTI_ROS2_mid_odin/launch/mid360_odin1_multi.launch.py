@@ -65,8 +65,8 @@ def generate_launch_description():
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
-        default_value='0.08',
-        description='Voxel size for Odin bridge/accum densify',
+        default_value='0.12',
+        description='Voxel size for Odin C++ bridge/densify (larger = lower latency)',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -140,56 +140,30 @@ def generate_launch_description():
         # USB host_sdk: /odin1/cloud_raw is already lidar-frame. Do NOT feed
         # cloud_slam into L2 — unproject was wrong (r_p50 ~4m vs raw ~1m) and
         # painted a ghost densify map (turn smear / offset).
+        # C++ bridge: latest-only + pre-decimate (replaces Python hot path ~2s lag).
         nodes.append(
             Node(
                 package='fast_lio_multi',
-                executable='odin_raw_downsample_bridge.py',
+                executable='odin_raw_downsample_bridge',
                 name='odin_raw_downsample_bridge',
                 output='screen',
                 parameters=[{
                     'input_topic': '/odin1/cloud_raw',
-                    # Full Odin cloud for L2 + densify (ground-only backup:
-                    # launch/mid360_odin1_multi_ground_only.launch.py).
                     'output_topic': '/odin1/cloud_raw_ds',
+                    'l2_body_topic': '/odin1/cloud_l2_body',
+                    'l2_mid_pose_topic': '/odin1/l2_mid_pose',
+                    'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
                     'voxel_size': float(
                         context.launch_configurations.get('odin_voxel', '0.12')
                     ),
-                    # Tight latency: unpack ≤4k from 49k raw (skip heavy voxel unique).
-                    'max_points': 4000,
-                    'pre_decimate_max': 4000,
+                    # 2k pts: keep proc_ms << 50 on Jetson.
+                    'max_points': 2000,
+                    'pre_decimate_max': 2000,
                     'min_confidence': 30.0,
-                    'restamp_from_odom': True,
-                    # False: do not wait for Mid odom tick (was adding ~100ms+
-                    # and stacking behind slow Python pack). Still restamp to a
-                    # nearby Mid stamp when one exists within mid_restamp_max_dt.
-                    'one_cloud_per_odom': False,
-                    # Restamp against Mid IEKF timebase (not system Odin /Odometry).
-                    'odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
-                    'odin_odom_topic': '/odin1/odometry',
-                    'odin_odom_max_dt': 1.0,
-                    # Must match mapping.lidar2_max_sync_dt: never restamp L2
-                    # outside this window (lying stamps twist Mid IEKF).
-                        # Causal Mid only (stamp<=Odin); no future interp (official sync).
-                    # Mid odom ~10Hz → allow up to one period so we rarely skip.
+                    # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
-                    # 0: no artificial rate floor (latest-only already drops extras).
-                    'fallback_period': 0.0,
-                    'ground_only': False,
-                    # raw is lidar-frame: no odom unproject on main or L2.
-                    'unproject_odom_clouds': False,
-                    'l2_body_topic': '/odin1/cloud_l2_body',
-                    'l2_mid_pose_topic': '/odin1/l2_mid_pose',
-                    'ground_topic': '/odin1/cloud_ground',
-                    # Skip RANSAC entirely when not keeping ground-only.
-                    'publish_ground_topic': False,
-                    'publish_full_topic': '',
-                    'ground_distance': 0.08,
-                    'ground_max_angle_deg': 25.0,
-                    'ground_ransac_iters': 20,
-                    'ground_min_inliers': 60,
-                    'ground_fit_z_span': 1.5,
-                    'ground_z_band': 0.20,
+                    'publish_ds_topic': True,
                 }],
             )
         )
@@ -322,82 +296,66 @@ def generate_launch_description():
 
         use_align = context.launch_configurations.get('enable_odin_align', 'true') == 'true'
         if use_align:
-            nodes.append(
-                Node(
-                    package='fast_lio_multi',
-                    executable='odin_independent_accum.py',
-                    name='odin_independent_accum',
-                    output='screen',
-                    parameters=[{
-                        # CT-LIO: align TF only. Else: densify lidar-frame Odin with Mid pose
-                        # (no Odin cloud_slam / own map for RViz accum).
-                        'align_only': use_ct,
-                        'cloud_topic': (
-                            '/odin1/cloud_in_odom' if use_ct else '/odin1/cloud_l2_body'
-                        ),
-                        'odom_topic': '/odin1/ct_lio/odom' if use_ct else '/odin1/odometry',
-                        'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
-                        'map_frame': 'odin_map',
-                        'parent_frame': 'map',
-                        'out_scan_topic': '/odin1/cloud_in_map',
-                        'out_accum_topic': '/viz/accum_odin',
-                        'cloud_already_in_odom': bool(use_ct),
-                        'project_with_mid': (not use_ct),
-                        'publish_in_parent_frame': False,
-                        'wait_align_for_parent': False,
-                        'align_mode': 'off' if not use_ct else 'yaw',
-                        'align_delay_sec': 2.0,
-                        'odom_pair_max_dt': 0.50,
-                        # OFF: warp-to-latest made /odin1/cloud_in_map disagree with
-                        # stamp-locked /viz/accum_odin inside AccumFused → live Odin
-                        # shakes against the fusion map on any Mid motion.
-                        'motion_sync_to_mid': False,
-                        'motion_sync_min_trans': 0.015,
-                        'motion_sync_min_rot_deg': 0.35,
-                        'mid_wall_pair_max_dt': 0.20,
-                        # Accum always stamp-locked; latest Mid only when moving (see gates).
-                        'mid_pose_lookback_sec': 0.0,
-                        'mid_pose_ema': 1.0,
-                        'prefer_latest_mid_pose': False,
-                        'latest_mid_min_trans_vel': 0.08,
-                        'latest_mid_min_yaw_rate_deg': 8.0,
-                        'still_trans_vel': 0.05,
-                        'still_yaw_rate_deg': 3.0,
-                        # OFF: deadband held densify Mid while /cloud_registered moved →
-                        # live Odin lagged Mid and keep-first voxels locked ~20cm double walls
-                        # into /viz/accum_odin (live NN~11cm, accum NN~26cm). Track 1:1.
-                        'densify_hold_trans': 0.0,
-                        'densify_hold_rot_deg': 0.0,
-                        'densify_track_alpha': 1.0,
-                        # OFF: live Mid yaw-rate deskew twisted Odin wedge on slight turns.
-                        'deskew_odin': False,
-                        'restamp_scan_to_now': True,
-                        # Still-only Python accum (official map = C++ ikdtree).
-                        # Keep-first voxels must not store micro-turn densify smear.
-                        'accum_max_yaw_rate_deg': 3.0,
-                        'l2_mid_pose_topic': '/odin1/l2_mid_pose',
-                        'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
-                        'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
-                        'extrinsic_T': [-0.011, -0.02329, 0.04412],
-                        'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
-                        'extrinsic_R_L2_wrt_L1': [
-                            0.97437006, 0.0, -0.22495105,
-                            0.0, 1.0, 0.0,
-                            0.22495105, 0.0, 0.97437006,
-                        ],
-                        'stride': 1,
-                        'blind': 0.2,
-                        'min_confidence': 0,
-                        'voxel_size': float(
-                            context.launch_configurations.get('odin_voxel', '0.08')
-                        ),
-                        'max_accum_points': 400000,
-                        'accum_publish_period': 0.5,
-                        'accum_skip_sec': 2.0,
-                    }],
+            if use_ct:
+                # CT-LIO path still needs Python align-only helper.
+                nodes.append(
+                    Node(
+                        package='fast_lio_multi',
+                        executable='odin_independent_accum.py',
+                        name='odin_independent_accum',
+                        output='screen',
+                        parameters=[{
+                            'align_only': True,
+                            'cloud_topic': '/odin1/cloud_in_odom',
+                            'odom_topic': '/odin1/ct_lio/odom',
+                            'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
+                            'map_frame': 'odin_map',
+                            'parent_frame': 'map',
+                            'out_scan_topic': '/odin1/cloud_in_map',
+                            'out_accum_topic': '/viz/accum_odin',
+                            'cloud_already_in_odom': True,
+                            'project_with_mid': False,
+                            'align_mode': 'yaw',
+                            'align_delay_sec': 2.0,
+                        }],
+                    )
                 )
-            )
+            else:
+                # C++ densify: Mid-pose project + still-only accum (low latency).
+                nodes.append(
+                    Node(
+                        package='fast_lio_multi',
+                        executable='odin_mid_densify',
+                        name='odin_independent_accum',
+                        output='screen',
+                        parameters=[{
+                            'cloud_topic': '/odin1/cloud_l2_body',
+                            'l2_mid_pose_topic': '/odin1/l2_mid_pose',
+                            'mid_odom_topic': '/Odometry_mid' if use_odin_sys else '/Odometry',
+                            'out_scan_topic': '/odin1/cloud_in_map',
+                            'out_accum_topic': '/viz/accum_odin',
+                            'map_frame': 'map',
+                            'voxel_size': float(
+                                context.launch_configurations.get('odin_voxel', '0.12')
+                            ),
+                            'max_accum_points': 400000,
+                            'accum_skip_sec': 2.0,
+                            'accum_max_yaw_rate_deg': 3.0,
+                            'still_trans_vel': 0.05,
+                            'still_yaw_rate_deg': 3.0,
+                            'accum_publish_period': 0.5,
+                            'restamp_scan_to_now': True,
+                            'extrinsic_T': [-0.011, -0.02329, 0.04412],
+                            'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                            'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                            'extrinsic_R_L2_wrt_L1': [
+                                0.97437006, 0.0, -0.22495105,
+                                0.0, 1.0, 0.0,
+                                0.22495105, 0.0, 0.97437006,
+                            ],
+                        }],
+                    )
+                )
 
         if context.launch_configurations.get('enable_frame_fuse', 'true') == 'true':
             # B1: independent_accum owns Odin densify (/odin1/cloud_in_map + /viz/accum_odin).

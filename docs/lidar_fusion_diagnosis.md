@@ -461,6 +461,15 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | fuse `accum_gyr_gate=0.05` | launch | Mid 体素也不在微转时堆 |
 | `lidar2_map_insert_en=false`；point/IEKF 仍开 | `mid360_odin1.yaml` | 紧耦合保留，坏 L2 不进 ikdtree |
 
+### 11. C++ 降延时（2026-11-12）
+
+| 项 | 内容 |
+|----|------|
+| Bridge | `odin_raw_downsample_bridge` **C++** 替换 Python：latest-only、pre_decimate **2k**、causal Mid、`proc_ms` 日志 |
+| Densify | `odin_mid_densify` **C++**（节点名仍 `odin_independent_accum`）：L2→`cloud_in_map` + still-only accum |
+| 参数 | `odin_voxel` 默认 **0.12**；`max_points/pre_decimate_max=2000`；不开 ground RANSAC |
+| 回退 | Python 脚本仍 install，CT-LIO `align_only` 路径继续用 `.py` |
+
 
 
 ---
