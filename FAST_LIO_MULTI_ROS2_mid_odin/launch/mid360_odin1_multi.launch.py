@@ -65,8 +65,8 @@ def generate_launch_description():
     )
     odin_voxel_arg = DeclareLaunchArgument(
         'odin_voxel',
-        default_value='0.12',
-        description='Voxel size for Odin bridge/accum (0.12 keeps Jetson densify low-latency)',
+        default_value='0.08',
+        description='Voxel size for Odin bridge/accum densify',
     )
 
     def choose_nodes(context, *args, **kwargs):
@@ -356,6 +356,8 @@ def generate_launch_description():
                         'prefer_latest_mid_pose': False,
                         'latest_mid_min_trans_vel': 0.08,
                         'latest_mid_min_yaw_rate_deg': 8.0,
+                        'still_trans_vel': 0.05,
+                        'still_yaw_rate_deg': 3.0,
                         'restamp_scan_to_now': True,
                         'accum_max_yaw_rate_deg': 25.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',

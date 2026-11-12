@@ -162,7 +162,11 @@ class MidOdinFrameFuse(Node):
         self._stamp_scan = None
         self._t0 = time.time()
         self._odin_voxel = VoxelAccum(voxel, max_n)
+        # Fallback Mid densify when /viz/accum_mid360 is absent (color_viz off).
+        self._mid_voxel = VoxelAccum(voxel, max_n)
         self._dirty_odin = False
+        self._n_mid_voxel = 0
+        self._have_ext_mid_accum = False
 
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
@@ -213,9 +217,31 @@ class MidOdinFrameFuse(Node):
         mode = 'already-in-map' if self.odin_already_in_map else 'TF(map←odin_map)'
         self.get_logger().info(
             f'Frame fuse Mid360+Odin1: Mid(map) + Odin via {mode}; '
-            f'odin_scan_accum={self.accumulate_odin} voxel={voxel} '
+            f'odin_scan_accum={self.accumulate_odin} mid_scan_accum=True(fallback) '
+            f'voxel={voxel} '
             f'accum_gyr_gate={self.accum_gyr_gate} cooldown={self.accum_gyr_cooldown_sec:.2f}s '
             f'max_scan_age={self.max_scan_age_sec:.2f}s'
+        )
+        self.create_timer(2.0, self._status)
+
+    def _status(self) -> None:
+        mid_n = (
+            int(self._mid_accum.shape[0])
+            if self._mid_accum is not None and self._mid_accum.size
+            else len(self._mid_voxel)
+        )
+        odin_n = (
+            len(self._odin_voxel)
+            if self.accumulate_odin
+            else (
+                int(self._odin_accum_ext.shape[0])
+                if self._odin_accum_ext is not None and self._odin_accum_ext.size
+                else 0
+            )
+        )
+        self.get_logger().info(
+            f'fuse_accum mid_n={mid_n} (ext={self._have_ext_mid_accum} local={len(self._mid_voxel)}) '
+            f'odin_n={odin_n} odin_from_scan={self.accumulate_odin}'
         )
 
     def _accum_ready(self) -> bool:
@@ -245,6 +271,17 @@ class MidOdinFrameFuse(Node):
         self._mid_scan = xyz_from_msg(msg, self.stride)
         self._stamp_scan = msg.header.stamp
         self._publish_scan()
+        # Build Mid accum locally if color_viz is not publishing /viz/accum_mid360.
+        if (
+            self._mid_scan is not None
+            and self._mid_scan.size
+            and self._accum_ready()
+            and not self._have_ext_mid_accum
+        ):
+            if self._mid_gyr_norm >= self.accum_gyr_gate or time.time() < self._gyr_block_until:
+                return
+            if self._mid_voxel.add(self._mid_scan):
+                self._n_mid_voxel += 1
 
     def on_mid_odom(self, msg: Odometry) -> None:
         # FAST_LIO /Odometry often has empty twist — estimate yaw rate from pose.
@@ -293,6 +330,8 @@ class MidOdinFrameFuse(Node):
 
     def on_mid_accum(self, msg: PointCloud2) -> None:
         self._mid_accum = xyz_from_msg(msg, 1)
+        if self._mid_accum is not None and self._mid_accum.size:
+            self._have_ext_mid_accum = True
 
     def on_odin_accum_ext(self, msg: PointCloud2) -> None:
         # Ignore our own republish echo if DDS loops; size check is enough for now.
@@ -321,8 +360,16 @@ class MidOdinFrameFuse(Node):
             return self._odin_to_map(self._odin_accum_ext)
         return None
 
+    def _mid_accum_cloud(self) -> Optional[np.ndarray]:
+        if self._have_ext_mid_accum and self._mid_accum is not None and self._mid_accum.size:
+            return self._mid_accum
+        if len(self._mid_voxel):
+            return self._mid_voxel.numpy()
+        return None
+
     def publish_accum(self) -> None:
         odin_m = self._odin_accum_cloud()
+        mid_m = self._mid_accum_cloud()
         stamp = self.get_clock().now().to_msg()
         h = Header()
         h.stamp = stamp
@@ -338,8 +385,8 @@ class MidOdinFrameFuse(Node):
             self._dirty_odin = False
 
         parts = []
-        if self._mid_accum is not None and self._mid_accum.size:
-            parts.append(self._mid_accum)
+        if mid_m is not None and mid_m.size:
+            parts.append(mid_m)
         if odin_m is not None and odin_m.size:
             parts.append(odin_m)
         if not parts:

@@ -220,6 +220,9 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('latest_mid_min_yaw_rate_deg', 8.0)
         # Stamp /odin1/cloud_in_map with now (map-frame draw; TF deadband handles still).
         self.declare_parameter('restamp_scan_to_now', True)
+        # Below these rates, reuse last Mid pose for densify (stop still-shake).
+        self.declare_parameter('still_trans_vel', 0.05)
+        self.declare_parameter('still_yaw_rate_deg', 3.0)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -279,6 +282,8 @@ class OdinIndependentAccum(Node):
         self.latest_mid_min_trans_vel = float(self.get_parameter('latest_mid_min_trans_vel').value)
         self.latest_mid_min_yaw_rate_deg = float(self.get_parameter('latest_mid_min_yaw_rate_deg').value)
         self.restamp_scan_to_now = bool(self.get_parameter('restamp_scan_to_now').value)
+        self.still_trans_vel = float(self.get_parameter('still_trans_vel').value)
+        self.still_yaw_rate_deg = float(self.get_parameter('still_yaw_rate_deg').value)
         self._ema_mid_T: Optional[np.ndarray] = None
         self._n_motion_hold = 0
         self._n_skip_accum_turn = 0
@@ -292,6 +297,9 @@ class OdinIndependentAccum(Node):
         self._mid_pos_prev: Optional[Tuple[float, np.ndarray]] = None  # (wall, xyz)
         # Cloud often arrives before matching l2_mid_pose in the same executor turn.
         self._pending_l2: Optional[Tuple[PointCloud2, np.ndarray, float]] = None
+        # Freeze densify Mid pose while still — IEKF mm wander otherwise shakes
+        # cloud_in_map and splatters keep-first voxels.
+        self._hold_T_mid: Optional[np.ndarray] = None
         # (cloud_stamp_sec, T_map_body) from downsample bridge
         self._l2_mid_pose_buf: Deque[Tuple[float, np.ndarray]] = deque(maxlen=200)
         self.align_mode = str(self.get_parameter('align_mode').value).strip().lower()
@@ -869,6 +877,15 @@ class OdinIndependentAccum(Node):
         self._pending_l2 = None
         self._last_sync_dt = dt_locked
         T_locked = self._ema_mid_pose(T_locked)
+        still = (
+            self._mid_trans_vel < self.still_trans_vel
+            and self._mid_yaw_rate_deg < self.still_yaw_rate_deg
+        )
+        if still and self._hold_T_mid is not None:
+            T_locked = self._hold_T_mid
+        else:
+            self._hold_T_mid = T_locked.copy()
+
         moving = (
             self._mid_trans_vel >= self.latest_mid_min_trans_vel
             or self._mid_yaw_rate_deg >= self.latest_mid_min_yaw_rate_deg
