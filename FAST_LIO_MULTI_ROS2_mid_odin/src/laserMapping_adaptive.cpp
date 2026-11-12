@@ -887,24 +887,31 @@ bool sync_packages_bundle(MeasureGroup &meas)
             // L2 → Mid lidar frame for IEKF (gravity_frame: translation-only).
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             meas.lidar_beg_time2 = time_buffer2[best_i];
-            if (meas.lidar2->points.size() <= 1) // time too little
+            // Odin header is USB receive time; do NOT set lidar_end_time2 =
+            // header + max(offset_time) (~+100ms) — that pulls IMU/KF past Mid
+            // end and caused turn swing→snap. Undistort remaps Odin curvature
+            // onto Mid's time base; fusion end time follows Mid.
             {
-                lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
-                std::cerr << "Too few input point cloud!\n";
-            }
-            else if (meas.lidar2->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime2)
-            {
-                lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
-            }
-            else
-            {
-                scan_num2 ++;
-                lidar_end_time2 = meas.lidar_beg_time2 + meas.lidar2->points.back().curvature / double(1000);
-                lidar_mean_scantime2 += (meas.lidar2->points.back().curvature / double(1000) - lidar_mean_scantime2) / scan_num2;
+                double odin_span = 0.0;
+                for (const auto &pt : meas.lidar2->points)
+                    odin_span = std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
+                if (odin_span > 1e-4)
+                {
+                    scan_num2++;
+                    lidar_mean_scantime2 += (odin_span - lidar_mean_scantime2) / scan_num2;
+                }
+                else if (lidar_mean_scantime2 > 1e-4)
+                    odin_span = lidar_mean_scantime2;
+                else
+                    odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+                // Keep end on Mid timeline (beg = Mid beg in Undistort).
+                lidar_end_time2 = meas.lidar_beg_time + odin_span;
+                if (lidar_end_time2 < lidar_end_time)
+                    lidar_end_time2 = lidar_end_time;
             }
             meas.lidar_end_time2 = lidar_end_time2;
 
-            publish_lidar_time = max(lidar_end_time, lidar_end_time2);
+            publish_lidar_time = lidar_end_time;
             lidar_pushed = true;
             bundle_pair_index_ = best_i; // remember which L2 to pop after IMU sync
             bundle_pair_dt_ = best_dt;

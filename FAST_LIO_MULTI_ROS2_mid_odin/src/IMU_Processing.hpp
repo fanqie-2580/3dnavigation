@@ -340,14 +340,14 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   constexpr double kMaxUndistortDt = 0.12; // s; motion-compensation model limit
 
   double pcl_beg_time = meas.lidar_beg_time;
-  double pcl_end_time = meas.lidar_end_time;
+  // Cover Mid end and Odin span remapped onto Mid beg (see lidar_end_time2).
+  double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
   if (pcl_end_time < pcl_beg_time)
     std::swap(pcl_end_time, pcl_beg_time);
 
   PointCloudXYZI pcl_1_out = *(meas.lidar);
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
-  // Odin cloud_slam is already motion-compensated; do not re-sort/deskew with Mid IMU.
 
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
@@ -458,17 +458,17 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // Odin USB (use_host_ros_time=2): header stamp is HOST RECEIVE time, while
-  // offset_time is relative to DEVICE frame start. Treating
-  //   t = header_stamp + offset_time
-  // as Mid-IMU time is wrong → during yaw, deskew pulls Odin with future Mid
-  // poses (points swing to wrong place), then ω→0 makes deskew≈I (snap back).
-  // Do NOT Mid-IMU deskew Odin; keep rigid L2→body and let Bundle stamp_comp
-  // align the whole frame. Mid deskew above is unchanged.
-  {
-    for (auto &pt : pcl_2_out.points)
-      pt.curvature = 0.0f;
-  }
+  // Odin offset_time spans ~0..100ms WITHIN the frame (live raw), so
+  // intra-frame Mid-IMU deskew is required — zeroing curvature left a
+  // ω·Δt smear that vanished when ω→0 ("wrong then snap").
+  //
+  // But use_host_ros_time=2 makes header = USB RECEIVE time. Anchoring
+  //   t = header + offset_time
+  // on Mid IMU pushes points into the future past Mid end → swing/snap.
+  // Fix: keep per-point curvature, deskew on Mid's time base (same as Mid
+  // scan window covered by IMUpose). Bundle already paired nearest Mid.
+  if (!pcl_2_out.points.empty())
+    deskew_cloud(pcl_2_out, meas.lidar_beg_time);
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
   for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1

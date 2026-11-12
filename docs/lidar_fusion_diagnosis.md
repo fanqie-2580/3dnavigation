@@ -482,19 +482,27 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
-**根因**（`UndistortPclMultiLiDAR`）：Odin `offset_time` 相对**设备帧起点**，但 `use_host_ros_time=2` 时 header 是 **USB 接收时刻**。用  
-`t = header_stamp + offset_time` 去套 Mid IMU 去畸变 → 转动中用到偏新的 Mid 姿态（错位），ω→0 时去畸变≈恒等（弹回）。错位点一旦 `map_insert` 就留在 `/Laser_map`。
+**两阶段结论**
 
-| 量 | 实测 |
+1. ~~仅 USB header 导致 deskew 用错绝对时间~~（曾用清零 curvature 规避，但引入新问题）  
+2. **清零 curvature 后的真因（本轮数据）**：Odin `offset_time` 帧内跨度 **~0–94 ms**（非已去畸变的单时刻云）。关掉 Mid-IMU deskew 后，转动时整帧残留 ω·Δt 拖影；ω→0 拖影消失 → **错误后跳变**。  
+   同时 `lidar_end_time2 = USB_header + max(offset)` 会把 IMU/KF 拉到 Mid end 之后，加剧摆动。
+
+| 量（stamp_comp=0，deskew 曾关闭） | 实测 |
 |----|------|
-| Odin raw stamp lag | ~0.15–0.18 s |
-| Mid /Odometry lag | ~0.08–0.09 s |
-| 相对时延 | ≈0.08–0.10 s |
+| still NN Mid↔Odin | ~0.15 m |
+| \|wz\|≈1.0 时 NN | ~0.33–0.37 m（升高） |
+| 停转后 NN | 立刻回到 ~0.17 m（弹回） |
+| L2 recv_lag / Mid recv_lag | ~147 ms / ~87 ms（相对 ~60 ms） |
+| Bundle dt | 锯齿 0→100 ms（Mid/Odin 相位漂移） |
+| Odin offset_time 跨度 | **0–94 ms** |
 
-| 正确做法（非冷却） | |
+| 正确做法（非冷却，已改） | |
 |--------------------|--|
-| **禁止**对 Odin 做 Mid-IMU deskew | 清零 L2 curvature；整帧刚性进 Bundle |
-| `stamp_latency_comp_sec=0` | **不要**为相对时延改 L2 stamp |
+| **恢复** Odin 按点 deskew | 保留 curvature |
+| deskew **锚在 Mid 时间基** | `deskew_cloud(Odin, meas.lidar_beg_time)`，不用 USB header 做绝对时刻 |
+| `lidar_end_time2` | Mid beg + odin_span（且 ≥ Mid end），禁止 `header+offset` |
+| `stamp_latency_comp_sec=0` | 仍不要改 L2 stamp（0.08 曾使 Bundle 贴满 100 ms） |
 
 **运行反证（stamp_comp=0.08 后更差）**
 
@@ -504,8 +512,6 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | 同 wall 下 L2−Odom stamp | **≈ −0.175 s**（L2 过早） |
 | Bundle dt | mean≈85ms，**80% >80ms**，多帧 ~95–100ms（贴 `max_sync_dt`） |
 | 后果 | Mid↔L2 配对在窗口边缘抖动 → Odin 整帧跟着跳/更不对 |
-
-相对采集时延仍在，但不改 stamp；靠关 deskew 去掉“错位→ω=0 弹回”的主机制。
 
 ### 10e. 转动时 Odin 左右摆（2026-11-12）
 
