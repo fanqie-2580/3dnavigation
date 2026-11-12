@@ -337,7 +337,9 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   // Using min(Mid,Odin) made Mid curvature relative to an earlier Odin stamp and
   // twisted /cloud_registered whenever the TCP/restamped L2 led Mid.
   constexpr double kMaxBundleSpan = 0.20; // s
-  constexpr double kMaxUndistortDt = 0.12; // s; motion-compensation model limit
+  // Odin whole-frame mid time can sit ~bias behind Mid beg → |dt| to Mid end
+  // ~0.15s; 0.12 was clipping (mixed deskewed/raw → turn snap).
+  constexpr double kMaxUndistortDt = 0.20; // s
 
   double pcl_beg_time = meas.lidar_beg_time;
   // Cover Mid end and Odin span remapped onto Mid beg (see lidar_end_time2).
@@ -482,25 +484,28 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
 
-  // Odin: offset_time is relative to DEVICE frame start; header is USB receive.
-  // Absolute point time ≈ header + offset. Map onto Mid timeline BEFORE deskew:
-  //   t_rel = (L2_header - Mid_beg) + offset
-  // Bundle pairs with stamp_bias so Mid_beg ≈ L2_header + ~65ms → t_rel ∈ ~[-65ms, +30ms].
-  // Do NOT deskew as Mid_beg+offset then slap on Exp(-ω·bias) — that is not a time shift
-  // and causes wrong-then-snap (error ∝ |ω|, vanishes when ω→0).
+  // Odin dToF: offset_time is per-row group relative to cloud.timestamp (header),
+  // span ~0..94ms. Per-point Mid-IMU deskew with USB/PTP header is fragile:
+  //   - varying Bundle residual changes (L2-Mid) every frame
+  //   - |t_end - t_point| can exceed kMaxUndistortDt → mixed deskewed/raw → snap
+  // Live still data: NN OK (~0.18) but centroid flickers; turns still wrong-then-snap.
+  // Fix: ONE representative time (frame mid) for the whole Odin cloud, then the
+  // same deskew_cloud path (incl. t<0 back-prop) → rigid SE3 to Mid end, no
+  // intra-frame Mid-IMU on unreliable per-point host times.
   if (!pcl_2_out.points.empty())
   {
+    double odin_span = 0.0;
+    for (const auto &pt : pcl_2_out.points)
+      odin_span = std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
     const double header_off = meas.lidar_beg_time2 - meas.lidar_beg_time;
+    double t_rel = header_off + 0.5 * odin_span;
+    if (t_rel < -kMaxBundleSpan)
+      t_rel = -kMaxBundleSpan;
+    if (t_rel > kMaxBundleSpan)
+      t_rel = kMaxBundleSpan;
+    const float t_ms = static_cast<float>(t_rel * 1000.0);
     for (auto &pt : pcl_2_out.points)
-    {
-      double t_rel = header_off + static_cast<double>(pt.curvature) / 1000.0;
-      if (t_rel < -kMaxUndistortDt)
-        t_rel = -kMaxUndistortDt;
-      if (t_rel > kMaxBundleSpan)
-        t_rel = kMaxBundleSpan;
-      pt.curvature = static_cast<float>(t_rel * 1000.0);
-    }
-    // curvature already Mid-relative; pass Mid_beg so beg_off=0.
+      pt.curvature = t_ms;
     deskew_cloud(pcl_2_out, meas.lidar_beg_time);
   }
 

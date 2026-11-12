@@ -77,8 +77,9 @@
       lidar2_stamp_bias_sec: 0.065
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      # Odin → official ikdtree (/Laser_map) after successful Bundle IEKF.
-      lidar2_map_insert_en: true
+      # Keep Odin out of ikdtree until live /cloud_odin_registered is stable.
+      # Bad turn frames were permanently staining /Laser_map (looks like jump).
+      lidar2_map_insert_en: false
       lidar2_map_insert_gyr_gate: 0.0
       lidar2_map_insert_cooldown_sec: 0.0
 
