@@ -39,6 +39,15 @@ inline double stamp_sec(const builtin_interfaces::msg::Time &s)
   return static_cast<double>(s.sec) + 1e-9 * static_cast<double>(s.nanosec);
 }
 
+inline builtin_interfaces::msg::Time sec_to_stamp(double t)
+{
+  builtin_interfaces::msg::Time s;
+  if (t < 0.0) t = 0.0;
+  s.sec = static_cast<int32_t>(t);
+  s.nanosec = static_cast<uint32_t>((t - static_cast<double>(s.sec)) * 1e9);
+  return s;
+}
+
 inline float read_f32(const uint8_t *p, uint8_t dt)
 {
   if (dt == sensor_msgs::msg::PointField::FLOAT32) {
@@ -113,6 +122,9 @@ public:
     declare_parameter<double>("min_confidence", 30.0);
     declare_parameter<double>("mid_restamp_max_dt", 0.12);
     declare_parameter<double>("max_cloud_age_sec", 0.25);
+    // use_host_ros_time=2 stamps receive time (~150ms after capture). Subtract
+    // so Bundle/densify Mid match uses pose near Odin capture, not receive.
+    declare_parameter<double>("stamp_latency_comp_sec", 0.15);
     declare_parameter<bool>("publish_ds_topic", true);
 
     input_topic_ = get_parameter("input_topic").as_string();
@@ -127,6 +139,7 @@ public:
     min_confidence_ = get_parameter("min_confidence").as_double();
     mid_restamp_max_dt_ = get_parameter("mid_restamp_max_dt").as_double();
     max_cloud_age_sec_ = get_parameter("max_cloud_age_sec").as_double();
+    stamp_latency_comp_sec_ = std::max(0.0, get_parameter("stamp_latency_comp_sec").as_double());
     publish_ds_ = get_parameter("publish_ds_topic").as_bool();
 
     auto reliable = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
@@ -154,10 +167,12 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "C++ odin bridge %s -> l2=%s ds=%s max=%d pre=%d voxel=%.3f mid_dt<=%.3f age<=%.2f",
+      "C++ odin bridge %s -> l2=%s ds=%s max=%d pre=%d voxel=%.3f mid_dt<=%.3f "
+      "age<=%.2f stamp_comp=%.0fms",
       input_topic_.c_str(), l2_body_topic_.c_str(),
       publish_ds_ ? output_topic_.c_str() : "off",
-      max_points_, pre_decimate_max_, voxel_, mid_restamp_max_dt_, max_cloud_age_sec_);
+      max_points_, pre_decimate_max_, voxel_, mid_restamp_max_dt_, max_cloud_age_sec_,
+      stamp_latency_comp_sec_ * 1000.0);
   }
 
 private:
@@ -318,6 +333,10 @@ private:
 
     std_msgs::msg::Header header = msg->header;
     header.frame_id = "odin_lidar";
+    // Capture-approx stamp for Mid Bundle sync + densify pose match.
+    const double t_recv = stamp_sec(msg->header.stamp);
+    const double t_cap = t_recv - stamp_latency_comp_sec_;
+    header.stamp = sec_to_stamp(t_cap);
     auto cloud = make_xyzit(header, pts);
 
     if (pub_ds_) {
@@ -330,7 +349,7 @@ private:
     bool have_mid = false;
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      have_mid = match_causal_mid(stamp_sec(msg->header.stamp), mid_pose, tag);
+      have_mid = match_causal_mid(t_cap, mid_pose, tag);
       last_l2_match_ = tag;
     }
 
@@ -338,7 +357,7 @@ private:
       if (have_mid) {
         if (pub_l2_mid_) {
           geometry_msgs::msg::PoseStamped ps;
-          ps.header.stamp = msg->header.stamp;  // geometry stamp
+          ps.header.stamp = header.stamp;  // capture-approx stamp
           ps.header.frame_id = "map";
           ps.pose = mid_pose;
           pub_l2_mid_->publish(ps);
@@ -371,6 +390,7 @@ private:
   int pre_decimate_max_ = 2000;
   double min_confidence_ = 30.0;
   double mid_restamp_max_dt_ = 0.12;
+  double stamp_latency_comp_sec_ = 0.15;
   double max_cloud_age_sec_ = 0.25;
   bool publish_ds_ = true;
 

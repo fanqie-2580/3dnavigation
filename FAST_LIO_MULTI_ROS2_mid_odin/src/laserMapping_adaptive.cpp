@@ -202,6 +202,9 @@ double lidar2_residual_cov_scale = 25.0;
 double lidar2_max_residual = 0.12;
 // If false: Odin still updates IEKF (tight couple) but never enters ikdtree.
 bool lidar2_map_insert_en = false;
+// Skip Odin → ikdtree while |ω| high (stamp residual / extrinsic smear).
+// IEKF point update can stay on; only map insert is gated.
+double lidar2_map_insert_gyr_gate = 0.25;
 // True only after a successful Stage2 Odin update this frame (gates map insert).
 bool last_odin_iekf_ok = false;
 long long n_skip_l2_sync = 0;
@@ -1000,8 +1003,11 @@ void map_incremental()
             feats_down_body->points[i].intensity >= kOdinIntensityTag ||
             (!bundle_enabled && current_lidar_num == 2);
         // Tight-couple pose via residuals, but keep Mid map clean unless enabled.
+        // Still-ish insert: fast yaw often pairs Odin with a slightly wrong Mid.
         if (is_odin_pt &&
-            (!lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok))
+            (!lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
+             (lidar2_map_insert_gyr_gate > 0.0 &&
+              last_imu_gyr_norm >= lidar2_map_insert_gyr_gate)))
             continue;
         const float bx = feats_down_body->points[i].x;
         const float by = feats_down_body->points[i].y;
@@ -1621,6 +1627,7 @@ public:
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.25);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
@@ -1705,6 +1712,7 @@ public:
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
+        this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.25);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
@@ -1851,6 +1859,8 @@ public:
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
+                 << " insert_gyr_gate=" << lidar2_map_insert_gyr_gate
+                 << "rad/s"
                  << endl
                  << endl;
             cout << "L2 wrt L1 TF: " << endl

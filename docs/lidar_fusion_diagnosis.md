@@ -469,6 +469,16 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | RViz | 主图 `/Laser_map`；`/cloud_odin_registered` 官方 Odin 实时；软 `/viz/accum_*` 默认关 |
 | 真值 | 地图=`/Laser_map`；位姿=`/Odometry`（IEKF）；densify 仅可选可视化 |
 
+### 10c. Odin 错位根因与修复（2026-11-12）
+
+**根因**：`use_host_ros_time:2` 使 Odin stamp≈USB 接收时刻（固有 ~150ms 晚于采集）。按 stamp 配 Mid → 运动/转向时用到**偏新的 Mid 位姿**，Odin 点被投影/进图到错误位置。
+
+| 修复 | 内容 |
+|------|------|
+| Bridge `stamp_latency_comp_sec=0.15` | L2/`l2_mid_pose` 改用 capture-approx stamp 再 causal 匹配 Mid |
+| `lidar2_map_insert_gyr_gate=0.25` | 转向时 Odin 不写 ikdtree（IEKF 仍可更新） |
+| `filter_size_surf=0.15` | `/Laser_map` 更密 |
+
 ### 11. C++ 降延时（2026-11-12）
 
 | 项 | 内容 |

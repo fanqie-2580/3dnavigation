@@ -25,11 +25,11 @@
       bundle_enabled_tic_thres: 10
 
     preprocess:
-      # Smaller leaf → denser /Laser_map (ikdtree). 0.4 looked too sparse in RViz.
-      filter_size_surf: 0.2
+      # Smaller leaf → denser /Laser_map (ikdtree).
+      filter_size_surf: 0.15
       point_filter_num: 2
-      # Odin is dense (~240x180); still stride, but keep more for map_insert.
-      point_filter_num2: 4
+      # Odin is dense (~240x180); lighter stride so more Odin enters map when still.
+      point_filter_num2: 2
       lidar_type: 1                   # Livox CustomMsg (Mid360)
       lidar_type2: 4                  # XYZ_ONLY / Odin1 PointCloud2 (+offset_time)
       scan_line: 4
@@ -72,10 +72,14 @@
       lidar2_pitch_gyr_gate: 0.0
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
-      lidar2_max_sync_dt: 0.08
+      # After bridge stamp_comp (~150ms), Mid↔Odin sync should be tighter.
+      lidar2_max_sync_dt: 0.10
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
       lidar2_map_insert_en: true
+      # Primary fix is bridge stamp_latency_comp (any motion, not just yaw).
+      # Optional hard gate for violent spins only; 0=off so slow walk still maps.
+      lidar2_map_insert_gyr_gate: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)

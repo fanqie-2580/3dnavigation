@@ -163,6 +163,8 @@ def generate_launch_description():
                     # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
+                    # USB receive stamp → capture-approx (use_host_ros_time=2).
+                    'stamp_latency_comp_sec': 0.15,
                     'publish_ds_topic': True,
                 }],
             )
