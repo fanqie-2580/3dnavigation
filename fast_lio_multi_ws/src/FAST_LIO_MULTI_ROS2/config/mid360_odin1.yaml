@@ -72,13 +72,12 @@
       lidar2_pitch_gyr_gate: 0.0
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
-      # After bridge stamp_comp (~150ms), Mid↔Odin sync should be tighter.
       lidar2_max_sync_dt: 0.10
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      lidar2_map_insert_en: true
-      # Primary fix is bridge stamp_latency_comp (any motion, not just yaw).
-      # Optional hard gate for violent spins only; 0=off so slow walk still maps.
+      # Still-frame Mid↔Odin wall NN~0.14m / ground Δz~-0.13m → extrinsic, not stamp.
+      # Keep Odin out of ikdtree until extrinsic verified (avoid double walls).
+      lidar2_map_insert_en: false
       lidar2_map_insert_gyr_gate: 0.0
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
@@ -103,9 +102,9 @@
       # gravity-leveled cloud_slam and dropped Ry(-13°) → stage-2 "No Effective
       # Points" + map_insert gated off + densify/IEKF extrinsic mismatch.
       extrinsic_L2_gravity_frame: false
-      extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.03169932]
+      # CAD T_z was 0.0317; still-frame ground Δz Odin-Mid ≈ -0.127m so raise T_z.
+      extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.1587]
       # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
-      # Keep CAD translation. (ICP -10.15° was pre-unproject; under-pitched ~3.6°.)
       extrinsic_R_L2_wrt_L1: [0.97437006, 0.0, -0.22495105,
                              0.0, 1.0, 0.0,
                              0.22495105, 0.0, 0.97437006]

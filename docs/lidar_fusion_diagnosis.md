@@ -479,6 +479,25 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | `lidar2_map_insert_gyr_gate=0.25` | 转向时 Odin 不写 ikdtree（IEKF 仍可更新） |
 | `filter_size_surf=0.15` | `/Laser_map` 更密 |
 
+
+### 10d. 运行时诊断：错位主因不是 stamp（2026-11-12）
+
+实测（静止、同 stamp Mid/Odin registered）：
+
+| 指标 | 值 | 含义 |
+|------|----|------|
+| Odin↔Mid NN med | ~0.14 m | 静止仍偏 → **外参/几何**，非运动配 Mid |
+| ground Δz (Odin−Mid) | ≈ −0.13 m | Odin 地面系统性偏低 |
+| `stamp_comp=0.15` 后 L2 delay | 0.15→0.32 s | **过度补偿**，观感更差 |
+| Bundle \|dt\| | 多在 60–90 ms | 时间同步本身尚可 |
+
+处理：
+
+1. `stamp_latency_comp_sec=0`（撤回）
+2. `lidar2_map_insert_en=false`（暂不进 ikdtree，防双墙）
+3. `extrinsic_T_L2_wrt_L1.z` CAD 0.032 → **0.159**（抵消地面 Δz）
+4. IEKF point update 仍开；确认对齐后再开 map_insert
+
 ### 11. C++ 降延时（2026-11-12）
 
 | 项 | 内容 |

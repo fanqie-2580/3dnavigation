@@ -127,7 +127,7 @@ def generate_launch_description():
                         'body_to_base_rpy': [0.0, -0.226893, 0.0],
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.1587],
                         'extrinsic_R_L2_wrt_L1': [
                             0.97437006, 0.0, -0.22495105,
                             0.0, 1.0, 0.0,
@@ -163,8 +163,9 @@ def generate_launch_description():
                     # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
-                    # USB receive stamp → capture-approx (use_host_ros_time=2).
-                    'stamp_latency_comp_sec': 0.15,
+                    # Live data: raw delay≈0.15s IS the stamp itself; extra
+                    # subtract made L2 0.32s old and Mid match worse. Keep 0.
+                    'stamp_latency_comp_sec': 0.0,
                     'publish_ds_topic': True,
                 }],
             )
@@ -286,7 +287,7 @@ def generate_launch_description():
                         'extrinsic_T': [-0.011, -0.02329, 0.04412],
                         'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                         'use_yaw_only_body': False,
-                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                        'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.1587],
                         'extrinsic_R_L2_wrt_L1': [
                             0.97437006, 0.0, -0.22495105,
                             0.0, 1.0, 0.0,
@@ -349,7 +350,7 @@ def generate_launch_description():
                             'restamp_scan_to_now': True,
                             'extrinsic_T': [-0.011, -0.02329, 0.04412],
                             'extrinsic_R': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                            'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.03169932],
+                            'extrinsic_T_L2_wrt_L1': [0.12157888, 0.00549610, 0.1587],
                             'extrinsic_R_L2_wrt_L1': [
                                 0.97437006, 0.0, -0.22495105,
                                 0.0, 1.0, 0.0,
