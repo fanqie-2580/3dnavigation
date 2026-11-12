@@ -200,6 +200,9 @@ double lidar2_vz_gate = 0.12;       // m/s |vz|; climbing
 double lidar2_pitch_gate_deg = 10.0; // |pitch| of Mid state
 // Reject L2 IEKF/bundle pair when |t_L2 - t_Mid| exceeds this (TCP lag gate).
 double lidar2_max_sync_dt = 0.08;
+// Soft-wait for late Odin before Mid-only (recover bridge lag without freezing).
+double lidar2_soft_wait_sec = 0.025;
+double bundle_mid_push_wall_ = -1.0;
 // Live (USB host stamp): L2 stamp is systematically earlier than Mid by ~60–80ms
 // at the same wall time. Add this to L2 when computing Bundle |dt| so pairing
 // centers near 0 instead of walking the max_sync edge.
@@ -834,14 +837,88 @@ bool sync_packages_bundle(MeasureGroup &meas)
 {
     if (multi_lidar)
     {
-        // Mid always advances (no wait/drop that freezes odom → snap).
-        // Attach Odin only when |(L2+bias)-Mid| <= tight_dt; else Mid-only and
-        // re-project last Odin body with current Mid pose for smooth viz.
+        // Mid always advances (no multi-100ms freeze). Soft-wait ~25ms for late
+        // Odin (bridge lag) before Mid-only; nearest L2 within half-period window.
+        // Prefer causal L2 to avoid early/late flip sawtooth.
         if (lidar_buffer.empty() || imu_buffer.empty()) {
             return false;
         }
         const double tight_dt =
-            (lidar2_max_sync_dt > 0.0) ? lidar2_max_sync_dt : 0.015;
+            (lidar2_max_sync_dt > 0.0) ? lidar2_max_sync_dt : 0.055;
+        const double soft_wait =
+            (lidar2_soft_wait_sec > 0.0) ? lidar2_soft_wait_sec : 0.0;
+        const auto wall_now = std::chrono::steady_clock::now().time_since_epoch();
+        const double wall_sec =
+            std::chrono::duration<double>(wall_now).count();
+
+        auto try_attach_odin = [&](bool &found_out, size_t &best_i_out,
+                                   double &best_dt_out) {
+            while (!time_buffer2.empty() &&
+                   (meas.lidar_beg_time -
+                    (time_buffer2.front() + lidar2_stamp_bias_sec)) > tight_dt)
+            {
+                lidar_buffer2.pop_front();
+                time_buffer2.pop_front();
+                n_skip_l2_sync++;
+            }
+            found_out = false;
+            best_i_out = 0;
+            best_dt_out = 1e9;
+            double best_score = 1e9;
+            for (size_t i = 0; i < time_buffer2.size(); i++)
+            {
+                const double signed_dt =
+                    (time_buffer2[i] + lidar2_stamp_bias_sec) - meas.lidar_beg_time;
+                const double dt = std::fabs(signed_dt);
+                if (dt > tight_dt)
+                    continue;
+                const double score = dt + ((signed_dt > 0.0) ? 0.008 : 0.0);
+                if (score < best_score)
+                {
+                    best_score = score;
+                    best_dt_out = dt;
+                    best_i_out = i;
+                    found_out = true;
+                }
+            }
+        };
+
+        auto fill_odin_meas = [&](size_t best_i, double best_dt) {
+            meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
+            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
+            meas.lidar_beg_time2 = time_buffer2[best_i];
+            double odin_span = 0.0;
+            for (const auto &pt : meas.lidar2->points)
+                odin_span =
+                    std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
+            if (odin_span > 1e-4)
+            {
+                scan_num2++;
+                lidar_mean_scantime2 +=
+                    (odin_span - lidar_mean_scantime2) / scan_num2;
+            }
+            else if (lidar_mean_scantime2 > 1e-4)
+                odin_span = lidar_mean_scantime2;
+            else
+                odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            lidar_end_time2 = meas.lidar_beg_time + odin_span;
+            if (lidar_end_time2 < lidar_end_time)
+                lidar_end_time2 = lidar_end_time;
+            meas.lidar_end_time2 = lidar_end_time2;
+            bundle_pair_index_ = best_i;
+            bundle_pair_dt_ = best_dt;
+        };
+
+        auto fill_mid_only = [&](bool count_skip) {
+            if (count_skip)
+                n_skip_l2_sync++;
+            meas.lidar2.reset(new PointCloudXYZI());
+            meas.lidar_beg_time2 = meas.lidar_beg_time;
+            lidar_end_time2 = lidar_end_time;
+            meas.lidar_end_time2 = lidar_end_time2;
+            bundle_pair_index_ = 0;
+            bundle_pair_dt_ = -1.0;
+        };
 
         if (!lidar_pushed)
         {
@@ -869,72 +946,49 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
             meas.lidar_end_time = lidar_end_time;
 
-            // Drop L2 frames that are hopelessly older than this Mid.
-            while (!time_buffer2.empty() &&
-                   (meas.lidar_beg_time -
-                    (time_buffer2.front() + lidar2_stamp_bias_sec)) > tight_dt)
-            {
-                lidar_buffer2.pop_front();
-                time_buffer2.pop_front();
-                n_skip_l2_sync++;
-            }
-
+            bool found = false;
             size_t best_i = 0;
             double best_dt = 1e9;
-            bool found = false;
-            for (size_t i = 0; i < time_buffer2.size(); i++)
-            {
-                const double dt = std::fabs(
-                    (time_buffer2[i] + lidar2_stamp_bias_sec) - meas.lidar_beg_time);
-                if (dt > tight_dt)
-                    continue;
-                if (dt < best_dt)
-                {
-                    best_dt = dt;
-                    best_i = i;
-                    found = true;
-                }
-            }
+            try_attach_odin(found, best_i, best_dt);
+            if (found)
+                fill_odin_meas(best_i, best_dt);
+            else
+                fill_mid_only(false); // provisional; soft-wait may still attach
 
+            publish_lidar_time = lidar_end_time;
+            bundle_mid_push_wall_ = wall_sec;
+            lidar_pushed = true;
+        }
+
+        // Soft-wait: Mid selected but no Odin yet — hold Mid briefly for late L2.
+        if (bundle_pair_dt_ < 0.0)
+        {
+            bool found = false;
+            size_t best_i = 0;
+            double best_dt = 1e9;
+            try_attach_odin(found, best_i, best_dt);
             if (found)
             {
-                meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
-                pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
-                meas.lidar_beg_time2 = time_buffer2[best_i];
-                double odin_span = 0.0;
-                for (const auto &pt : meas.lidar2->points)
-                    odin_span =
-                        std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
-                if (odin_span > 1e-4)
-                {
-                    scan_num2++;
-                    lidar_mean_scantime2 +=
-                        (odin_span - lidar_mean_scantime2) / scan_num2;
-                }
-                else if (lidar_mean_scantime2 > 1e-4)
-                    odin_span = lidar_mean_scantime2;
-                else
-                    odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-                lidar_end_time2 = meas.lidar_beg_time + odin_span;
-                if (lidar_end_time2 < lidar_end_time)
-                    lidar_end_time2 = lidar_end_time;
-                meas.lidar_end_time2 = lidar_end_time2;
-                bundle_pair_index_ = best_i;
-                bundle_pair_dt_ = best_dt;
+                fill_odin_meas(best_i, best_dt);
             }
             else
             {
-                n_skip_l2_sync++;
-                meas.lidar2.reset(new PointCloudXYZI());
-                meas.lidar_beg_time2 = meas.lidar_beg_time;
-                lidar_end_time2 = lidar_end_time;
-                meas.lidar_end_time2 = lidar_end_time2;
-                bundle_pair_index_ = 0;
-                bundle_pair_dt_ = -1.0; // Mid-only this tick
+                bool worth_waiting = soft_wait > 0.0 && time_buffer2.empty();
+                if (soft_wait > 0.0 && !time_buffer2.empty())
+                {
+                    const double latest =
+                        time_buffer2.back() + lidar2_stamp_bias_sec;
+                    // Newer L2 may still arrive closer to this Mid.
+                    if (latest < meas.lidar_beg_time + tight_dt)
+                        worth_waiting = true;
+                }
+                if (worth_waiting &&
+                    (wall_sec - bundle_mid_push_wall_) < soft_wait)
+                {
+                    return false; // keep Mid unpushed from consumer POV
+                }
+                fill_mid_only(true); // commit Mid-only after wait / no hope
             }
-
-            publish_lidar_time = lidar_end_time;
-            lidar_pushed = true;
         }
 
         if (last_timestamp_imu < lidar_end_time || last_timestamp_imu < lidar_end_time2)
@@ -1685,6 +1739,7 @@ public:
         this->declare_parameter<std::string>("mapping.odin_odom_topic", "/odin1/odometry");
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
+        this->declare_parameter<double>("mapping.lidar2_soft_wait_sec", 0.025);
         this->declare_parameter<double>("mapping.lidar2_stamp_bias_sec", 0.065);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
@@ -1772,6 +1827,7 @@ public:
         this->get_parameter_or("mapping.odin_odom_topic", odin_odom_topic, std::string("/odin1/odometry"));
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
+        this->get_parameter_or("mapping.lidar2_soft_wait_sec", lidar2_soft_wait_sec, 0.025);
         this->get_parameter_or("mapping.lidar2_stamp_bias_sec", lidar2_stamp_bias_sec, 0.065);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
@@ -1923,6 +1979,7 @@ public:
                  << " pose_factor=" << (lidar2_pose_factor_en ? "true" : "false")
                  << " pose_alpha=" << lidar2_pose_alpha
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
+                 << " soft_wait=" << lidar2_soft_wait_sec * 1000.0 << "ms"
                  << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"

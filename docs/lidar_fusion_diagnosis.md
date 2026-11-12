@@ -508,10 +508,11 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 | 修复 | |
 |------|--|
-| **Mid 不停** | 每帧处理 Mid；仅 `|dt|≤30ms` 时挂上 Odin 紧耦合（等齐曾卡住 0.5s+ → 跳变） |
-| Mid-only 间隙 | `/cloud_odin_registered` 用**当前 Mid 位姿**重投影上一帧 Odin body（不冻结） |
-| deskew | 紧配对时用 `(L2+bias−Mid)+offset` |
-| 验证 | Odin Δt max ~200ms（原 wait-align ~600ms）；couple_rate 随窗口 15→30ms 提高 |
+| **Mid 不停** | 每帧处理 Mid；半周期 `|dt|≤55ms` + **soft_wait≤25ms** 等晚到 Odin |
+| Mid-only 间隙 | Odin 源本身 ~6–8Hz 空洞 / 超窗；hold 重投影保 viz |
+| deskew | `(L2+bias−Mid)+offset`；配对偏好因果 L2 |
+| 其余帧根因 | ① Odin 输入不稳 ~6–8Hz（非真 10Hz）② bridge 常比 Mid 晚到，不候就错过 ③ 旧硬门 30ms 丢相位差 |
+| 可解部分 | soft-wait 捞晚到帧；不可解：Odin 没出云的空洞（上限≈f_odin/f_mid） |
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
