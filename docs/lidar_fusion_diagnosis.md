@@ -500,6 +500,18 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | `set_lidar2_stamp_bias` | 与 Bundle 同一参数 |
 | `lidar2_map_insert_en=true` | Bundle \|dt\|≤40ms 且 IEKF ok 时写 `/Laser_map` |
 
+### 10j. Bundle 残差锯齿灌进 deskew（2026-11-12 运行数据）
+
+**现象（本轮日志）**：`Bundle dt` 持续 **0→50ms 锯齿**；静止 `|wz|≈0` 时 Kabsch 仍可跳数度；用户仍报先错后跳变。
+
+**根因**：把 Bundle 残差 `ε=(L2+bias)−Mid` 写进 deskew 后，相位漂移使 ε 来回翻 → `ω·Δε` 几何跳变。绝对最近邻配对会在偏早/偏晚间切换。
+
+| 修复 | |
+|------|--|
+| deskew | **忽略** Bundle stamp 残差；Odin `offset` **中心对齐**到 Mid scan（杀 ω·ε 跳变） |
+| 配对 | 仍用最近邻 `(L2+bias)≈Mid`（纯因果曾导致 ~50% Mid-only，Odin 闪断更像跳变） |
+| IEKF/写图 | `bundle_dt≤30ms` 才 Stage2 / map_insert；显示帧仍带 Odin |
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
