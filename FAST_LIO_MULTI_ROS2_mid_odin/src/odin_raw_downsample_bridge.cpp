@@ -122,9 +122,12 @@ public:
     declare_parameter<double>("min_confidence", 30.0);
     declare_parameter<double>("mid_restamp_max_dt", 0.12);
     declare_parameter<double>("max_cloud_age_sec", 0.25);
-    // use_host_ros_time=2 stamps receive time (~150ms after capture). Subtract
-    // so Bundle/densify Mid match uses pose near Odin capture, not receive.
-    declare_parameter<double>("stamp_latency_comp_sec", 0.15);
+    // Do NOT rewrite L2 cloud stamp (Bundle must stay on receive-time domain).
+    declare_parameter<double>("stamp_latency_comp_sec", 0.0);
+    // Densify-only: USB stamp is receive≈capture+150ms. Match Mid at capture
+    // for /odin1/l2_mid_pose content, but keep pose header stamp == L2 stamp
+    // so densify lookup still hits. Fixes turn left/right swing on cloud_in_map.
+    declare_parameter<double>("densify_mid_lag_comp_sec", 0.15);
     declare_parameter<bool>("publish_ds_topic", true);
 
     input_topic_ = get_parameter("input_topic").as_string();
@@ -140,6 +143,8 @@ public:
     mid_restamp_max_dt_ = get_parameter("mid_restamp_max_dt").as_double();
     max_cloud_age_sec_ = get_parameter("max_cloud_age_sec").as_double();
     stamp_latency_comp_sec_ = std::max(0.0, get_parameter("stamp_latency_comp_sec").as_double());
+    densify_mid_lag_comp_sec_ =
+      std::max(0.0, get_parameter("densify_mid_lag_comp_sec").as_double());
     publish_ds_ = get_parameter("publish_ds_topic").as_bool();
 
     auto reliable = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
@@ -168,11 +173,11 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "C++ odin bridge %s -> l2=%s ds=%s max=%d pre=%d voxel=%.3f mid_dt<=%.3f "
-      "age<=%.2f stamp_comp=%.0fms",
+      "age<=%.2f stamp_comp=%.0fms densify_mid_lag=%.0fms",
       input_topic_.c_str(), l2_body_topic_.c_str(),
       publish_ds_ ? output_topic_.c_str() : "off",
       max_points_, pre_decimate_max_, voxel_, mid_restamp_max_dt_, max_cloud_age_sec_,
-      stamp_latency_comp_sec_ * 1000.0);
+      stamp_latency_comp_sec_ * 1000.0, densify_mid_lag_comp_sec_ * 1000.0);
   }
 
 private:
@@ -333,10 +338,12 @@ private:
 
     std_msgs::msg::Header header = msg->header;
     header.frame_id = "odin_lidar";
-    // Capture-approx stamp for Mid Bundle sync + densify pose match.
+    // Keep receive-time stamp for Bundle (same domain as before). Optional
+    // stamp_latency_comp_sec rewrites L2 stamp — leave 0 unless experimenting.
     const double t_recv = stamp_sec(msg->header.stamp);
-    const double t_cap = t_recv - stamp_latency_comp_sec_;
-    header.stamp = sec_to_stamp(t_cap);
+    const double t_l2 =
+      (stamp_latency_comp_sec_ > 0.0) ? (t_recv - stamp_latency_comp_sec_) : t_recv;
+    header.stamp = sec_to_stamp(t_l2);
     auto cloud = make_xyzit(header, pts);
 
     if (pub_ds_) {
@@ -344,29 +351,29 @@ private:
       ++n_pub_;
     }
 
+    // Densify Mid pose at capture-approx time; header stamp stays = L2 stamp.
+    const double t_pose = t_l2 - densify_mid_lag_comp_sec_;
     geometry_msgs::msg::Pose mid_pose;
     std::string tag;
     bool have_mid = false;
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      have_mid = match_causal_mid(t_cap, mid_pose, tag);
+      have_mid = match_causal_mid(t_pose, mid_pose, tag);
       last_l2_match_ = tag;
     }
 
     if (pub_l2_) {
-      if (have_mid) {
-        if (pub_l2_mid_) {
-          geometry_msgs::msg::PoseStamped ps;
-          ps.header.stamp = header.stamp;  // capture-approx stamp
-          ps.header.frame_id = "map";
-          ps.pose = mid_pose;
-          pub_l2_mid_->publish(ps);
-        }
-        pub_l2_->publish(cloud);
-        ++n_l2_pub_;
+      // Always publish L2 for Bundle IEKF (stamp domain = receive).
+      pub_l2_->publish(cloud);
+      ++n_l2_pub_;
+      if (have_mid && pub_l2_mid_) {
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header.stamp = header.stamp;  // == L2 stamp for densify lookup
+        ps.header.frame_id = "map";
+        ps.pose = mid_pose;              // Mid @ capture-approx
+        pub_l2_mid_->publish(ps);
       } else {
-        ++n_skip_l2_sync_;
-        // Official: drop unmatched L2 (do not publish with future Mid).
+        ++n_skip_l2_sync_;  // densify pose miss only
       }
     }
   }
@@ -390,7 +397,8 @@ private:
   int pre_decimate_max_ = 2000;
   double min_confidence_ = 30.0;
   double mid_restamp_max_dt_ = 0.12;
-  double stamp_latency_comp_sec_ = 0.15;
+  double stamp_latency_comp_sec_ = 0.0;
+  double densify_mid_lag_comp_sec_ = 0.15;
   double max_cloud_age_sec_ = 0.25;
   bool publish_ds_ = true;
 

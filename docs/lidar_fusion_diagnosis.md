@@ -480,6 +480,17 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | `filter_size_surf=0.15` | `/Laser_map` 更密 |
 
 
+### 10e. 转动时 Odin 左右摆（2026-11-12）
+
+RViz `Odin1_Realtime` 原订阅 densify `/odin1/cloud_in_map`：整帧用**一个** Mid 位姿投影。  
+`use_host_ros_time=2` 下 stamp≈接收时刻（晚于采集 ~150ms）→ 按 stamp 取 Mid = 转过头的姿态 → 角速度×时延形成偏航误差；左右转时误差反向 → **左右摆**。
+
+| 处理 | 说明 |
+|------|------|
+| `densify_mid_lag_comp_sec=0.15` | 仅 densify 的 Mid 位姿按采集时刻匹配；**不改** L2 stamp（Bundle 仍用接收域） |
+| densify 转动时不发 live | 避免残余摆动；转动看 `/cloud_odin_registered` |
+| RViz Odin1_Realtime | 改订 `/cloud_odin_registered`（IEKF undistort） |
+
 ### 10d. 运行时诊断：错位主因不是 stamp（2026-11-12）
 
 实测（静止、同 stamp Mid/Odin registered）：

@@ -240,7 +240,8 @@ private:
         best = &e.second;
       }
     }
-    if (best && best_dt <= 0.05) {
+    // Allow up to 120ms: densify pose is stamped with L2 receive time.
+    if (best && best_dt <= 0.12) {
       T_out = *best;
       return true;
     }
@@ -305,29 +306,31 @@ private:
     }
     if (out.empty()) return;
 
-    std_msgs::msg::Header h;
-    h.frame_id = map_frame_;
-    if (restamp_now_) {
-      const int64_t ns = now().nanoseconds();
-      h.stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
-      h.stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
+    // Hold live densify while turning — single Mid pose × whole frame swings.
+    // Official turn view: /cloud_odin_registered (IEKF undistort).
+    const double yaw_lim = (accum_max_yaw_ > 0.0) ? accum_max_yaw_ : still_yaw_rate_;
+    const bool turning =
+      (yaw_lim > 0.0 && yaw_rate_deg_ > yaw_lim) ||
+      (still_trans_vel_ > 0.0 && trans_vel_ > still_trans_vel_);
+    if (!turning) {
+      std_msgs::msg::Header h;
+      h.frame_id = map_frame_;
+      if (restamp_now_) {
+        const int64_t ns = now().nanoseconds();
+        h.stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
+        h.stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
+      } else {
+        h.stamp = msg->header.stamp;
+      }
+      pub_scan_->publish(make_xyz(h, out));
+      ++n_pub_;
     } else {
-      h.stamp = msg->header.stamp;
+      ++n_skip_accum_;
     }
-    pub_scan_->publish(make_xyz(h, out));
-    ++n_pub_;
 
     // Still-only keep-first accum (soft viz; official map = C++ ikdtree).
-    const double yaw_lim = (accum_max_yaw_ > 0.0) ? accum_max_yaw_ : still_yaw_rate_;
     if ((now().seconds() - t0_) < accum_skip_sec_) return;
-    if (yaw_lim > 0.0 && yaw_rate_deg_ > yaw_lim) {
-      ++n_skip_accum_;
-      return;
-    }
-    if (still_trans_vel_ > 0.0 && trans_vel_ > still_trans_vel_) {
-      ++n_skip_accum_;
-      return;
-    }
+    if (turning) return;
 
     const double inv = 1.0 / voxel_;
     std::lock_guard<std::mutex> lk(mtx_accum_);

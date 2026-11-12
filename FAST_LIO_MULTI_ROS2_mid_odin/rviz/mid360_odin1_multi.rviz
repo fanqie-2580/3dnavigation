@@ -171,7 +171,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /odin1/cloud_in_map
+        Value: /cloud_odin_registered
       Use Fixed Frame: true
       Use rainbow: false
       Value: true

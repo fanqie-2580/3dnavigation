@@ -163,9 +163,9 @@ def generate_launch_description():
                     # Causal Mid only (matches mapping.lidar2_max_sync_dt window).
                     'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
-                    # Live data: raw delay≈0.15s IS the stamp itself; extra
-                    # subtract made L2 0.32s old and Mid match worse. Keep 0.
+                    # Keep L2 stamp = receive (Bundle). Densify Mid pose lagged.
                     'stamp_latency_comp_sec': 0.0,
+                    'densify_mid_lag_comp_sec': 0.15,
                     'publish_ds_topic': True,
                 }],
             )
