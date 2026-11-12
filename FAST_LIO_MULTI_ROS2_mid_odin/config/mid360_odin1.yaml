@@ -57,11 +57,10 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Tight couple: Mid stage-1 + Odin stage-2 point residuals in same IEKF.
-      # Pose-factor (Odin /odometry soft pull) stays off — it yanked Mid TF on turns.
+      # Full tight couple (Odin densify lag is low): point IEKF + pose-factor + map insert.
       lidar2_update_en: true
       lidar2_point_update_en: true
-      lidar2_pose_factor_en: false
+      lidar2_pose_factor_en: true
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
       odin_odom_topic: "/odin1/odometry"
@@ -70,11 +69,9 @@
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
       lidar2_max_sync_dt: 0.08
-      # Weak Odin R (×50) so L2 cannot yank Mid; lower toward 10–20 after extrinsic OK.
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      # Keep Mid-only ikdtree until L2 extrinsic is trusted.
-      lidar2_map_insert_en: false
+      lidar2_map_insert_en: true
 
       # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
       # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
