@@ -409,6 +409,20 @@ Bridge 重发布 L2 时保留 `offset_time`（s）；若字段丢失则填 0 →
 机器人稍动 → 橙色 live 相对融合图墙体滑动，表现为「融合图上 Odin 在晃」。  
 修复：关闭 motion_sync，live 与 accum 共用同一 deadband 后的 stamp Mid 位姿。
 
+### 补充：AccumFused 双墙（2026-11-12）
+
+静止外参网格（pitch/yaw/xy）只能把 live NN 从 ~10.9 cm 降到 ~10.1 cm → **CAD Ry(−13°) 不是主因**。  
+同场实测：
+
+| 云 | vs Mid NN p50 |
+|----|----------------|
+| `/odin1/cloud_in_map` (live) | ~11 cm |
+| `/viz/accum_odin` | **~26 cm** |
+| `/viz/accum_fused` | **~22 cm** |
+
+**根因**：densify `hold_trans=0.03`/`hold_rot=1.2°`/`α=0.06` 让 Odin 投影 Mid 落后于 `/cloud_registered`；keep-first voxel 把这段错位永久写进 accum → RViz 双墙。  
+**修复**：hold=0、α=1（与 Mid 1:1）；`accum_max_yaw_rate_deg` 25→12；清空 `/odin_independent_accum/clear_accum` 与 fuse `~/clear_accum`。
+
 
 
 ---

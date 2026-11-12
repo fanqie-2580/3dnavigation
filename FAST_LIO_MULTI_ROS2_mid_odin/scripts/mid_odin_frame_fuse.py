@@ -28,6 +28,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
 
 
@@ -213,6 +214,7 @@ class MidOdinFrameFuse(Node):
             )
         period = float(self.get_parameter('accum_period').value)
         self.create_timer(max(0.2, period), self.publish_accum)
+        self.create_service(Trigger, '~/clear_accum', self.on_clear)
 
         mode = 'already-in-map' if self.odin_already_in_map else 'TF(map←odin_map)'
         self.get_logger().info(
@@ -246,6 +248,18 @@ class MidOdinFrameFuse(Node):
 
     def _accum_ready(self) -> bool:
         return (time.time() - self._t0) >= self.accum_skip_sec
+
+    def on_clear(self, _req, resp):
+        self._mid_voxel.clear()
+        self._odin_voxel.clear()
+        self._mid_accum = None
+        self._odin_accum_ext = None
+        self._have_ext_mid_accum = False
+        self._n_mid_voxel = 0
+        self._t0 = time.time()
+        resp.success = True
+        resp.message = 'cleared mid+odin fuse accum voxels'
+        return resp
 
     def _lookup_T(self) -> Optional[np.ndarray]:
         try:

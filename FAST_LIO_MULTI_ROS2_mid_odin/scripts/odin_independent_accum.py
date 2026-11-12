@@ -975,7 +975,18 @@ class OdinIndependentAccum(Node):
         self._accum_locked(out)
 
     def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
-        """Hold densify Mid pose under TF-like deadband; soft-track above it."""
+        """Hold densify Mid pose under TF-like deadband; soft-track above it.
+
+        hold_trans=hold_rot=0 and alpha≈1 → pass-through (must match Mid live;
+        otherwise keep-first accum locks Mid–Odin double walls forever).
+        """
+        if (
+            self.densify_hold_trans <= 0.0
+            and self.densify_hold_rot_deg <= 0.0
+            and self.densify_track_alpha >= 0.999
+        ):
+            self._hold_T_mid = T_locked.copy()
+            return self._hold_T_mid
         if self._hold_T_mid is None:
             self._hold_T_mid = T_locked.copy()
             return self._hold_T_mid

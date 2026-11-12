@@ -363,13 +363,16 @@ def generate_launch_description():
                         'latest_mid_min_yaw_rate_deg': 8.0,
                         'still_trans_vel': 0.05,
                         'still_yaw_rate_deg': 3.0,
-                        # Hold Mid IEKF noise for densify + warp T_dst (match TF feel).
-                        'densify_hold_trans': 0.03,
-                        'densify_hold_rot_deg': 1.2,
-                        'densify_track_alpha': 0.06,
+                        # OFF: deadband held densify Mid while /cloud_registered moved →
+                        # live Odin lagged Mid and keep-first voxels locked ~20cm double walls
+                        # into /viz/accum_odin (live NN~11cm, accum NN~26cm). Track 1:1.
+                        'densify_hold_trans': 0.0,
+                        'densify_hold_rot_deg': 0.0,
+                        'densify_track_alpha': 1.0,
                         'deskew_odin': True,
                         'restamp_scan_to_now': True,
-                        'accum_max_yaw_rate_deg': 25.0,
+                        # Tighter: keep-first voxels permanently store turn smear.
+                        'accum_max_yaw_rate_deg': 12.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',
                         'imu_to_lidar_xyz': [-0.02663, 0.03447, 0.02174],
                         'imu_to_lidar_rpy_deg': [0.0, 0.0, 0.0],
