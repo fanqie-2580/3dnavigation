@@ -934,21 +934,16 @@ class OdinIndependentAccum(Node):
         ):
             arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
 
-        # Accum: stamp-locked Mid (stable voxels; no latest-Mid paint on turns).
-        T_accum = self._ema_mid_pose(T_locked)
-        T_map_acc = T_accum @ self.T_body_odin_lidar
-        out_acc = (arr @ T_map_acc[:3, :3].T) + T_map_acc[:3, 3]
-        self._accum_locked(out_acc)
-
-        # Live: soft-track *latest* Mid (same timeline as /cloud_registered), with
-        # deadband. Stamp-locked live lagged Mid then snapped when leaving the
-        # hold gate — felt like huge shake on slight motion.
-        T_live_src = self._mid_T if self._mid_T is not None else T_locked
-        T_live = self._deadband_densify_pose(T_live_src)
+        # ROOT CAUSE FIX: Odin L2 geometry stamp lags receive by ~200–300ms.
+        # Painting that cloud with *latest* Mid pose makes it swing on any motion
+        # (δθ ≈ ω·Δt; at 5°/s × 0.28s ≈ 1.4° → ~12cm @5m). Always project with
+        # stamp-locked Mid; live then SE3-warps to current Mid (motion_sync).
+        T_stamp = self._deadband_densify_pose(self._ema_mid_pose(T_locked))
+        T_map = T_stamp @ self.T_body_odin_lidar
+        out = (arr @ T_map[:3, :3].T) + T_map[:3, 3]
         self._n_locked_viz += 1
-        T_map_live = T_live @ self.T_body_odin_lidar
-        out_live = (arr @ T_map_live[:3, :3].T) + T_map_live[:3, 3]
-        self._publish_live(msg.header.stamp, out_live)
+        self._publish_live(msg.header.stamp, out)  # warps if motion_sync_to_mid
+        self._accum_locked(out)  # accum stays at stamp pose (no warp)
 
     def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
         """Hold densify Mid pose under TF-like deadband; soft-track above it."""
@@ -970,11 +965,11 @@ class OdinIndependentAccum(Node):
         return self._hold_T_mid
 
     def _publish_live(self, stamp, out_live_pts: np.ndarray) -> None:
+        # Warp stamp-projected map points to latest Mid (correct for delayed geom).
         t_cloud = stamp_sec(stamp)
-        out_live, sync_stamp, _sync_dt = self._warp_to_latest_mid(out_live_pts, t_cloud)
-        if sync_stamp is not None:
-            pub_stamp = self.get_clock().now().to_msg()
-        elif self.restamp_scan_to_now and self.project_with_mid:
+        out_live, sync_stamp, sync_dt = self._warp_to_latest_mid(out_live_pts, t_cloud)
+        self._last_sync_dt = sync_dt
+        if sync_stamp is not None or (self.restamp_scan_to_now and self.project_with_mid):
             pub_stamp = self.get_clock().now().to_msg()
         else:
             pub_stamp = stamp
@@ -986,6 +981,7 @@ class OdinIndependentAccum(Node):
             self._n_pub += 1
 
     def _accum_locked(self, out: np.ndarray) -> None:
+        # IMPORTANT: `out` must be stamp-pose projected (not motion-synced live).
         if (time.time() - self._t0) < self.accum_skip_sec:
             return
         if (

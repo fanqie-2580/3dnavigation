@@ -348,9 +348,10 @@ def generate_launch_description():
                         'align_mode': 'off' if not use_ct else 'yaw',
                         'align_delay_sec': 2.0,
                         'odom_pair_max_dt': 0.50,
-                        'motion_sync_to_mid': False,
-                        'motion_sync_min_trans': 0.02,
-                        'motion_sync_min_rot_deg': 0.5,
+                        # Warp stamp-projected Odin to latest Mid (L2 geom ~0.25s old).
+                        'motion_sync_to_mid': True,
+                        'motion_sync_min_trans': 0.015,
+                        'motion_sync_min_rot_deg': 0.35,
                         'mid_wall_pair_max_dt': 0.20,
                         # Accum always stamp-locked; latest Mid only when moving (see gates).
                         'mid_pose_lookback_sec': 0.0,
