@@ -408,17 +408,36 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   last_lidar_end_time_ = pcl_end_time;
 
   // Deskew one cloud: point time = lidar_beg_offset + curvature_ms/1000, relative to pcl_beg.
+  // Supports t < 0 (Odin USB header earlier than Mid beg after header remap).
   auto deskew_cloud = [&](PointCloudXYZI &cloud, const double lidar_beg_time)
   {
     if (cloud.points.empty() || IMUpose.size() <= 1)
       return;
     const double beg_off = lidar_beg_time - pcl_beg_time;
-    // Work on indices sorted by absolute point time (do not mutate curvature).
     std::vector<int> order(cloud.points.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
       return cloud.points[a].curvature < cloud.points[b].curvature;
     });
+
+    auto apply_pose = [&](PointType &pt, const double t,
+                          const M3D &R0, const V3D &pos0, const V3D &vel0,
+                          const V3D &acc0, const V3D &gyr0, const double t0) {
+      dt = t - t0;
+      if (std::fabs(dt) > kMaxUndistortDt)
+        return;
+      M3D R_i(R0 * Exp(gyr0, dt));
+      V3D P_i(pt.x, pt.y, pt.z);
+      V3D T_ei(pos0 + vel0 * dt + 0.5 * acc0 * dt * dt - imu_state.pos);
+      V3D P_compensate =
+          imu_state.offset_R_L_I.conjugate() *
+          (imu_state.rot.conjugate() *
+               (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) -
+           imu_state.offset_T_L_I);
+      pt.x = P_compensate(0);
+      pt.y = P_compensate(1);
+      pt.z = P_compensate(2);
+    };
 
     size_t idx = order.size();
     for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
@@ -438,46 +457,51 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
         if (t <= head->offset_time)
           break;
         --idx;
-        dt = t - head->offset_time;
-        // Invalid relative time → skip compensation (keep raw lidar point).
-        if (std::fabs(dt) > kMaxUndistortDt)
-          continue;
-        M3D R_i(R_imu * Exp(angvel_avr, dt));
-        V3D P_i(pt.x, pt.y, pt.z);
-        V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
-        V3D P_compensate =
-            imu_state.offset_R_L_I.conjugate() *
-            (imu_state.rot.conjugate() *
-                 (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) -
-             imu_state.offset_T_L_I);
-        pt.x = P_compensate(0);
-        pt.y = P_compensate(1);
-        pt.z = P_compensate(2);
+        apply_pose(pt, t, R_imu, pos_imu, vel_imu, acc_imu, angvel_avr, head->offset_time);
+      }
+    }
+
+    // Remaining points have t <= IMUpose.front() (typically Mid beg = 0).
+    // Back-propagate with front pose + its gyro (negative dt).
+    if (idx > 0)
+    {
+      auto head = IMUpose.begin();
+      R_imu << MAT_FROM_ARRAY(head->rot);
+      vel_imu << VEC_FROM_ARRAY(head->vel);
+      pos_imu << VEC_FROM_ARRAY(head->pos);
+      acc_imu << VEC_FROM_ARRAY(head->acc);
+      angvel_avr << VEC_FROM_ARRAY(head->gyr);
+      for (size_t i = 0; i < idx; i++)
+      {
+        PointType &pt = cloud.points[order[i]];
+        const double t = beg_off + static_cast<double>(pt.curvature) / 1000.0;
+        apply_pose(pt, t, R_imu, pos_imu, vel_imu, acc_imu, angvel_avr, head->offset_time);
       }
     }
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // Odin offset_time spans ~0..100ms WITHIN the frame → need intra-frame
-  // deskew. USB header must NOT be the absolute Mid time base (swing/snap),
-  // so deskew on Mid beg. Bundle uses lidar2_stamp_bias≈65ms so Mid≈L2+bias.
-  // Residual: Odin body is still ~bias earlier than Mid → whole-frame Exp(-ω·bias).
-  constexpr double kOdinStampBias = 0.065; // keep in sync with lidar2_stamp_bias_sec
+
+  // Odin: offset_time is relative to DEVICE frame start; header is USB receive.
+  // Absolute point time ≈ header + offset. Map onto Mid timeline BEFORE deskew:
+  //   t_rel = (L2_header - Mid_beg) + offset
+  // Bundle pairs with stamp_bias so Mid_beg ≈ L2_header + ~65ms → t_rel ∈ ~[-65ms, +30ms].
+  // Do NOT deskew as Mid_beg+offset then slap on Exp(-ω·bias) — that is not a time shift
+  // and causes wrong-then-snap (error ∝ |ω|, vanishes when ω→0).
   if (!pcl_2_out.points.empty())
   {
-    deskew_cloud(pcl_2_out, meas.lidar_beg_time);
-    if (kOdinStampBias > 1e-4 && angvel_last.norm() > 1e-4)
+    const double header_off = meas.lidar_beg_time2 - meas.lidar_beg_time;
+    for (auto &pt : pcl_2_out.points)
     {
-      const M3D R_corr = Exp(angvel_last, -kOdinStampBias);
-      for (auto &pt : pcl_2_out.points)
-      {
-        V3D p(pt.x, pt.y, pt.z);
-        p = R_corr * p;
-        pt.x = p(0);
-        pt.y = p(1);
-        pt.z = p(2);
-      }
+      double t_rel = header_off + static_cast<double>(pt.curvature) / 1000.0;
+      if (t_rel < -kMaxUndistortDt)
+        t_rel = -kMaxUndistortDt;
+      if (t_rel > kMaxBundleSpan)
+        t_rel = kMaxBundleSpan;
+      pt.curvature = static_cast<float>(t_rel * 1000.0);
     }
+    // curvature already Mid-relative; pass Mid_beg so beg_off=0.
+    deskew_cloud(pcl_2_out, meas.lidar_beg_time);
   }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360

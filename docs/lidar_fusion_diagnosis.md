@@ -480,6 +480,16 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | `filter_size_surf=0.15` | `/Laser_map` 更密 |
 
 
+### 10h. 真正 deskew 根因（2026-11-12，源码）
+
+**根因**：Odin 点时间被当成 `Mid_beg + offset`，忽略 `L2_header`；再对已 deskew 点做整帧 `Exp(-ω·65ms)` **不是**时间平移。误差 ∝ \|ω\|，停车消失 → 错误后跳变。
+
+| 正确做法 | |
+|----------|--|
+| deskew 前 | `curvature_ms = ((L2_header − Mid_beg) + offset_s) · 1000` |
+| deskew | 按 Mid 轴逐点；**支持 t\<0 反推** |
+| 删除 | 事后 `Exp(-ω·bias)` 整帧硬转 |
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
