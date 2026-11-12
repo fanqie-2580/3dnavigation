@@ -92,6 +92,8 @@ int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic
 size_t bundle_pair_index_ = 0;
 double bundle_pair_dt_ = 0.0;
 double bundle_pair_signed_dt_ = 0.0; // (L2+bias)-Mid; deskew/IMU horizon need sign
+double bundle_mid_span_ = 0.0;       // Mid end - Mid beg (s)
+double bundle_center_dt_ = 0.0;      // Odin scan-center − Mid scan-center (s)
 // Gyro of the *current* Bundle IMU window (not latest callback). <0 = unset.
 double bundle_scan_gyr_norm_ = -1.0;
 double bundle_scan_gyr_pitch_ = -1.0;
@@ -213,22 +215,22 @@ double bundle_mid_push_wall_ = -1.0;
 // centers near 0 instead of walking the max_sync edge.
 double lidar2_stamp_bias_sec = 0.065;
 // Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
+// Stage2 also applies per-point time uncertainty (ω·|dt_to_mid_end|·lever).
 double lidar2_residual_cov_scale = 25.0;
 // Reject Odin point-to-plane residuals larger than this (meters) in Stage2.
 double lidar2_max_residual = 0.12;
+// Assumed residual stamp/deskew timing sigma (s) folded into Stage2 weights.
+double lidar2_time_sigma_sec = 0.008;
 // If false: Odin still updates IEKF (tight couple) but never enters ikdtree.
 bool lidar2_map_insert_en = false;
-// Moving: only lock Odin into ikdtree when Bundle |dt| <= this.
-double lidar2_map_insert_max_sync_dt = 0.018;
-// Near-still (|ω|<still_gyr): allow looser |dt| so accum is dense (deskew≈0).
+// Map insert sync window (same bar moving/still once time-cov is structural).
+double lidar2_map_insert_max_sync_dt = 0.055;
 double lidar2_map_insert_max_sync_dt_still = 0.055;
 double lidar2_map_insert_still_gyr = 0.12;
-// Skip Odin → ikdtree while |ω| high (stamp residual / extrinsic smear).
-// IEKF point update can stay on; only map insert is gated.
-double lidar2_map_insert_gyr_gate = 0.20;
-// After a turn, keep blocking Odin insert briefly while pose/sync settles
-// (avoids "wrong then snap back" points already locked in ikdtree).
-double lidar2_map_insert_cooldown_sec = 0.8;
+// Optional legacy |ω| insert block; 0 = disabled (prefer time-aware Stage2).
+double lidar2_map_insert_gyr_gate = 0.0;
+// After a turn, keep blocking Odin insert briefly while pose/sync settles.
+double lidar2_map_insert_cooldown_sec = 0.0;
 double odin_map_insert_block_until = 0.0;
 // True only after a successful Stage2 Odin update this frame (gates map insert).
 bool last_odin_iekf_ok = false;
@@ -392,26 +394,24 @@ inline bool odin_pose_update_allowed()
     return true;
 }
 
-// Never skip Stage2; inflate Odin cov under fast motion / climb so Mid stays stable.
+// Base Stage2 scalar; per-point time weights applied in h_share_model.
 inline double odin_cov_scale_now()
 {
-    double s = std::max(1.0, lidar2_residual_cov_scale);
-    const double gyr_n = gate_gyr_norm();
-    const double gyr_p = gate_gyr_pitch();
-    // Mild motion already weakens Odin — full-time couple was smearing Mid at scale=25.
-    if (gyr_n >= 0.20)
-        s *= 1.5;
-    if (gyr_n >= 0.35)
-        s *= 2.0;
-    if (gyr_p >= 0.12)
-        s *= 1.5;
-    if (gyr_p >= 0.20)
-        s *= 1.5;
-    if (std::fabs(last_mid_vz) >= 0.08)
-        s *= 1.5;
-    if (std::fabs(last_mid_pitch) * 180.0 / M_PI >= 6.0)
-        s *= 1.5;
-    return s;
+    return std::max(1.0, lidar2_residual_cov_scale);
+}
+
+// Median point offset (s) from curvature-ms; empty → 0.
+inline double cloud_offset_median_sec(const PointCloudXYZI::Ptr &cloud)
+{
+    if (!cloud || cloud->empty())
+        return 0.0;
+    std::vector<double> offs;
+    offs.reserve(cloud->size());
+    for (const auto &pt : cloud->points)
+        offs.push_back(static_cast<double>(pt.curvature) / 1000.0);
+    const size_t mid = offs.size() / 2;
+    std::nth_element(offs.begin(), offs.begin() + mid, offs.end());
+    return offs[mid];
 }
 
 // Gravity-leveled cloud_slam: apply CAD translation only for IEKF (no Ry(-13°)),
@@ -875,7 +875,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             std::chrono::duration<double>(wall_now).count();
 
         auto try_attach_odin = [&](bool &found_out, size_t &best_i_out,
-                                   double &best_dt_out, double &signed_dt_out) {
+                                   double &best_dt_out, double &signed_dt_out,
+                                   double &center_dt_out) {
             while (!time_buffer2.empty() &&
                    (meas.lidar_beg_time -
                     (time_buffer2.front() + lidar2_stamp_bias_sec)) > tight_dt)
@@ -888,27 +889,41 @@ bool sync_packages_bundle(MeasureGroup &meas)
             best_i_out = 0;
             best_dt_out = 1e9;
             signed_dt_out = 0.0;
+            center_dt_out = 0.0;
             double best_score = 1e9;
+            const double mid_span =
+                std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            const double mid_center = meas.lidar_beg_time + 0.5 * mid_span;
             for (size_t i = 0; i < time_buffer2.size(); i++)
             {
                 const double signed_dt =
                     (time_buffer2[i] + lidar2_stamp_bias_sec) - meas.lidar_beg_time;
                 const double dt = std::fabs(signed_dt);
+                // Keep header inside couple window so deskew residual stays bounded.
                 if (dt > tight_dt)
                     continue;
-                const double score = dt + ((signed_dt > 0.0) ? 0.008 : 0.0);
+                const double odin_med =
+                    cloud_offset_median_sec(lidar_buffer2[i]);
+                const double odin_center =
+                    time_buffer2[i] + lidar2_stamp_bias_sec + odin_med;
+                const double center_dt = odin_center - mid_center;
+                // Score scan centers; mild causal preference on header.
+                const double score =
+                    std::fabs(center_dt) + ((signed_dt > 0.0) ? 0.004 : 0.0);
                 if (score < best_score)
                 {
                     best_score = score;
                     best_dt_out = dt;
                     signed_dt_out = signed_dt;
+                    center_dt_out = center_dt;
                     best_i_out = i;
                     found_out = true;
                 }
             }
         };
 
-        auto fill_odin_meas = [&](size_t best_i, double best_dt, double signed_dt) {
+        auto fill_odin_meas = [&](size_t best_i, double best_dt, double signed_dt,
+                                  double center_dt) {
             meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             meas.lidar_beg_time2 = time_buffer2[best_i];
@@ -934,6 +949,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             bundle_pair_index_ = best_i;
             bundle_pair_dt_ = best_dt;
             bundle_pair_signed_dt_ = signed_dt;
+            bundle_mid_span_ = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            bundle_center_dt_ = center_dt;
         };
 
         auto fill_mid_only = [&](bool count_skip) {
@@ -946,6 +963,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             bundle_pair_index_ = 0;
             bundle_pair_dt_ = -1.0;
             bundle_pair_signed_dt_ = 0.0;
+            bundle_mid_span_ = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            bundle_center_dt_ = 0.0;
         };
 
         if (!lidar_pushed)
@@ -978,9 +997,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
             size_t best_i = 0;
             double best_dt = 1e9;
             double signed_dt = 0.0;
-            try_attach_odin(found, best_i, best_dt, signed_dt);
+            double center_dt = 0.0;
+            try_attach_odin(found, best_i, best_dt, signed_dt, center_dt);
             if (found)
-                fill_odin_meas(best_i, best_dt, signed_dt);
+                fill_odin_meas(best_i, best_dt, signed_dt, center_dt);
             else
                 fill_mid_only(false); // provisional; soft-wait may still attach
 
@@ -996,10 +1016,11 @@ bool sync_packages_bundle(MeasureGroup &meas)
             size_t best_i = 0;
             double best_dt = 1e9;
             double signed_dt = 0.0;
-            try_attach_odin(found, best_i, best_dt, signed_dt);
+            double center_dt = 0.0;
+            try_attach_odin(found, best_i, best_dt, signed_dt, center_dt);
             if (found)
             {
-                fill_odin_meas(best_i, best_dt, signed_dt);
+                fill_odin_meas(best_i, best_dt, signed_dt, center_dt);
             }
             else
             {
@@ -1074,6 +1095,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             const double extend_ms = std::max(0.0, odin_h - mid_span) * 1000.0;
             cout << "\033[36;1mBundle tight dt=" << bundle_pair_dt_ * 1000.0
                  << "ms signed=" << bundle_pair_signed_dt_ * 1000.0
+                 << "ms center=" << bundle_center_dt_ * 1000.0
                  << "ms extend=" << extend_ms
                  << "ms gyr_scan=" << bundle_scan_gyr_norm_
                  << " gyr_latest=" << last_imu_gyr_norm << "\033[0m" << endl;
@@ -1324,14 +1346,11 @@ void publish_odin_from_undistorted(
     const PointCloudXYZI::Ptr &undistorted)
 {
     // Fresh Odin → map + cache. Mid-only → republish last map snapshot (no re-pose).
-    // Hard turn: keep last good map snapshot (deskew residual still smears live Odin).
+    // No |ω| freeze: deskew + time-aware Stage2 should keep live Odin usable.
     if (!pubOdin || !scan_pub_en)
         return;
     if (!p_imu->IMU_inited())
         return;
-    const bool hard_turn =
-        (lidar2_map_insert_gyr_gate > 0.0) &&
-        (gate_gyr_norm() >= lidar2_map_insert_gyr_gate);
     auto pub_hold = [&]() {
         if (!odin_hold_map_have || !odin_hold_map || odin_hold_map->empty())
             return;
@@ -1341,11 +1360,6 @@ void publish_odin_from_undistorted(
         laserCloudmsg.header.frame_id = map_frame;
         pubOdin->publish(laserCloudmsg);
     };
-    if (hard_turn)
-    {
-        pub_hold();
-        return;
-    }
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
     if (undistorted && !undistorted->empty())
     {
@@ -1742,6 +1756,12 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
     ekfom_data.h_x = MatrixXd::Zero(effect_feat_num, 12); //23
     ekfom_data.h.resize(effect_feat_num);
+    const double R_base = LASER_POINT_COV * odin_cov_scale_now();
+    const double gyr_n = std::max(0.0, gate_gyr_norm());
+    const double mid_span = (bundle_mid_span_ > 1e-4)
+                                ? bundle_mid_span_
+                                : std::max(0.0, lidar_mean_scantime);
+    const double sig_t = std::max(0.0, lidar2_time_sigma_sec);
 
     for (int i = 0; i < effect_feat_num; i++)
     {
@@ -1772,6 +1792,24 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
+
+        // Stage2: whitening weight so scalar R_base ≈ per-point
+        // R_i = R_base + (ω·|t-mid_end|·lever + σ_t·ω·lever)^2
+        if (residual_select == 2)
+        {
+            const double t_rel =
+                static_cast<double>(laser_p.curvature) / 1000.0;
+            const double dt_end = t_rel - mid_span;
+            const double lever =
+                std::sqrt(point_this_be(0) * point_this_be(0) +
+                          point_this_be(1) * point_this_be(1));
+            const double sig_pos =
+                gyr_n * lever * (std::fabs(dt_end) + sig_t);
+            const double R_i = R_base + sig_pos * sig_pos;
+            const double w = std::sqrt(R_base / std::max(R_i, R_base * 1e-6));
+            ekfom_data.h_x.row(i) *= w;
+            ekfom_data.h(i) *= w;
+        }
     }
 }
 
@@ -1838,12 +1876,13 @@ public:
         this->declare_parameter<double>("mapping.lidar2_stamp_bias_sec", 0.065);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
+        this->declare_parameter<double>("mapping.lidar2_time_sigma_sec", 0.008);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
-        this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt", 0.018);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt", 0.055);
         this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt_still", 0.055);
         this->declare_parameter<double>("mapping.lidar2_map_insert_still_gyr", 0.12);
-        this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.20);
-        this->declare_parameter<double>("mapping.lidar2_map_insert_cooldown_sec", 0.8);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.0);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_cooldown_sec", 0.0);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_vz_gate", 0.12);
         this->declare_parameter<double>("mapping.lidar2_pitch_gate_deg", 10.0);
@@ -1929,14 +1968,15 @@ public:
         this->get_parameter_or("mapping.lidar2_stamp_bias_sec", lidar2_stamp_bias_sec, 0.065);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
+        this->get_parameter_or("mapping.lidar2_time_sigma_sec", lidar2_time_sigma_sec, 0.008);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
-        this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt", lidar2_map_insert_max_sync_dt, 0.018);
+        this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt", lidar2_map_insert_max_sync_dt, 0.055);
         this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt_still",
                                lidar2_map_insert_max_sync_dt_still, 0.055);
         this->get_parameter_or("mapping.lidar2_map_insert_still_gyr",
                                lidar2_map_insert_still_gyr, 0.12);
-        this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.20);
-        this->get_parameter_or("mapping.lidar2_map_insert_cooldown_sec", lidar2_map_insert_cooldown_sec, 0.8);
+        this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.0);
+        this->get_parameter_or("mapping.lidar2_map_insert_cooldown_sec", lidar2_map_insert_cooldown_sec, 0.0);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_vz_gate", lidar2_vz_gate, 0.12);
         this->get_parameter_or("mapping.lidar2_pitch_gate_deg", lidar2_pitch_gate_deg, 10.0);
@@ -2286,28 +2326,12 @@ private:
                 // Stage 1: Mid residuals lock pose (prevents Odin from twisting Mid).
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
-                // Stage2: same quality bar as map insert — hard turn / loose sync
-                // must not yank shared IEKF yaw (live overshoot then snap).
-                const double gyr_n = gate_gyr_norm();
-                const bool stage2_near_still =
-                    (lidar2_map_insert_still_gyr <= 0.0) ||
-                    (gyr_n < lidar2_map_insert_still_gyr);
-                const double stage2_dt_lim =
-                    stage2_near_still
-                        ? ((lidar2_map_insert_max_sync_dt_still > 0.0)
-                               ? lidar2_map_insert_max_sync_dt_still
-                               : lidar2_max_sync_dt)
-                        : lidar2_map_insert_max_sync_dt;
-                const bool stage2_sync_ok =
-                    bundle_pair_dt_ >= 0.0 &&
-                    (stage2_dt_lim <= 0.0 || bundle_pair_dt_ <= stage2_dt_lim);
-                const bool stage2_gyr_ok =
-                    (lidar2_map_insert_gyr_gate <= 0.0) ||
-                    (gyr_n < lidar2_map_insert_gyr_gate);
+                // Stage2 always on when Bundle has Odin; per-point time cov in
+                // h_share_model replaces |ω| / sync hard skips.
                 const bool odin_ok = lidar2_point_update_en && bundle_enabled &&
                                      odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0 &&
-                                     stage2_sync_ok && stage2_gyr_ok;
+                                     bundle_pair_dt_ >= 0.0;
                 if (odin_ok)
                 {
                     residual_select = 2;

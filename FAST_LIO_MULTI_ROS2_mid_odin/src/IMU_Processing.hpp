@@ -346,10 +346,9 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   // ~0.15s; 0.12 was clipping (mixed deskewed/raw → turn snap).
   constexpr double kMaxUndistortDt = 0.20; // s
 
-  // KF + publish stay on Mid scan end. Odin deskew may need a longer IMU
-  // horizon (signed_dt + odin_span). Extending last_lidar_end_time_ past Mid
-  // end caused next-frame IMUpose[0] to be a future state labeled as t=0 →
-  // turn overshoot then snap on /cloud_odin_registered.
+  // Official KF integrates once to Mid end. Deskew may need a longer horizon
+  // (signed_dt + odin_span); that path uses a shadow copy so we never
+  // predict(+dt) then predict(-dt) on the real filter (non-inverse + Q inject).
   const double pcl_beg_time = meas.lidar_beg_time;
   const double mid_end_time = meas.lidar_end_time;
   const double deskew_end_time =
@@ -359,99 +358,121 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
 
-  /*** Initialize IMU pose — label incoming KF at its true offset vs Mid beg ***/
-  state_ikfom imu_state = kf_state.get_x();
-  IMUpose.clear();
-  double offs0 = 0.0;
-  if (last_lidar_end_time_ > 1.0)
-    offs0 = last_lidar_end_time_ - pcl_beg_time;
-  if (offs0 < -kMaxBundleSpan)
-    offs0 = -kMaxBundleSpan;
-  if (offs0 > kMaxBundleSpan)
-    offs0 = kMaxBundleSpan;
-  IMUpose.push_back(set_pose6d(offs0, acc_s_last, angvel_last, imu_state.vel,
-                               imu_state.pos, imu_state.rot.toRotationMatrix()));
-
-  /*** forward propagation at each imu point ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
   M3D R_imu;
   double dt = 0;
   input_ikfom in;
-  for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
-  {
-    auto &&head = *(it_imu);
-    auto &&tail = *(it_imu + 1);
+  V3D angvel_prop = angvel_last;
+  V3D acc_s_prop = acc_s_last;
 
-    if (get_time_sec(tail->header.stamp) < last_lidar_end_time_) continue;
+  auto propagate_imu =
+      [&](esekfom::esekf<state_ikfom, 12, input_ikfom> &kf, const double end_time,
+          const bool record_pose, std::vector<Pose6D> *pose_out,
+          V3D &angvel_io, V3D &acc_s_io) {
+        state_ikfom st = kf.get_x();
+        if (record_pose && pose_out)
+        {
+          pose_out->clear();
+          double offs0 = 0.0;
+          if (last_lidar_end_time_ > 1.0)
+            offs0 = last_lidar_end_time_ - pcl_beg_time;
+          if (offs0 < -kMaxBundleSpan)
+            offs0 = -kMaxBundleSpan;
+          if (offs0 > kMaxBundleSpan)
+            offs0 = kMaxBundleSpan;
+          pose_out->push_back(set_pose6d(offs0, acc_s_io, angvel_io, st.vel, st.pos,
+                                         st.rot.toRotationMatrix()));
+        }
 
-    angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
-                0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
-                0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
-    acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
-                0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
-                0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+        for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
+        {
+          auto &&head = *(it_imu);
+          auto &&tail = *(it_imu + 1);
+          const double t_tail = get_time_sec(tail->header.stamp);
+          if (t_tail < last_lidar_end_time_)
+            continue;
 
-    acc_avr = acc_avr * G_m_s2 / mean_acc.norm();
+          angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+              0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+              0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+          acc_avr << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+              0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+              0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+          acc_avr = acc_avr * G_m_s2 / mean_acc.norm();
 
-    if (get_time_sec(head->header.stamp) < last_lidar_end_time_)
-      dt = get_time_sec(tail->header.stamp) - last_lidar_end_time_;
-    else
-      dt = get_time_sec(tail->header.stamp) - get_time_sec(head->header.stamp);
+          if (get_time_sec(head->header.stamp) < last_lidar_end_time_)
+            dt = t_tail - last_lidar_end_time_;
+          else
+            dt = t_tail - get_time_sec(head->header.stamp);
 
-    in.acc = acc_avr;
-    in.gyro = angvel_avr;
-    Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
-    Q.block<3, 3>(3, 3).diagonal() = cov_acc;
-    Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
-    Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
+          // Clip interval that crosses end_time so KF stops exactly on anchor.
+          if (t_tail > end_time + 1e-9)
+          {
+            const double t0 = (get_time_sec(head->header.stamp) < last_lidar_end_time_)
+                                  ? last_lidar_end_time_
+                                  : get_time_sec(head->header.stamp);
+            dt = end_time - t0;
+            if (dt <= 1e-9)
+              break;
+          }
 
-    imu_state = kf_state.get_x();
-    angvel_last = angvel_avr - imu_state.bg;
-    acc_s_last = imu_state.rot * (acc_avr - imu_state.ba);
-    for (int i = 0; i < 3; i++)
-      acc_s_last[i] += imu_state.grav[i];
-    double &&offs_t = get_time_sec(tail->header.stamp) - pcl_beg_time;
-    IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
-  }
+          in.acc = acc_avr;
+          in.gyro = angvel_avr;
+          Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
+          Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+          Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+          Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+          kf.predict(dt, Q, in);
 
-  // Extend trajectory to deskew horizon (may be past Mid end for +signed Odin).
-  {
-    double note = deskew_end_time > imu_end_time ? 1.0 : -1.0;
-    dt = note * (deskew_end_time - imu_end_time);
-    if (std::fabs(dt) > kMaxBundleSpan)
-      dt = note * kMaxBundleSpan;
-    if (std::fabs(dt) > 1e-6)
-    {
-      kf_state.predict(dt, Q, in);
-      imu_state = kf_state.get_x();
-      double offs_t = deskew_end_time - pcl_beg_time;
-      IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel,
-                                   imu_state.pos, imu_state.rot.toRotationMatrix()));
-    }
-  }
+          st = kf.get_x();
+          angvel_io = angvel_avr - st.bg;
+          acc_s_io = st.rot * (acc_avr - st.ba);
+          for (int i = 0; i < 3; i++)
+            acc_s_io[i] += st.grav[i];
+          if (record_pose && pose_out)
+          {
+            const double offs_t =
+                std::min(t_tail, end_time) - pcl_beg_time;
+            pose_out->push_back(set_pose6d(offs_t, acc_s_io, angvel_io, st.vel,
+                                           st.pos, st.rot.toRotationMatrix()));
+          }
+          if (t_tail >= end_time - 1e-9)
+            break;
+        }
 
-  // Snap KF + deskew target back to Mid end (publish/IEKF anchor).
-  if (deskew_end_time > mid_end_time + 1e-6)
-  {
-    dt = mid_end_time - deskew_end_time; // negative rewind
-    if (dt < -kMaxBundleSpan)
-      dt = -kMaxBundleSpan;
-    kf_state.predict(dt, Q, in);
-  }
-  else if (deskew_end_time < mid_end_time - 1e-6)
-  {
-    dt = mid_end_time - deskew_end_time;
-    if (dt > kMaxBundleSpan)
-      dt = kMaxBundleSpan;
-    kf_state.predict(dt, Q, in);
-    imu_state = kf_state.get_x();
-    IMUpose.push_back(set_pose6d(mid_end_time - pcl_beg_time, acc_s_last,
-                                 angvel_last, imu_state.vel, imu_state.pos,
-                                 imu_state.rot.toRotationMatrix()));
-  }
+        // Stub from last IMU sample to end_time if still short.
+        const double t_imu_last = get_time_sec(v_imu.back()->header.stamp);
+        double note = end_time > t_imu_last ? 1.0 : -1.0;
+        dt = note * (end_time - t_imu_last);
+        if (std::fabs(dt) > kMaxBundleSpan)
+          dt = note * kMaxBundleSpan;
+        if (std::fabs(dt) > 1e-6)
+        {
+          kf.predict(dt, Q, in);
+          st = kf.get_x();
+          if (record_pose && pose_out)
+          {
+            const double offs_t = end_time - pcl_beg_time;
+            pose_out->push_back(set_pose6d(offs_t, acc_s_io, angvel_io, st.vel,
+                                           st.pos, st.rot.toRotationMatrix()));
+          }
+        }
+      };
 
-  imu_state = kf_state.get_x();
+  // Shadow: full deskew horizon (may pass Mid end). Does not touch official P.
+  esekfom::esekf<state_ikfom, 12, input_ikfom> kf_shadow = kf_state;
+  V3D angvel_shadow = angvel_last;
+  V3D acc_s_shadow = acc_s_last;
+  propagate_imu(kf_shadow, deskew_end_time, true, &IMUpose, angvel_shadow,
+                acc_s_shadow);
+
+  // Official KF: integrate once to Mid end only (IEKF / publish anchor).
+  propagate_imu(kf_state, mid_end_time, false, nullptr, angvel_prop, acc_s_prop);
+  angvel_last = angvel_prop;
+  acc_s_last = acc_s_prop;
+
+  // Deskew compensates into this Mid-end state; IMUpose may extend past it.
+  state_ikfom imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = mid_end_time;
 

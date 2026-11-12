@@ -540,7 +540,19 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 ### 10o. 地图干净但 live 仍轻微过头（2026-11-12）
 
 **现象**：转后橙色仍略超前，但错点未进 `/Laser_map`（insert 门有效）。  
-**修复**：Stage2 与写图同门槛（硬转/松同步不改 IEKF）；硬转时 `/cloud_odin_registered` 冻结为上一帧 map 快照，不刷新带 deskew 残差的 live。 |
+**修复（过渡）**：Stage2 与写图同门槛；硬转冻结 live。  
+
+### 10p. 无 |ω| 门控主路径（2026-11-12）
+
+**方向**：门控只挡症状；结构性修时间与观测模型。  
+**已改**：
+
+1. **影子轨迹**：`UndistortPclMultiLiDAR` 用 KF 拷贝积到 deskew horizon；正式 KF **只积到 Mid end**（去掉 `predict(+)/predict(-)`）。  
+2. **Bundle 扫描中心**：配对代价用 Odin `median(offset)+bias` vs Mid 扫描中心，不再只比 header。  
+3. **Stage2 逐点时间权重**：`R_i = R_base + (ω·(|t−mid_end|+σ_t)·lever)²`，对 H/h 白化；硬转不再跳过 Stage2。  
+4. **去硬门**：`map_insert_gyr_gate=0`、写图 sync=0.055、取消硬转 freeze；Mid-only 仍 hold map 快照。
+
+参数：`mapping.lidar2_time_sigma_sec`（默认 0.008）。
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
