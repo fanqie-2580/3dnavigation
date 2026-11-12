@@ -91,6 +91,9 @@ bool extrinsic_imu_to_lidars = false;
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
 size_t bundle_pair_index_ = 0;
 double bundle_pair_dt_ = 0.0;
+// Only use Odin (IEKF/insert/fresh publish) when |Bundle dt| is this small.
+// Larger residual is Mid/Odin phase sawtooth — showing those frames = wrong-then-jump.
+constexpr double kOdinUseMaxBundleDt = 0.015; // s
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -1035,13 +1038,13 @@ void map_incremental()
     }
     // Sync-quality gate (not turn cooldown): Bundle Mid↔L2 |dt| too large means
     // Odin world pose is unreliable — do not lock into ikdtree.
-        constexpr double kOdinInsertMaxBundleDt = 0.03; // s
-    const bool block_odin_insert =
+        const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
          last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until ||
-        (bundle_enabled && bundle_pair_dt_ > kOdinInsertMaxBundleDt);
+        (bundle_enabled &&
+         (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt));
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1190,8 +1193,12 @@ void publish_odin_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &undistorted)
 {
-    // Publish Odin points already undistorted into Mid body, using current state_point.
+    // Publish Odin only on tight Bundle sync. Loose/Mid-only frames would be
+    // ω·ε-wrong during turns then snap back — leave last good cloud in RViz.
     if (!pubOdin || !undistorted || undistorted->empty() || !scan_pub_en)
+        return;
+    if (bundle_enabled &&
+        (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt))
         return;
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
     odin_body->reserve(undistorted->size());
@@ -2014,6 +2021,21 @@ private:
                 return;
             }
 
+            // Drop Odin from this Mid frame when Bundle sync is loose / Mid-only.
+            // Prevents IEKF/map/viz from consuming ω·ε-wrong L2 during phase sawtooth.
+            if (bundle_enabled &&
+                (bundle_pair_dt_ < 0.0 || bundle_pair_dt_ > kOdinUseMaxBundleDt))
+            {
+                PointCloudXYZI::Ptr mid_only(new PointCloudXYZI());
+                mid_only->reserve(feats_undistort->size());
+                for (const auto &pt : feats_undistort->points)
+                {
+                    if (pt.intensity < kOdinIntensityTag)
+                        mid_only->push_back(pt);
+                }
+                feats_undistort.swap(mid_only);
+            }
+
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
 
@@ -2105,14 +2127,12 @@ private:
                 residual_select = 1;
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
                 // Optional Stage 2 point residuals (usually OFF — prefer pose-factor).
-                // Skip Stage2 when Mid-only (dt<0) or Bundle lag too large —
-                // deskew still shows Odin, but bad sync must not yank Mid IEKF.
-                constexpr double kOdinIekfMaxBundleDt = 0.03; // s
+                // Skip Stage2 on Mid-only / loose Bundle — bad sync yanks Mid.
                 const bool odin_ok = lidar2_point_update_en && bundle_enabled &&
                                      odin_pose_update_allowed() &&
                                      lidar2_residual_cov_scale > 0.0 &&
                                      bundle_pair_dt_ >= 0.0 &&
-                                     bundle_pair_dt_ <= kOdinIekfMaxBundleDt;
+                                     bundle_pair_dt_ <= kOdinUseMaxBundleDt;
                 if (odin_ok)
                 {
                     residual_select = 2;

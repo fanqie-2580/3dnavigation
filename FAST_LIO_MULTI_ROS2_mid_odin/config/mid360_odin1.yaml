@@ -72,8 +72,8 @@
       lidar2_pitch_gyr_gate: 0.0
       lidar2_vz_gate: 0.0
       lidar2_pitch_gate_deg: 0.0
-      # Causal Bundle window (L2+bias <= Mid). Deskew ignores residual; IEKF/insert gated tighter in code.
-      lidar2_max_sync_dt: 0.08
+      # Bundle pairing window. Odin use/IEKF/insert gated to |dt|<=15ms in code.
+      lidar2_max_sync_dt: 0.10
       # USB L2 stamp leads Mid by ~−65ms at same wall; bias recenters Bundle dt.
       lidar2_stamp_bias_sec: 0.065
       lidar2_residual_cov_scale: 50.0
