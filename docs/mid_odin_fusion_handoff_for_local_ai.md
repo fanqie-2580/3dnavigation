@@ -229,10 +229,16 @@ ros2 topic hz /cloud_registered
 ros2 topic hz /odin1/cloud_l2_body
 ros2 topic hz /cloud_odin_registered
 
-# 清空 densify 累积（若服务在）
-ros2 service call /odin_independent_accum/clear_accum std_srvs/srv/Empty {}
+# 清空 densify 累积（odin_mid_densify 是 Trigger，不是 Empty）
+ros2 service call /odin_independent_accum/clear_accum std_srvs/srv/Trigger {}
 ros2 service call /mid_odin_frame_fuse/clear_accum std_srvs/srv/Empty {}
 ```
+
+### 2026-11-12 已落地修复（Codex 假说 H1/H2）
+
+1. **H1**：写图 / cov 门控改用 Bundle 窗口 `meas.imu` 的 `gyr_scan`，不再用最新回调 `gyr_latest`。  
+2. **H2**：`lidar_end_time2 = Mid_beg + signed_dt + odin_span`，与 deskew 对齐，IMU 覆盖含正向残差。  
+日志：`Bundle tight dt=… signed=…ms gyr_scan=… gyr_latest=…`
 
 编译：
 

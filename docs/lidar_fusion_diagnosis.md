@@ -520,6 +520,13 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 **根因**：IEKF 窗 55ms 内的帧也 `map_insert`；`|dt|` 大时 deskew 残差在转动中把 Odin 写进 ikdtree，**无法撤销**。  
 **修复**：移动中 `insert_max_dt=18ms`；近静止 `|ω|<0.12` 时放宽到 55ms 加密累积；`insert_gyr_gate=0.35` 同帧挡硬转。IEKF 仍可用到 55ms。
 
+### 10l. Bundle 时间语义两处不一致（2026-11-12，本地 Codex 指出）
+
+| 假说 | 问题 | 修复 |
+|------|------|------|
+| H1 | 写图/cov 用**最新** IMU，停车后把迟到转弯帧当 still 写入 | 用 `meas.imu` 窗口 max \|ω\| 作 `gyr_scan` 门控 |
+| H2 | deskew 含 signed 残差，但 `lidar_end_time2=Mid+span` → IMU 覆盖不足 | `lidar_end_time2=Mid+signed_dt+span` |
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

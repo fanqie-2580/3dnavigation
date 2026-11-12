@@ -91,6 +91,10 @@ bool extrinsic_imu_to_lidars = false;
 int voxelized_pt_num_thres = 100, bundle_enabled_tic = 10000, bundle_enabled_tic_thres = 10;
 size_t bundle_pair_index_ = 0;
 double bundle_pair_dt_ = 0.0;
+double bundle_pair_signed_dt_ = 0.0; // (L2+bias)-Mid; deskew/IMU horizon need sign
+// Gyro of the *current* Bundle IMU window (not latest callback). <0 = unset.
+double bundle_scan_gyr_norm_ = -1.0;
+double bundle_scan_gyr_pitch_ = -1.0;
 // Last good Odin body (intensity-tagged, Mid-lidar frame) for smooth viz between
 // tight Bundle pairs — re-project with current Mid pose so RViz does not freeze.
 PointCloudXYZI::Ptr odin_hold_body(new PointCloudXYZI());
@@ -358,15 +362,26 @@ void apply_odin_pose_factor()
     last_pf_odin_yaw = wrap_pi(yaw_o + odin_yaw_align);
 }
 
+// Prefer Bundle-window gyro; fall back to latest IMU callback only if unset.
+inline double gate_gyr_norm()
+{
+    return (bundle_scan_gyr_norm_ >= 0.0) ? bundle_scan_gyr_norm_ : last_imu_gyr_norm;
+}
+inline double gate_gyr_pitch()
+{
+    return (bundle_scan_gyr_pitch_ >= 0.0) ? bundle_scan_gyr_pitch_
+                                           : last_imu_gyr_pitch;
+}
+
 inline bool odin_pose_update_allowed()
 {
     // Full-time tight couple: gates <=0 disable holds (stairs/turns still update).
     // Optional gates remain for experiments; production yaml sets all to 0.
     if (!lidar2_update_en)
         return false;
-    if (lidar2_pose_gyr_gate > 0.0 && last_imu_gyr_norm >= lidar2_pose_gyr_gate)
+    if (lidar2_pose_gyr_gate > 0.0 && gate_gyr_norm() >= lidar2_pose_gyr_gate)
         return false;
-    if (lidar2_pitch_gyr_gate > 0.0 && last_imu_gyr_pitch >= lidar2_pitch_gyr_gate)
+    if (lidar2_pitch_gyr_gate > 0.0 && gate_gyr_pitch() >= lidar2_pitch_gyr_gate)
         return false;
     if (lidar2_vz_gate > 0.0 && std::fabs(last_mid_vz) >= lidar2_vz_gate)
         return false;
@@ -380,14 +395,16 @@ inline bool odin_pose_update_allowed()
 inline double odin_cov_scale_now()
 {
     double s = std::max(1.0, lidar2_residual_cov_scale);
+    const double gyr_n = gate_gyr_norm();
+    const double gyr_p = gate_gyr_pitch();
     // Mild motion already weakens Odin — full-time couple was smearing Mid at scale=25.
-    if (last_imu_gyr_norm >= 0.20)
+    if (gyr_n >= 0.20)
         s *= 1.5;
-    if (last_imu_gyr_norm >= 0.35)
+    if (gyr_n >= 0.35)
         s *= 2.0;
-    if (last_imu_gyr_pitch >= 0.12)
+    if (gyr_p >= 0.12)
         s *= 1.5;
-    if (last_imu_gyr_pitch >= 0.20)
+    if (gyr_p >= 0.20)
         s *= 1.5;
     if (std::fabs(last_mid_vz) >= 0.08)
         s *= 1.5;
@@ -857,7 +874,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             std::chrono::duration<double>(wall_now).count();
 
         auto try_attach_odin = [&](bool &found_out, size_t &best_i_out,
-                                   double &best_dt_out) {
+                                   double &best_dt_out, double &signed_dt_out) {
             while (!time_buffer2.empty() &&
                    (meas.lidar_beg_time -
                     (time_buffer2.front() + lidar2_stamp_bias_sec)) > tight_dt)
@@ -869,6 +886,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             found_out = false;
             best_i_out = 0;
             best_dt_out = 1e9;
+            signed_dt_out = 0.0;
             double best_score = 1e9;
             for (size_t i = 0; i < time_buffer2.size(); i++)
             {
@@ -882,13 +900,14 @@ bool sync_packages_bundle(MeasureGroup &meas)
                 {
                     best_score = score;
                     best_dt_out = dt;
+                    signed_dt_out = signed_dt;
                     best_i_out = i;
                     found_out = true;
                 }
             }
         };
 
-        auto fill_odin_meas = [&](size_t best_i, double best_dt) {
+        auto fill_odin_meas = [&](size_t best_i, double best_dt, double signed_dt) {
             meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             meas.lidar_beg_time2 = time_buffer2[best_i];
@@ -906,12 +925,14 @@ bool sync_packages_bundle(MeasureGroup &meas)
                 odin_span = lidar_mean_scantime2;
             else
                 odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-            lidar_end_time2 = meas.lidar_beg_time + odin_span;
+            // Match deskew: t_max = Mid_beg + signed_dt + odin_span (not Mid+span only).
+            lidar_end_time2 = meas.lidar_beg_time + signed_dt + odin_span;
             if (lidar_end_time2 < lidar_end_time)
                 lidar_end_time2 = lidar_end_time;
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = best_i;
             bundle_pair_dt_ = best_dt;
+            bundle_pair_signed_dt_ = signed_dt;
         };
 
         auto fill_mid_only = [&](bool count_skip) {
@@ -923,6 +944,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = 0;
             bundle_pair_dt_ = -1.0;
+            bundle_pair_signed_dt_ = 0.0;
         };
 
         if (!lidar_pushed)
@@ -954,9 +976,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
             bool found = false;
             size_t best_i = 0;
             double best_dt = 1e9;
-            try_attach_odin(found, best_i, best_dt);
+            double signed_dt = 0.0;
+            try_attach_odin(found, best_i, best_dt, signed_dt);
             if (found)
-                fill_odin_meas(best_i, best_dt);
+                fill_odin_meas(best_i, best_dt, signed_dt);
             else
                 fill_mid_only(false); // provisional; soft-wait may still attach
 
@@ -971,10 +994,11 @@ bool sync_packages_bundle(MeasureGroup &meas)
             bool found = false;
             size_t best_i = 0;
             double best_dt = 1e9;
-            try_attach_odin(found, best_i, best_dt);
+            double signed_dt = 0.0;
+            try_attach_odin(found, best_i, best_dt, signed_dt);
             if (found)
             {
-                fill_odin_meas(best_i, best_dt);
+                fill_odin_meas(best_i, best_dt, signed_dt);
             }
             else
             {
@@ -1013,6 +1037,22 @@ bool sync_packages_bundle(MeasureGroup &meas)
             imu_buffer.pop_front();
         }
 
+        // Scan-window gyro for gates (not latest callback — avoids still-after-turn
+        // false near_still that locked smeared Odin into ikdtree).
+        {
+            double max_n = 0.0, max_p = 0.0;
+            for (const auto &im : meas.imu)
+            {
+                const double gx = im->angular_velocity.x;
+                const double gy = im->angular_velocity.y;
+                const double gz = im->angular_velocity.z;
+                max_n = std::max(max_n, std::sqrt(gx * gx + gy * gy + gz * gz));
+                max_p = std::max(max_p, std::fabs(gy));
+            }
+            bundle_scan_gyr_norm_ = max_n;
+            bundle_scan_gyr_pitch_ = max_p;
+        }
+
         lidar_buffer.pop_front();
         time_buffer.pop_front();
         if (bundle_pair_dt_ >= 0.0)
@@ -1027,9 +1067,12 @@ bool sync_packages_bundle(MeasureGroup &meas)
         lidar_pushed = false;
         if (bundle_pair_dt_ >= 0.0)
             cout << "\033[36;1mBundle tight dt=" << bundle_pair_dt_ * 1000.0
-                 << "ms\033[0m" << endl;
+                 << "ms signed=" << bundle_pair_signed_dt_ * 1000.0
+                 << "ms gyr_scan=" << bundle_scan_gyr_norm_
+                 << " gyr_latest=" << last_imu_gyr_norm << "\033[0m" << endl;
         else
-            cout << "\033[33;1mBundle Mid-only (hold Odin viz)\033[0m" << endl;
+            cout << "\033[33;1mBundle Mid-only (hold Odin viz) gyr_scan="
+                 << bundle_scan_gyr_norm_ << "\033[0m" << endl;
         return true;
     }
     else
@@ -1095,8 +1138,9 @@ void map_incremental()
     PointNoNeedDownsample.reserve(feats_down_size);
     const float det_r2 = DET_RANGE * DET_RANGE;
     const double now_ros = rclcpp::Clock(RCL_ROS_TIME).now().seconds();
+    const double gyr_for_insert = gate_gyr_norm();
     if (lidar2_map_insert_gyr_gate > 0.0 &&
-        last_imu_gyr_norm >= lidar2_map_insert_gyr_gate)
+        gyr_for_insert >= lidar2_map_insert_gyr_gate)
     {
         odin_map_insert_block_until =
             std::max(odin_map_insert_block_until,
@@ -1104,9 +1148,10 @@ void map_incremental()
     }
     // IEKF may couple up to max_sync_dt. Map insert: strict while moving, loose
     // when still (ω·ε≈0) so /Laser_map Odin is not sparse.
+    // Use Bundle-window gyro so a late turn scan is not treated as still.
     const bool near_still =
         (lidar2_map_insert_still_gyr <= 0.0) ||
-        (last_imu_gyr_norm < lidar2_map_insert_still_gyr);
+        (gyr_for_insert < lidar2_map_insert_still_gyr);
     const double insert_dt_lim =
         near_still
             ? ((lidar2_map_insert_max_sync_dt_still > 0.0)
@@ -1120,7 +1165,7 @@ void map_incremental()
     const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
-         last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
+         gyr_for_insert >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until || sync_too_loose_for_map;
     for (int i = 0; i < feats_down_size; i++)
     {
