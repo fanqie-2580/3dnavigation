@@ -933,18 +933,22 @@ class OdinIndependentAccum(Node):
             and self._mid_yaw_rate_deg >= self.still_yaw_rate_deg
         ):
             arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
-        T_locked = self._ema_mid_pose(T_locked)
-        # Deadband densify pose like map→body TF hold. Old still_hold froze while
-        # Mid moved under the gate then snapped — looked like amplified shake.
-        T_locked = self._deadband_densify_pose(T_locked)
 
+        # Accum: stamp-locked Mid (stable voxels; no latest-Mid paint on turns).
+        T_accum = self._ema_mid_pose(T_locked)
+        T_map_acc = T_accum @ self.T_body_odin_lidar
+        out_acc = (arr @ T_map_acc[:3, :3].T) + T_map_acc[:3, 3]
+        self._accum_locked(out_acc)
+
+        # Live: soft-track *latest* Mid (same timeline as /cloud_registered), with
+        # deadband. Stamp-locked live lagged Mid then snapped when leaving the
+        # hold gate — felt like huge shake on slight motion.
+        T_live_src = self._mid_T if self._mid_T is not None else T_locked
+        T_live = self._deadband_densify_pose(T_live_src)
         self._n_locked_viz += 1
-        # Stamp-locked Mid only (never wall/latest) for live + accum.
-        T_map = T_locked @ self.T_body_odin_lidar
-        R, t = T_map[:3, :3], T_map[:3, 3]
-        out = (arr @ R.T) + t
-        self._publish_live(msg.header.stamp, out)
-        self._accum_locked(out)
+        T_map_live = T_live @ self.T_body_odin_lidar
+        out_live = (arr @ T_map_live[:3, :3].T) + T_map_live[:3, 3]
+        self._publish_live(msg.header.stamp, out_live)
 
     def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
         """Hold densify Mid pose under TF-like deadband; soft-track above it."""
@@ -958,9 +962,10 @@ class OdinIndependentAccum(Node):
         rot_deg = math.degrees(math.acos(cos_a))
         if trans < self.densify_hold_trans and rot_deg < self.densify_hold_rot_deg:
             return self._hold_T_mid
+        # Never boost alpha on small exits — that was the slight-motion snap.
         a = self.densify_track_alpha
-        if trans > 0.03 or rot_deg > 0.8:
-            a = max(a, 0.65)
+        if trans > 0.20 or rot_deg > 5.0:
+            a = max(a, 0.5)
         self._hold_T_mid = self._lerp_se3(self._hold_T_mid, T_locked, a)
         return self._hold_T_mid
 

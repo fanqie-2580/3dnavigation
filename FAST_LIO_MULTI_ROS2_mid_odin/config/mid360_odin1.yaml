@@ -57,10 +57,11 @@
       # Match preprocess.max_range; also gates map_incremental body-range insert.
       det_range: 25.0
       extrinsic_est_en: false
-      # Full tight couple (Odin densify lag is low): point IEKF + pose-factor + map insert.
+      # Point IEKF + map insert. Pose-factor OFF: Odin /odometry soft-pull made
+      # Mid /Odometry (and densify) jitter on slight motion.
       lidar2_update_en: true
       lidar2_point_update_en: true
-      lidar2_pose_factor_en: true
+      lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
       odin_odom_topic: "/odin1/odometry"
