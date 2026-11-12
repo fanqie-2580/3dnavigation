@@ -169,7 +169,9 @@ def generate_launch_description():
                     'odin_odom_max_dt': 1.0,
                     # Must match mapping.lidar2_max_sync_dt: never restamp L2
                     # outside this window (lying stamps twist Mid IEKF).
-                    'mid_restamp_max_dt': 0.05,
+                    # Causal Mid densify pose window (interp/before only; never future).
+                    # Mid odom ~10Hz → allow up to one period so we rarely skip.
+                    'mid_restamp_max_dt': 0.12,
                     'max_cloud_age_sec': 0.25,
                     # 0: no artificial rate floor (latest-only already drops extras).
                     'fallback_period': 0.0,
@@ -358,6 +360,7 @@ def generate_launch_description():
                         'latest_mid_min_yaw_rate_deg': 8.0,
                         'still_trans_vel': 0.05,
                         'still_yaw_rate_deg': 3.0,
+                        'deskew_odin': True,
                         'restamp_scan_to_now': True,
                         'accum_max_yaw_rate_deg': 25.0,
                         'l2_mid_pose_topic': '/odin1/l2_mid_pose',

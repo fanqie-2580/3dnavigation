@@ -223,6 +223,8 @@ class OdinIndependentAccum(Node):
         # Below these rates, reuse last Mid pose for densify (stop still-shake).
         self.declare_parameter('still_trans_vel', 0.05)
         self.declare_parameter('still_yaw_rate_deg', 3.0)
+        # Yaw deskew Odin points with Mid yaw rate (kills turn fan vs Mid).
+        self.declare_parameter('deskew_odin', True)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
         self.declare_parameter('imu_to_lidar_rpy_deg', [0.0, 0.0, 0.0])
@@ -284,7 +286,9 @@ class OdinIndependentAccum(Node):
         self.restamp_scan_to_now = bool(self.get_parameter('restamp_scan_to_now').value)
         self.still_trans_vel = float(self.get_parameter('still_trans_vel').value)
         self.still_yaw_rate_deg = float(self.get_parameter('still_yaw_rate_deg').value)
+        self.deskew_odin = bool(self.get_parameter('deskew_odin').value)
         self._ema_mid_T: Optional[np.ndarray] = None
+        self._mid_yaw_rate_rad = 0.0
         self._n_motion_hold = 0
         self._n_skip_accum_turn = 0
         self._n_l2_pose_hit = 0
@@ -296,7 +300,8 @@ class OdinIndependentAccum(Node):
         self._mid_yaw_prev: Optional[Tuple[float, float]] = None  # (wall, yaw_rad)
         self._mid_pos_prev: Optional[Tuple[float, np.ndarray]] = None  # (wall, xyz)
         # Cloud often arrives before matching l2_mid_pose in the same executor turn.
-        self._pending_l2: Optional[Tuple[PointCloud2, np.ndarray, float]] = None
+        # (msg, xyz, offset_t, wall)
+        self._pending_l2: Optional[Tuple[PointCloud2, np.ndarray, np.ndarray, float]] = None
         # Freeze densify Mid pose while still — IEKF mm wander otherwise shakes
         # cloud_in_map and splatters keep-first voxels.
         self._hold_T_mid: Optional[np.ndarray] = None
@@ -471,10 +476,10 @@ class OdinIndependentAccum(Node):
         self._l2_mid_pose_buf.append((t, se3_from_pose(msg.pose)))
         # Retry densify if cloud arrived before this pose (same stamp).
         if self._pending_l2 is not None:
-            pmsg, parr, pwall = self._pending_l2
+            pmsg, parr, poff, pwall = self._pending_l2
             if abs(stamp_sec(pmsg.header.stamp) - t) <= 0.05:
                 self._pending_l2 = None
-                self._project_odin_cloud(pmsg, parr, pwall)
+                self._project_odin_cloud(pmsg, parr, poff, pwall)
 
     def on_mid_odom(self, msg: Odometry) -> None:
         t = stamp_sec(msg.header.stamp)
@@ -493,7 +498,8 @@ class OdinIndependentAccum(Node):
             dw = wall - self._mid_yaw_prev[0]
             if dw > 1e-3:
                 dy = (yaw - self._mid_yaw_prev[1] + math.pi) % (2.0 * math.pi) - math.pi
-                self._mid_yaw_rate_deg = abs(dy) / dw * (180.0 / math.pi)
+                self._mid_yaw_rate_rad = dy / dw  # signed (deskew); abs for gates
+                self._mid_yaw_rate_deg = abs(self._mid_yaw_rate_rad) * (180.0 / math.pi)
         self._mid_yaw_prev = (wall, yaw)
         if self._mid_pos_prev is not None:
             dw = wall - self._mid_pos_prev[0]
@@ -668,7 +674,7 @@ class OdinIndependentAccum(Node):
     def on_mid_accum(self, msg: PointCloud2) -> None:
         if self._aligned:
             return
-        arr = self._xyz_stride(msg)
+        arr, _off = self._xyz_stride(msg)
         if len(arr) >= 200:
             self._mid_cloud = arr
 
@@ -797,20 +803,24 @@ class OdinIndependentAccum(Node):
             return None
         return best.copy()
 
-    def _xyz_stride(self, msg: PointCloud2) -> np.ndarray:
-        """Vectorized XYZ extract — Python per-point unpack was a major lag source."""
+    def _xyz_stride(self, msg: PointCloud2) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorized XYZ (+ optional offset_time sec) extract.
+
+        Returns (Nx3 xyz, N offset_time_sec). offset_time is 0 if absent.
+        """
         offs = {f.name: (f.offset, f.datatype) for f in msg.fields}
+        empty = (np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=np.float64))
         if not all(k in offs for k in ('x', 'y', 'z')):
-            return np.zeros((0, 3), dtype=np.float64)
+            return empty
         n = int(msg.width) * int(msg.height)
         if n <= 0:
-            return np.zeros((0, 3), dtype=np.float64)
+            return empty
         step = int(msg.point_step)
         raw = np.frombuffer(msg.data, dtype=np.uint8)
         if raw.size < n * step:
             n = raw.size // step
         if n <= 0:
-            return np.zeros((0, 3), dtype=np.float64)
+            return empty
         arr = raw[: n * step].reshape(n, step)
 
         def col_f32(name: str) -> np.ndarray:
@@ -830,10 +840,38 @@ class OdinIndependentAccum(Node):
             keep &= conf >= float(self.min_confidence)
         if not self.cloud_already_in_odom and self.blind2 > 0.0:
             keep &= (xyz[:, 0] ** 2 + xyz[:, 1] ** 2 + xyz[:, 2] ** 2) >= self.blind2
+        off_t = np.zeros(n, dtype=np.float64)
+        if 'offset_time' in offs:
+            o, dt = offs['offset_time']
+            if dt == 7:
+                off_t = arr[:, o : o + 4].copy().view(np.float32).reshape(-1).astype(np.float64)
         xyz = xyz[keep]
+        off_t = off_t[keep]
         if self.stride > 1 and len(xyz) > 0:
             xyz = xyz[:: int(self.stride)]
-        return xyz
+            off_t = off_t[:: int(self.stride)]
+        return xyz, off_t
+
+    def _deskew_yaw(self, pts: np.ndarray, offset_t: np.ndarray, yaw_rate: float) -> np.ndarray:
+        """Yaw-only deskew in lidar frame using Mid yaw rate (rad/s).
+
+        Odin frames span ~0–100ms without intra-scan pose; during turns this is
+        the main live fan-smear vs deskewed Mid /cloud_registered.
+        """
+        if pts.size == 0 or offset_t.size == 0 or abs(yaw_rate) < 1e-3:
+            return pts
+        # Bring each point from its sample time to median-time lidar frame:
+        # p_ref = R_z(-(yaw(t)-yaw(t_ref))) * p_t
+        t_ref = float(np.median(offset_t))
+        ang = -yaw_rate * (offset_t - t_ref)
+        c = np.cos(ang)
+        s = np.sin(ang)
+        x = pts[:, 0]
+        y = pts[:, 1]
+        out = pts.copy()
+        out[:, 0] = c * x - s * y
+        out[:, 1] = s * x + c * y
+        return out
 
     def _lookup_l2_mid(self, t_cloud: float):
         best = None
@@ -848,7 +886,11 @@ class OdinIndependentAccum(Node):
         return None, best_dt
 
     def _project_odin_cloud(
-        self, msg: PointCloud2, arr: np.ndarray, wall_cloud: float
+        self,
+        msg: PointCloud2,
+        arr: np.ndarray,
+        off_t: np.ndarray,
+        wall_cloud: float,
     ) -> None:
         """project_with_mid path (also used when l2_mid_pose arrives after cloud)."""
         t_cloud = stamp_sec(msg.header.stamp)
@@ -856,26 +898,24 @@ class OdinIndependentAccum(Node):
         if T_locked is not None:
             self._n_l2_pose_hit += 1
         T_wall = None
-        dt_wall = 0.0
         mid_hit = self._mid_pose_by_wall(wall_cloud)
         if mid_hit is not None:
-            T_wall, dt_wall = mid_hit
+            T_wall, _dt_wall = mid_hit
         if T_locked is None and T_wall is None:
             self._n_skip_odom += 1
             return
         if T_locked is None:
-            # Hold cloud briefly for matching pose (on_l2_mid_pose retries).
-            self._pending_l2 = (msg, arr, wall_cloud)
+            # Hold raw cloud for stamp-matched pose (on_l2_mid_pose retries).
+            # Do NOT project with wall Mid — newer Mid yaw on older Odin → fan.
+            self._pending_l2 = (msg, arr, off_t, wall_cloud)
             self._n_skip_no_locked += 1
-            # Still publish live with wall Mid so RViz is not blank.
-            T_viz = self._ema_mid_pose(T_wall)
-            T_map = T_viz @ self.T_body_odin_lidar
-            out_live_pts = (arr @ T_map[:3, :3].T) + T_map[:3, 3]
-            self._publish_live(msg.header.stamp, out_live_pts)
             return
 
         self._pending_l2 = None
         self._last_sync_dt = dt_locked
+        # Deskew once after pose lock (pending retries would double-deskew otherwise).
+        if self.deskew_odin and off_t.size == len(arr) and abs(self._mid_yaw_rate_rad) >= 1e-3:
+            arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
         T_locked = self._ema_mid_pose(T_locked)
         still = (
             self._mid_trans_vel < self.still_trans_vel
@@ -886,24 +926,12 @@ class OdinIndependentAccum(Node):
         else:
             self._hold_T_mid = T_locked.copy()
 
-        moving = (
-            self._mid_trans_vel >= self.latest_mid_min_trans_vel
-            or self._mid_yaw_rate_deg >= self.latest_mid_min_yaw_rate_deg
-        )
-        T_viz = T_locked
         self._n_locked_viz += 1
-        if self.prefer_latest_mid_pose and moving and T_wall is not None:
-            T_viz = T_wall
-            self._n_latest_mid_hit += 1
-
-        def _project(T_mid: np.ndarray) -> np.ndarray:
-            T_map = T_mid @ self.T_body_odin_lidar
-            R, t = T_map[:3, :3], T_map[:3, 3]
-            return (arr @ R.T) + t
-
-        out = _project(T_locked)
-        out_live_pts = _project(T_viz)
-        self._publish_live(msg.header.stamp, out_live_pts)
+        # Stamp-locked Mid only (never wall/latest) for live + accum.
+        T_map = T_locked @ self.T_body_odin_lidar
+        R, t = T_map[:3, :3], T_map[:3, 3]
+        out = (arr @ R.T) + t
+        self._publish_live(msg.header.stamp, out)
         self._accum_locked(out)
 
     def _publish_live(self, stamp, out_live_pts: np.ndarray) -> None:
@@ -935,13 +963,13 @@ class OdinIndependentAccum(Node):
             self._dirty = True
 
     def on_cloud(self, msg: PointCloud2) -> None:
-        arr = self._xyz_stride(msg)
+        arr, off_t = self._xyz_stride(msg)
         if arr.size == 0:
             return
 
         if self.project_with_mid:
             wall_cloud = self.get_clock().now().nanoseconds * 1e-9
-            self._project_odin_cloud(msg, arr, wall_cloud)
+            self._project_odin_cloud(msg, arr, off_t, wall_cloud)
             return
         elif self.cloud_already_in_odom:
             world = arr

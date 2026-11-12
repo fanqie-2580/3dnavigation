@@ -25,8 +25,9 @@ from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped
 from nav_msgs.msg import Odometry
+from builtin_interfaces.msg import Time as TimeMsg
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -115,8 +116,12 @@ def _stamp_sec(stamp) -> float:
 
 
 def _mat_from_odom(msg: Odometry) -> np.ndarray:
-    p = msg.pose.pose.position
-    q = msg.pose.pose.orientation
+    return _mat_from_pose(msg.pose.pose)
+
+
+def _mat_from_pose(pose: Pose) -> np.ndarray:
+    p = pose.position
+    q = pose.orientation
     x, y, z, w = q.x, q.y, q.z, q.w
     n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
     x, y, z, w = x / n, y / n, z / n, w / n
@@ -132,6 +137,80 @@ def _mat_from_odom(msg: Odometry) -> np.ndarray:
     T[:3, :3] = R
     T[:3, 3] = [p.x, p.y, p.z]
     return T
+
+
+def _pose_from_mat(T: np.ndarray) -> Pose:
+    pose = Pose()
+    pose.position.x = float(T[0, 3])
+    pose.position.y = float(T[1, 3])
+    pose.position.z = float(T[2, 3])
+    R = T[:3, :3]
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w, x, y, z = 0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w, x, y, z = (R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w, x, y, z = (R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w, x, y, z = (R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    pose.orientation.x = x / n
+    pose.orientation.y = y / n
+    pose.orientation.z = z / n
+    pose.orientation.w = w / n
+    return pose
+
+
+def _slerp_pose(p0: Pose, p1: Pose, a: float) -> Pose:
+    """Linear translation + quaternion slerp (a in [0,1])."""
+    a = max(0.0, min(1.0, float(a)))
+    T0 = _mat_from_pose(p0)
+    T1 = _mat_from_pose(p1)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = (1.0 - a) * T0[:3, 3] + a * T1[:3, 3]
+    q0 = np.array(
+        [p0.orientation.x, p0.orientation.y, p0.orientation.z, p0.orientation.w],
+        dtype=np.float64,
+    )
+    q1 = np.array(
+        [p1.orientation.x, p1.orientation.y, p1.orientation.z, p1.orientation.w],
+        dtype=np.float64,
+    )
+    q0 /= np.linalg.norm(q0) or 1.0
+    q1 /= np.linalg.norm(q1) or 1.0
+    if float(np.dot(q0, q1)) < 0.0:
+        q1 = -q1
+    dot = float(np.clip(np.dot(q0, q1), -1.0, 1.0))
+    if dot > 0.9995:
+        q = q0 + a * (q1 - q0)
+        q /= np.linalg.norm(q) or 1.0
+    else:
+        th = math.acos(dot)
+        s = math.sin(th) or 1.0
+        q = (math.sin((1.0 - a) * th) * q0 + math.sin(a * th) * q1) / s
+    out = Pose()
+    out.position.x = float(T[0, 3])
+    out.position.y = float(T[1, 3])
+    out.position.z = float(T[2, 3])
+    out.orientation.x = float(q[0])
+    out.orientation.y = float(q[1])
+    out.orientation.z = float(q[2])
+    out.orientation.w = float(q[3])
+    return out
+
+
+def _stamp_msg(t: float) -> TimeMsg:
+    sec = int(math.floor(t))
+    nsec = int(round((t - sec) * 1e9))
+    if nsec >= 1_000_000_000:
+        sec += 1
+        nsec -= 1_000_000_000
+    return TimeMsg(sec=sec, nanosec=nsec)
 
 
 def _unpack_points(
@@ -492,21 +571,52 @@ class OdinRawDownsampleBridge(Node):
         return best
 
     def _match_mid_for_l2(self, t_cloud: float, wall_cloud: float):
-        """Prefer same-timebase stamp match; else pair by arrival within window.
+        """Causal Mid pose at Odin cloud stamp (never a future Mid alone).
 
-        L2 header becomes the matched Mid stamp so IEKF sync_dt≈0 while geometry
-        stays unprojected at the Odin/geometry stamp (no Mid-IMU re-deskew).
+        Nearest-stamp matching picked Mid *after* Odin ~50% of frames. During
+        turns that projects Odin with a yaw that has already advanced → RViz
+        "overshoots then snaps back". Prefer:
+          1) SE3 interpolate Mid before/after bracketing t_cloud
+          2) else Mid with stamp <= t_cloud within mid_restamp_max_dt
+        Never fall back to wall/latest Mid for densify pose.
         """
-        stamp_hit = self._nearest_mid_stamp(t_cloud)
-        if stamp_hit is not None and stamp_hit[2] <= self.mid_restamp_max_dt:
-            self._last_l2_match = f'stamp:{stamp_hit[2]*1000:.0f}ms'
-            return stamp_hit
-        if wall_cloud > 0.0:
-            wall_hit = self._nearest_mid_by_wall(wall_cloud)
-            if wall_hit is not None and wall_hit[2] <= self.mid_restamp_max_dt:
-                self._last_l2_match = f'wall:{wall_hit[2]*1000:.0f}ms'
-                return wall_hit
-        self._last_l2_match = 'none'
+        del wall_cloud  # kept in signature for callers
+        before = None  # max t <= t_cloud
+        after = None  # min t > t_cloud
+        for t, st, _wall, pose in self._mid_stamps:
+            if t <= t_cloud:
+                if before is None or t > before[0]:
+                    before = (t, st, pose)
+            else:
+                if after is None or t < after[0]:
+                    after = (t, st, pose)
+
+        max_dt = self.mid_restamp_max_dt
+        # Interp only when both sides are close (tight half-window).
+        interp_dt = min(max_dt, 0.08)
+        if before is not None and after is not None:
+            dt_span = after[0] - before[0]
+            if (
+                dt_span > 1e-6
+                and (t_cloud - before[0]) <= interp_dt
+                and (after[0] - t_cloud) <= interp_dt
+            ):
+                a = (t_cloud - before[0]) / dt_span
+                pose = _slerp_pose(before[2], after[2], a)
+                self._last_l2_match = f'interp:{a:.2f}'
+                return (t_cloud, _stamp_msg(t_cloud), 0.0, pose)
+
+        if before is not None:
+            dt = t_cloud - before[0]
+            if dt <= max_dt:
+                self._last_l2_match = f'causal:{dt*1000:.0f}ms'
+                return (before[0], before[1], dt, before[2])
+
+        # Future-only Mid would overshoot on turns — refuse.
+        if after is not None:
+            self._last_l2_match = f'future_only:{(after[0]-t_cloud)*1000:.0f}ms'
+        else:
+            self._last_l2_match = 'none'
         return None
 
     def on_mid_odom(self, msg: Odometry) -> None:
@@ -752,13 +862,14 @@ class OdinRawDownsampleBridge(Node):
             else:
                 l2_arr = out_arr if not self.ground_only else arr
             if l2_arr is not None and len(l2_arr) > 0:
-                # Publish Mid pose *before* L2 cloud so densify can stamp-match
-                # in the same spin (cloud-after-pose avoids wall-Mid fallback).
+                # Densify pose ONLY when causal Mid match exists. Never publish
+                # _last_mid_pose under the cloud stamp — that is a future Mid
+                # and causes turn overshoot then snap-back in RViz.
                 pose = None
                 if mid_match is not None and len(mid_match) >= 4:
                     pose = mid_match[3]
-                if pose is None:
-                    pose = self._last_mid_pose
+                else:
+                    self._n_skip_l2_sync += 1
                 if self.pub_l2_mid_pose is not None and pose is not None:
                     ps = PoseStamped()
                     ps.header.stamp = geom_stamp
