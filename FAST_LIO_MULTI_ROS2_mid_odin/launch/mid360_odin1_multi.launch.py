@@ -60,7 +60,9 @@ def generate_launch_description():
     )
     enable_frame_fuse_arg = DeclareLaunchArgument(
         'enable_frame_fuse',
-        default_value='true',
+        # Default off: Python fuse is CPU-heavy; orphan duplicates caused dual
+        # /viz/accum_fused and load~8. densify already owns /viz/accum_odin.
+        default_value='false',
         description='Fuse Mid + Odin-in-map into /cloud_fused and /viz/accum_fused',
     )
     odin_voxel_arg = DeclareLaunchArgument(

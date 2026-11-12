@@ -527,6 +527,11 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | H1 | 写图/cov 用**最新** IMU，停车后把迟到转弯帧当 still 写入 | 用 `meas.imu` 窗口 max \|ω\| 作 `gyr_scan` 门控 |
 | H2 | deskew 含 signed 残差，但 `lidar_end_time2=Mid+span` → IMU 覆盖不足 | `lidar_end_time2=Mid+signed_dt+span` |
 
+### 10m. 脏运行 + hold 重投影（2026-11-12 现场）
+
+**现象**：双 `/mid_odin_frame_fuse` → `/viz/accum_fused` 在两套累积图间交替；大量遗留 static TF；load~8；`/cloud_odin_registered` 用**当前 Mid 位姿**重投旧 Odin body → 先错后跳。  
+**修复**：hold 改为缓存并重发 **map 系快照**（不改姿态）；`enable_frame_fuse` 默认 **false**；重启必须清孤儿 fuse/TF。 |
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

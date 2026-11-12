@@ -95,10 +95,11 @@ double bundle_pair_signed_dt_ = 0.0; // (L2+bias)-Mid; deskew/IMU horizon need s
 // Gyro of the *current* Bundle IMU window (not latest callback). <0 = unset.
 double bundle_scan_gyr_norm_ = -1.0;
 double bundle_scan_gyr_pitch_ = -1.0;
-// Last good Odin body (intensity-tagged, Mid-lidar frame) for smooth viz between
-// tight Bundle pairs — re-project with current Mid pose so RViz does not freeze.
-PointCloudXYZI::Ptr odin_hold_body(new PointCloudXYZI());
-bool odin_hold_have = false;
+// Last good Odin cloud already in map frame. On Mid-only ticks republish this
+// snapshot (update stamp only) — do NOT re-warp old body with the new Mid pose
+// (that caused "wrong shape then jump" on /cloud_odin_registered).
+PointCloudXYZI::Ptr odin_hold_map(new PointCloudXYZI());
+bool odin_hold_map_have = false;
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -1315,9 +1316,10 @@ void publish_odin_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &undistorted)
 {
-    // Fresh Odin from tight Bundle, else re-project last body with current Mid pose
-    // so /cloud_odin_registered never freezes across Mid-only ticks (turn snap).
+    // Fresh Odin → map + cache. Mid-only → republish last map snapshot (no re-pose).
     if (!pubOdin || !scan_pub_en)
+        return;
+    if (!p_imu->IMU_inited())
         return;
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
     if (undistorted && !undistorted->empty())
@@ -1333,13 +1335,27 @@ void publish_odin_from_undistorted(
     }
     if (!odin_body->empty())
     {
-        *odin_hold_body = *odin_body;
-        odin_hold_have = true;
-        publish_odin_body_to_world(pubOdin, odin_body, publish_lidar_time);
+        const int size = static_cast<int>(odin_body->size());
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+        for (int i = 0; i < size; i++)
+            RGBpointBodyToWorld(&odin_body->points[i], &laserCloudWorld->points[i]);
+        *odin_hold_map = *laserCloudWorld;
+        odin_hold_map_have = true;
+        sensor_msgs::msg::PointCloud2 laserCloudmsg;
+        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+        laserCloudmsg.header.frame_id = map_frame;
+        pubOdin->publish(laserCloudmsg);
         return;
     }
-    if (odin_hold_have && odin_hold_body && !odin_hold_body->empty())
-        publish_odin_body_to_world(pubOdin, odin_hold_body, publish_lidar_time);
+    if (odin_hold_map_have && odin_hold_map && !odin_hold_map->empty())
+    {
+        sensor_msgs::msg::PointCloud2 laserCloudmsg;
+        pcl::toROSMsg(*odin_hold_map, laserCloudmsg);
+        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+        laserCloudmsg.header.frame_id = map_frame;
+        pubOdin->publish(laserCloudmsg);
+    }
 }
 
 void publish_mid_from_undistorted(
