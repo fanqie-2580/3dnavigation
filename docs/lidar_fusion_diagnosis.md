@@ -518,7 +518,7 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 **现象**：couple~98% 后 `/Laser_map` / 融合图里 Odin 有时堆在错误位置。  
 **根因**：IEKF 窗 55ms 内的帧也 `map_insert`；`|dt|` 大时 deskew 残差在转动中把 Odin 写进 ikdtree，**无法撤销**。  
-**修复**：`lidar2_map_insert_max_sync_dt=18ms`（仅紧同步写图）；`insert_gyr_gate=0.35` 同帧挡硬转；IEKF `point_update` 仍可用到 55ms。重启清空旧错图。
+**修复**：移动中 `insert_max_dt=18ms`；近静止 `|ω|<0.12` 时放宽到 55ms 加密累积；`insert_gyr_gate=0.35` 同帧挡硬转。IEKF 仍可用到 55ms。
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 

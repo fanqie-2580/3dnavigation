@@ -347,9 +347,10 @@ def generate_launch_description():
                             ),
                             'max_accum_points': 400000,
                             'accum_skip_sec': 2.0,
-                            'accum_max_yaw_rate_deg': 3.0,
-                            'still_trans_vel': 0.05,
-                            'still_yaw_rate_deg': 3.0,
+                            # 3°/s was too strict → sparse /viz/accum_odin while walking.
+                            'accum_max_yaw_rate_deg': 8.0,
+                            'still_trans_vel': 0.08,
+                            'still_yaw_rate_deg': 8.0,
                             'accum_publish_period': 0.5,
                             'restamp_scan_to_now': True,
                             'extrinsic_T': [-0.011, -0.02329, 0.04412],

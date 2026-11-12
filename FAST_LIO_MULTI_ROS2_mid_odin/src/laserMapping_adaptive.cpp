@@ -213,8 +213,11 @@ double lidar2_residual_cov_scale = 25.0;
 double lidar2_max_residual = 0.12;
 // If false: Odin still updates IEKF (tight couple) but never enters ikdtree.
 bool lidar2_map_insert_en = false;
-// Only lock Odin into ikdtree when Bundle |dt| <= this (IEKF may use wider window).
+// Moving: only lock Odin into ikdtree when Bundle |dt| <= this.
 double lidar2_map_insert_max_sync_dt = 0.018;
+// Near-still (|ω|<still_gyr): allow looser |dt| so accum is dense (deskew≈0).
+double lidar2_map_insert_max_sync_dt_still = 0.055;
+double lidar2_map_insert_still_gyr = 0.12;
 // Skip Odin → ikdtree while |ω| high (stamp residual / extrinsic smear).
 // IEKF point update can stay on; only map insert is gated.
 double lidar2_map_insert_gyr_gate = 0.20;
@@ -1099,13 +1102,21 @@ void map_incremental()
             std::max(odin_map_insert_block_until,
                      now_ros + lidar2_map_insert_cooldown_sec);
     }
-    // IEKF may couple with |dt| up to max_sync_dt (~55ms). Map insert is stricter:
-    // large residual deskew still smears Odin into ikdtree permanently.
+    // IEKF may couple up to max_sync_dt. Map insert: strict while moving, loose
+    // when still (ω·ε≈0) so /Laser_map Odin is not sparse.
+    const bool near_still =
+        (lidar2_map_insert_still_gyr <= 0.0) ||
+        (last_imu_gyr_norm < lidar2_map_insert_still_gyr);
+    const double insert_dt_lim =
+        near_still
+            ? ((lidar2_map_insert_max_sync_dt_still > 0.0)
+                   ? lidar2_map_insert_max_sync_dt_still
+                   : lidar2_max_sync_dt)
+            : lidar2_map_insert_max_sync_dt;
     const bool sync_too_loose_for_map =
         bundle_enabled &&
         (bundle_pair_dt_ < 0.0 ||
-         (lidar2_map_insert_max_sync_dt > 0.0 &&
-          bundle_pair_dt_ > lidar2_map_insert_max_sync_dt));
+         (insert_dt_lim > 0.0 && bundle_pair_dt_ > insert_dt_lim));
     const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
@@ -1750,6 +1761,8 @@ public:
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
         this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt", 0.018);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt_still", 0.055);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_still_gyr", 0.12);
         this->declare_parameter<double>("mapping.lidar2_map_insert_gyr_gate", 0.20);
         this->declare_parameter<double>("mapping.lidar2_map_insert_cooldown_sec", 0.8);
         this->declare_parameter<double>("mapping.lidar2_pitch_gyr_gate", 0.20);
@@ -1839,6 +1852,10 @@ public:
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
         this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt", lidar2_map_insert_max_sync_dt, 0.018);
+        this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt_still",
+                               lidar2_map_insert_max_sync_dt_still, 0.055);
+        this->get_parameter_or("mapping.lidar2_map_insert_still_gyr",
+                               lidar2_map_insert_still_gyr, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_gyr_gate", lidar2_map_insert_gyr_gate, 0.20);
         this->get_parameter_or("mapping.lidar2_map_insert_cooldown_sec", lidar2_map_insert_cooldown_sec, 0.8);
         this->get_parameter_or("mapping.lidar2_pitch_gyr_gate", lidar2_pitch_gyr_gate, 0.20);
@@ -1992,6 +2009,8 @@ public:
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
                  << " insert_max_dt=" << lidar2_map_insert_max_sync_dt * 1000.0 << "ms"
+                 << " still_dt=" << lidar2_map_insert_max_sync_dt_still * 1000.0 << "ms"
+                 << "@|w|<" << lidar2_map_insert_still_gyr
                  << " insert_gyr_gate=" << lidar2_map_insert_gyr_gate
                  << "rad/s cooldown=" << lidar2_map_insert_cooldown_sec << "s"
                  << endl

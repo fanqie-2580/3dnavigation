@@ -81,11 +81,12 @@
       lidar2_stamp_bias_sec: 0.065
       lidar2_residual_cov_scale: 50.0
       lidar2_max_residual: 0.08
-      # Odin → ikdtree only when sync is tight. IEKF may still use up to max_sync_dt.
-      # Loose |dt| deskew smear locked permanently into /Laser_map (wrong accum).
+      # Odin → ikdtree: strict |dt| while moving; near-still allow full couple window
+      # so accum is dense (ω·ε≈0). Hard-turn same-frame block, no cooldown.
       lidar2_map_insert_en: true
       lidar2_map_insert_max_sync_dt: 0.018
-      # Same-frame only (no cooldown): skip insert while turning hard.
+      lidar2_map_insert_max_sync_dt_still: 0.055
+      lidar2_map_insert_still_gyr: 0.12
       lidar2_map_insert_gyr_gate: 0.35
       lidar2_map_insert_cooldown_sec: 0.0
 
