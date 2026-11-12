@@ -490,6 +490,16 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | deskew | 按 Mid 轴逐点；**支持 t\<0 反推** |
 | 删除 | 事后 `Exp(-ω·bias)` 整帧硬转 |
 
+### 10i. stamp_bias 未进 deskew（2026-11-12）
+
+**根因**：Bundle 配对用 `(L2 + stamp_bias) ≈ Mid_beg`（bias≈65ms），但 `UndistortPclMultiLiDAR` 仍用裸 `L2 − Mid` 算 Odin 时间 → **系统偏差 ≈ −bias**。转动时几何误差 ≈ `ω·bias`，停车消失 → 先错后跳变。
+
+| 修复 | |
+|------|--|
+| deskew | `t = (L2 + stamp_bias − Mid_beg) + offset`，逐点 Mid-IMU deskew |
+| `set_lidar2_stamp_bias` | 与 Bundle 同一参数 |
+| `lidar2_map_insert_en=true` | Bundle \|dt\|≤40ms 且 IEKF ok 时写 `/Laser_map` |
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

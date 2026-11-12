@@ -40,6 +40,8 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  // Same convention as Bundle sync: physical Mid time ≈ L2_stamp + bias.
+  void set_lidar2_stamp_bias(const double bias_sec) { lidar2_stamp_bias_ = bias_sec; }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_, const bool &multi_lidar, int lidar_num = 1);
   bool IMU_inited() const { return !imu_need_init_; }
@@ -69,6 +71,7 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_, last_lidar_end_time_2;
+  double lidar2_stamp_bias_ = 0.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -484,28 +487,25 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
 
-  // Odin dToF: offset_time is per-row group relative to cloud.timestamp (header),
-  // span ~0..94ms. Per-point Mid-IMU deskew with USB/PTP header is fragile:
-  //   - varying Bundle residual changes (L2-Mid) every frame
-  //   - |t_end - t_point| can exceed kMaxUndistortDt → mixed deskewed/raw → snap
-  // Live still data: NN OK (~0.18) but centroid flickers; turns still wrong-then-snap.
-  // Fix: ONE representative time (frame mid) for the whole Odin cloud, then the
-  // same deskew_cloud path (incl. t<0 back-prop) → rigid SE3 to Mid end, no
-  // intra-frame Mid-IMU on unreliable per-point host times.
+  // Odin dToF: offset_time is relative to USB/host header (span ~0..94ms).
+  // Bundle pairs with (L2_stamp + stamp_bias) ≈ Mid_beg, but deskew previously
+  // used raw (L2 - Mid) and omitted bias → systematic ~−65ms time error.
+  // During yaw rate ω that becomes ~ω·bias rad of smear that vanishes when
+  // ω→0 → classic "wrong then jump". Remap each point onto Mid timeline with
+  // the SAME bias as Bundle, then per-point Mid-IMU deskew (t<0 back-prop OK).
   if (!pcl_2_out.points.empty())
   {
-    double odin_span = 0.0;
-    for (const auto &pt : pcl_2_out.points)
-      odin_span = std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
-    const double header_off = meas.lidar_beg_time2 - meas.lidar_beg_time;
-    double t_rel = header_off + 0.5 * odin_span;
-    if (t_rel < -kMaxBundleSpan)
-      t_rel = -kMaxBundleSpan;
-    if (t_rel > kMaxBundleSpan)
-      t_rel = kMaxBundleSpan;
-    const float t_ms = static_cast<float>(t_rel * 1000.0);
+    const double header_off =
+        (meas.lidar_beg_time2 + lidar2_stamp_bias_) - meas.lidar_beg_time;
     for (auto &pt : pcl_2_out.points)
-      pt.curvature = t_ms;
+    {
+      double t_rel = header_off + static_cast<double>(pt.curvature) / 1000.0;
+      if (t_rel < -kMaxBundleSpan)
+        t_rel = -kMaxBundleSpan;
+      if (t_rel > kMaxBundleSpan + 0.12)
+        t_rel = kMaxBundleSpan + 0.12;
+      pt.curvature = static_cast<float>(t_rel * 1000.0);
+    }
     deskew_cloud(pcl_2_out, meas.lidar_beg_time);
   }
 

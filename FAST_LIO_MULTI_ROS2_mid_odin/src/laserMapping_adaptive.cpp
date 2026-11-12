@@ -1855,6 +1855,8 @@ public:
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+        // Deskew must use the same L2 stamp bias as Bundle pairing.
+        p_imu->set_lidar2_stamp_bias(lidar2_stamp_bias_sec);
 
         // for multi lidar tf only
         if (multi_lidar)
