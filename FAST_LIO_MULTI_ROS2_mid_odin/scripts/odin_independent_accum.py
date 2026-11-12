@@ -220,10 +220,17 @@ class OdinIndependentAccum(Node):
         self.declare_parameter('latest_mid_min_yaw_rate_deg', 8.0)
         # Stamp /odin1/cloud_in_map with now (map-frame draw; TF deadband handles still).
         self.declare_parameter('restamp_scan_to_now', True)
-        # Below these rates, reuse last Mid pose for densify (stop still-shake).
+        # Below these rates, treat robot as still for deskew gate (not hard freeze).
         self.declare_parameter('still_trans_vel', 0.05)
         self.declare_parameter('still_yaw_rate_deg', 3.0)
+        # Densify pose deadband (match laserMapping TF hold): small Mid IEKF
+        # wander must NOT swing Odin far points while TF/body looks stable.
+        self.declare_parameter('densify_hold_trans', 0.012)  # m
+        self.declare_parameter('densify_hold_rot_deg', 0.40)
+        # Light track when above deadband (1.0=snap to locked each frame).
+        self.declare_parameter('densify_track_alpha', 0.15)
         # Yaw deskew Odin points with Mid yaw rate (kills turn fan vs Mid).
+        # Only when |yaw_rate| >= still_yaw_rate_deg — else Mid noise deskews randomly.
         self.declare_parameter('deskew_odin', True)
         # Official Odin IMU→lidar (wiki), R≈I — matches downsample bridge.
         self.declare_parameter('imu_to_lidar_xyz', [-0.02663, 0.03447, 0.02174])
@@ -286,6 +293,11 @@ class OdinIndependentAccum(Node):
         self.restamp_scan_to_now = bool(self.get_parameter('restamp_scan_to_now').value)
         self.still_trans_vel = float(self.get_parameter('still_trans_vel').value)
         self.still_yaw_rate_deg = float(self.get_parameter('still_yaw_rate_deg').value)
+        self.densify_hold_trans = float(self.get_parameter('densify_hold_trans').value)
+        self.densify_hold_rot_deg = float(self.get_parameter('densify_hold_rot_deg').value)
+        self.densify_track_alpha = float(
+            np.clip(self.get_parameter('densify_track_alpha').value, 0.01, 1.0)
+        )
         self.deskew_odin = bool(self.get_parameter('deskew_odin').value)
         self._ema_mid_T: Optional[np.ndarray] = None
         self._mid_yaw_rate_rad = 0.0
@@ -913,18 +925,18 @@ class OdinIndependentAccum(Node):
 
         self._pending_l2 = None
         self._last_sync_dt = dt_locked
-        # Deskew once after pose lock (pending retries would double-deskew otherwise).
-        if self.deskew_odin and off_t.size == len(arr) and abs(self._mid_yaw_rate_rad) >= 1e-3:
+        # Deskew only when truly turning. Near-zero Mid yaw noise was rotating
+        # the Odin wedge every frame → "slight motion, huge shake".
+        if (
+            self.deskew_odin
+            and off_t.size == len(arr)
+            and self._mid_yaw_rate_deg >= self.still_yaw_rate_deg
+        ):
             arr = self._deskew_yaw(arr, off_t, self._mid_yaw_rate_rad)
         T_locked = self._ema_mid_pose(T_locked)
-        still = (
-            self._mid_trans_vel < self.still_trans_vel
-            and self._mid_yaw_rate_deg < self.still_yaw_rate_deg
-        )
-        if still and self._hold_T_mid is not None:
-            T_locked = self._hold_T_mid
-        else:
-            self._hold_T_mid = T_locked.copy()
+        # Deadband densify pose like map→body TF hold. Old still_hold froze while
+        # Mid moved under the gate then snapped — looked like amplified shake.
+        T_locked = self._deadband_densify_pose(T_locked)
 
         self._n_locked_viz += 1
         # Stamp-locked Mid only (never wall/latest) for live + accum.
@@ -933,6 +945,24 @@ class OdinIndependentAccum(Node):
         out = (arr @ R.T) + t
         self._publish_live(msg.header.stamp, out)
         self._accum_locked(out)
+
+    def _deadband_densify_pose(self, T_locked: np.ndarray) -> np.ndarray:
+        """Hold densify Mid pose under TF-like deadband; soft-track above it."""
+        if self._hold_T_mid is None:
+            self._hold_T_mid = T_locked.copy()
+            return self._hold_T_mid
+        T_rel = se3_inv(self._hold_T_mid) @ T_locked
+        trans = float(np.linalg.norm(T_rel[:3, 3]))
+        R = T_rel[:3, :3]
+        cos_a = max(-1.0, min(1.0, 0.5 * (float(R[0, 0] + R[1, 1] + R[2, 2]) - 1.0)))
+        rot_deg = math.degrees(math.acos(cos_a))
+        if trans < self.densify_hold_trans and rot_deg < self.densify_hold_rot_deg:
+            return self._hold_T_mid
+        a = self.densify_track_alpha
+        if trans > 0.03 or rot_deg > 0.8:
+            a = max(a, 0.65)
+        self._hold_T_mid = self._lerp_se3(self._hold_T_mid, T_locked, a)
+        return self._hold_T_mid
 
     def _publish_live(self, stamp, out_live_pts: np.ndarray) -> None:
         t_cloud = stamp_sec(stamp)
