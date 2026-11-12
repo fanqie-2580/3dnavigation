@@ -458,17 +458,27 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   };
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
-  // Odin offset_time spans ~0..100ms WITHIN the frame (live raw), so
-  // intra-frame Mid-IMU deskew is required — zeroing curvature left a
-  // ω·Δt smear that vanished when ω→0 ("wrong then snap").
-  //
-  // But use_host_ros_time=2 makes header = USB RECEIVE time. Anchoring
-  //   t = header + offset_time
-  // on Mid IMU pushes points into the future past Mid end → swing/snap.
-  // Fix: keep per-point curvature, deskew on Mid's time base (same as Mid
-  // scan window covered by IMUpose). Bundle already paired nearest Mid.
+  // Odin offset_time spans ~0..100ms WITHIN the frame → need intra-frame
+  // deskew. USB header must NOT be the absolute Mid time base (swing/snap),
+  // so deskew on Mid beg. Bundle uses lidar2_stamp_bias≈65ms so Mid≈L2+bias.
+  // Residual: Odin body is still ~bias earlier than Mid → whole-frame Exp(-ω·bias).
+  constexpr double kOdinStampBias = 0.065; // keep in sync with lidar2_stamp_bias_sec
   if (!pcl_2_out.points.empty())
+  {
     deskew_cloud(pcl_2_out, meas.lidar_beg_time);
+    if (kOdinStampBias > 1e-4 && angvel_last.norm() > 1e-4)
+    {
+      const M3D R_corr = Exp(angvel_last, -kOdinStampBias);
+      for (auto &pt : pcl_2_out.points)
+      {
+        V3D p(pt.x, pt.y, pt.z);
+        p = R_corr * p;
+        pt.x = p(0);
+        pt.y = p(1);
+        pt.z = p(2);
+      }
+    }
+  }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360
   for (auto &pt : pcl_2_out.points) pt.intensity = 200.0f;  // Odin1

@@ -513,6 +513,18 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 | Bundle dt | mean≈85ms，**80% >80ms**，多帧 ~95–100ms（贴 `max_sync_dt`） |
 | 后果 | Mid↔L2 配对在窗口边缘抖动 → Odin 整帧跟着跳/更不对 |
 
+### 10g. Bundle 锯齿与 stamp 对齐（2026-11-12）
+
+**现象**：即使关 deskew 清零、再开 Mid 时间基 deskew，转动错位/弹回仍在。日志 Bundle dt 呈 **0→100ms 锯齿**（贴 `max_sync_dt`）。
+
+| 尝试 | 结果 |
+|------|------|
+| `stamp_comp` 固定减 L2 stamp | L2 掉进 Mid 帧间隙 → Bundle 更差 |
+| `align_l2_stamp_to_mid` 拷贝**偏旧** Mid stamp | Bundle **卡死在 ~99ms** |
+| **`lidar2_stamp_bias_sec=0.065`**（配对时 L2+bias vs Mid） | Bundle mean≈26ms，**gt50=0** |
+| Mid 时间基 deskew + 整帧 `Exp(-ω·bias)` | 补偿 USB 相对时延几何差 |
+| map_insert：`bundle_dt>40ms` 不写 ikdtree | 同步质量门（非转向冷却） |
+
 ### 10e. 转动时 Odin 左右摆（2026-11-12）
 
 RViz `Odin1_Realtime` 原订阅 densify `/odin1/cloud_in_map`：整帧用**一个** Mid 位姿投影。  

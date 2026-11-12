@@ -122,12 +122,14 @@ public:
     declare_parameter<double>("min_confidence", 30.0);
     declare_parameter<double>("mid_restamp_max_dt", 0.12);
     declare_parameter<double>("max_cloud_age_sec", 0.25);
-    // Do NOT rewrite L2 cloud stamp (Bundle must stay on receive-time domain).
+    // Legacy: subtract from L2 stamp (breaks Bundle — leaves L2 between Mid
+    // frames → sync dt walks to max_sync_dt). Prefer align_l2_stamp_to_mid.
     declare_parameter<double>("stamp_latency_comp_sec", 0.0);
-    // Densify-only: USB stamp is receive≈capture+150ms. Match Mid at capture
-    // for /odin1/l2_mid_pose content, but keep pose header stamp == L2 stamp
-    // so densify lookup still hits. Fixes turn left/right swing on cloud_in_map.
-    declare_parameter<double>("densify_mid_lag_comp_sec", 0.15);
+    // Match Mid at (L2_recv - lag) then optionally copy that Mid stamp onto L2
+    // so Bundle dt≈0. Live relative L2−Mid lag ≈60–80ms (not full USB 150ms).
+    declare_parameter<double>("densify_mid_lag_comp_sec", 0.065);
+    // Snap L2 header stamp to matched Mid stamp (kills 0→100ms Bundle sawtooth).
+    declare_parameter<bool>("align_l2_stamp_to_mid", true);
     declare_parameter<bool>("publish_ds_topic", true);
 
     input_topic_ = get_parameter("input_topic").as_string();
@@ -145,6 +147,7 @@ public:
     stamp_latency_comp_sec_ = std::max(0.0, get_parameter("stamp_latency_comp_sec").as_double());
     densify_mid_lag_comp_sec_ =
       std::max(0.0, get_parameter("densify_mid_lag_comp_sec").as_double());
+    align_l2_stamp_to_mid_ = get_parameter("align_l2_stamp_to_mid").as_bool();
     publish_ds_ = get_parameter("publish_ds_topic").as_bool();
 
     auto reliable = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
@@ -173,11 +176,12 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "C++ odin bridge %s -> l2=%s ds=%s max=%d pre=%d voxel=%.3f mid_dt<=%.3f "
-      "age<=%.2f stamp_comp=%.0fms densify_mid_lag=%.0fms",
+      "age<=%.2f stamp_comp=%.0fms mid_lag=%.0fms align_l2_to_mid=%s",
       input_topic_.c_str(), l2_body_topic_.c_str(),
       publish_ds_ ? output_topic_.c_str() : "off",
       max_points_, pre_decimate_max_, voxel_, mid_restamp_max_dt_, max_cloud_age_sec_,
-      stamp_latency_comp_sec_ * 1000.0, densify_mid_lag_comp_sec_ * 1000.0);
+      stamp_latency_comp_sec_ * 1000.0, densify_mid_lag_comp_sec_ * 1000.0,
+      align_l2_stamp_to_mid_ ? "true" : "false");
   }
 
 private:
@@ -193,38 +197,57 @@ private:
     ++n_mid_;
   }
 
-  // Causal Mid only: stamp <= t_cloud within mid_restamp_max_dt.
-  bool match_causal_mid(double t_cloud, geometry_msgs::msg::Pose &pose_out, std::string &tag)
+  // Nearest Mid within mid_restamp_max_dt (prefer <= t_cloud, else closest).
+  bool match_mid(
+    double t_cloud, geometry_msgs::msg::Pose &pose_out,
+    builtin_interfaces::msg::Time &stamp_out, std::string &tag)
   {
+    const MidStamp *best = nullptr;
+    double best_abs = 1e9;
     const MidStamp *before = nullptr;
-    const MidStamp *after = nullptr;
     for (const auto &m : mid_stamps_) {
+      const double adt = std::fabs(m.t - t_cloud);
+      if (adt < best_abs) {
+        best_abs = adt;
+        best = &m;
+      }
       if (m.t <= t_cloud) {
         if (!before || m.t > before->t) before = &m;
-      } else {
-        if (!after || m.t < after->t) after = &m;
       }
     }
-    if (before) {
-      const double dt = t_cloud - before->t;
-      if (dt <= mid_restamp_max_dt_) {
-        pose_out = before->pose;
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "causal:%.0fms", dt * 1000.0);
-        tag = buf;
-        return true;
-      }
+    // Prefer causal (before) if still inside window — avoids using future Mid
+    // pose while Odin USB stamp is late.
+    const MidStamp *pick = nullptr;
+    double dt_signed = 0.0;
+    if (before && (t_cloud - before->t) <= mid_restamp_max_dt_) {
+      pick = before;
+      dt_signed = t_cloud - before->t;
       char buf[64];
-      std::snprintf(buf, sizeof(buf), "causal_old:%.0fms", dt * 1000.0);
+      std::snprintf(buf, sizeof(buf), "causal:%.0fms", dt_signed * 1000.0);
       tag = buf;
-    } else if (after) {
+    } else if (best && best_abs <= mid_restamp_max_dt_) {
+      pick = best;
+      dt_signed = t_cloud - best->t;
       char buf[64];
-      std::snprintf(buf, sizeof(buf), "future_only:%.0fms", (after->t - t_cloud) * 1000.0);
+      std::snprintf(buf, sizeof(buf), "nearest:%+.0fms", dt_signed * 1000.0);
       tag = buf;
+    } else if (before) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "causal_old:%.0fms", (t_cloud - before->t) * 1000.0);
+      tag = buf;
+      return false;
+    } else if (best) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "far:%.0fms", best_abs * 1000.0);
+      tag = buf;
+      return false;
     } else {
       tag = "none";
+      return false;
     }
-    return false;
+    pose_out = pick->pose;
+    stamp_out = pick->stamp;
+    return true;
   }
 
   void on_cloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
@@ -338,12 +361,27 @@ private:
 
     std_msgs::msg::Header header = msg->header;
     header.frame_id = "odin_lidar";
-    // Keep receive-time stamp for Bundle (same domain as before). Optional
-    // stamp_latency_comp_sec rewrites L2 stamp — leave 0 unless experimenting.
     const double t_recv = stamp_sec(msg->header.stamp);
+    // Optional legacy subtract (usually 0). Prefer Mid-stamp align below.
     const double t_l2 =
       (stamp_latency_comp_sec_ > 0.0) ? (t_recv - stamp_latency_comp_sec_) : t_recv;
-    header.stamp = sec_to_stamp(t_l2);
+    // Match Mid near capture-approx: USB receive leads capture by ~relative lag.
+    const double t_pose = t_l2 - densify_mid_lag_comp_sec_;
+    geometry_msgs::msg::Pose mid_pose;
+    builtin_interfaces::msg::Time mid_stamp;
+    std::string tag;
+    bool have_mid = false;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      have_mid = match_mid(t_pose, mid_pose, mid_stamp, tag);
+      last_l2_match_ = tag;
+    }
+    if (align_l2_stamp_to_mid_ && have_mid) {
+      // Bundle pairs by stamp — copying Mid stamp collapses 0→100ms sawtooth.
+      header.stamp = mid_stamp;
+    } else {
+      header.stamp = sec_to_stamp(t_l2);
+    }
     auto cloud = make_xyzit(header, pts);
 
     if (pub_ds_) {
@@ -351,29 +389,17 @@ private:
       ++n_pub_;
     }
 
-    // Densify Mid pose at capture-approx time; header stamp stays = L2 stamp.
-    const double t_pose = t_l2 - densify_mid_lag_comp_sec_;
-    geometry_msgs::msg::Pose mid_pose;
-    std::string tag;
-    bool have_mid = false;
-    {
-      std::lock_guard<std::mutex> lk(mtx_);
-      have_mid = match_causal_mid(t_pose, mid_pose, tag);
-      last_l2_match_ = tag;
-    }
-
     if (pub_l2_) {
-      // Always publish L2 for Bundle IEKF (stamp domain = receive).
       pub_l2_->publish(cloud);
       ++n_l2_pub_;
       if (have_mid && pub_l2_mid_) {
         geometry_msgs::msg::PoseStamped ps;
         ps.header.stamp = header.stamp;  // == L2 stamp for densify lookup
         ps.header.frame_id = "map";
-        ps.pose = mid_pose;              // Mid @ capture-approx
+        ps.pose = mid_pose;
         pub_l2_mid_->publish(ps);
       } else {
-        ++n_skip_l2_sync_;  // densify pose miss only
+        ++n_skip_l2_sync_;
       }
     }
   }
@@ -398,8 +424,9 @@ private:
   double min_confidence_ = 30.0;
   double mid_restamp_max_dt_ = 0.12;
   double stamp_latency_comp_sec_ = 0.0;
-  double densify_mid_lag_comp_sec_ = 0.15;
+  double densify_mid_lag_comp_sec_ = 0.065;
   double max_cloud_age_sec_ = 0.25;
+  bool align_l2_stamp_to_mid_ = true;
   bool publish_ds_ = true;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ds_, pub_l2_;

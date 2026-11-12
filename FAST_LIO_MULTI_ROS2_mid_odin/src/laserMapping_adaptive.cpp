@@ -196,6 +196,10 @@ double lidar2_vz_gate = 0.12;       // m/s |vz|; climbing
 double lidar2_pitch_gate_deg = 10.0; // |pitch| of Mid state
 // Reject L2 IEKF/bundle pair when |t_L2 - t_Mid| exceeds this (TCP lag gate).
 double lidar2_max_sync_dt = 0.08;
+// Live (USB host stamp): L2 stamp is systematically earlier than Mid by ~60–80ms
+// at the same wall time. Add this to L2 when computing Bundle |dt| so pairing
+// centers near 0 instead of walking the max_sync edge.
+double lidar2_stamp_bias_sec = 0.065;
 // Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
 double lidar2_residual_cov_scale = 25.0;
 // Reject Odin point-to-plane residuals larger than this (meters) in Stage2.
@@ -856,10 +860,13 @@ bool sync_packages_bundle(MeasureGroup &meas)
             meas.lidar_end_time = lidar_end_time;
 
             size_t best_i = 0;
-            double best_dt = std::fabs(time_buffer2.front() - meas.lidar_beg_time);
+            auto bundle_dt = [&](double t_l2) {
+                return std::fabs((t_l2 + lidar2_stamp_bias_sec) - meas.lidar_beg_time);
+            };
+            double best_dt = bundle_dt(time_buffer2.front());
             for (size_t i = 1; i < time_buffer2.size(); i++)
             {
-                const double dt = std::fabs(time_buffer2[i] - meas.lidar_beg_time);
+                const double dt = bundle_dt(time_buffer2[i]);
                 if (dt < best_dt)
                 {
                     best_dt = dt;
@@ -1016,11 +1023,15 @@ void map_incremental()
             std::max(odin_map_insert_block_until,
                      now_ros + lidar2_map_insert_cooldown_sec);
     }
+    // Sync-quality gate (not turn cooldown): Bundle Mid↔L2 |dt| too large means
+    // Odin world pose is unreliable — do not lock into ikdtree.
+    constexpr double kOdinInsertMaxBundleDt = 0.04; // s
     const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
          last_imu_gyr_norm >= lidar2_map_insert_gyr_gate) ||
-        now_ros < odin_map_insert_block_until;
+        now_ros < odin_map_insert_block_until ||
+        (bundle_enabled && bundle_pair_dt_ > kOdinInsertMaxBundleDt);
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1645,6 +1656,7 @@ public:
         this->declare_parameter<std::string>("mapping.odin_odom_topic", "/odin1/odometry");
         this->declare_parameter<double>("mapping.lidar2_pose_gyr_gate", 0.35);
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
+        this->declare_parameter<double>("mapping.lidar2_stamp_bias_sec", 0.065);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 25.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
@@ -1731,6 +1743,7 @@ public:
         this->get_parameter_or("mapping.odin_odom_topic", odin_odom_topic, std::string("/odin1/odometry"));
         this->get_parameter_or("mapping.lidar2_pose_gyr_gate", lidar2_pose_gyr_gate, 0.35);
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
+        this->get_parameter_or("mapping.lidar2_stamp_bias_sec", lidar2_stamp_bias_sec, 0.065);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 25.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
@@ -1879,6 +1892,7 @@ public:
                  << " pose_factor=" << (lidar2_pose_factor_en ? "true" : "false")
                  << " pose_alpha=" << lidar2_pose_alpha
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
+                 << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
