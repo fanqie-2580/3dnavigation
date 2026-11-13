@@ -1,0 +1,338 @@
+{
+  "map_source": "fusion_cloud_registered_pose_contaminated",
+  "map_meta": {
+    "n_cand": 295,
+    "n_keep": 39,
+    "reject_w": 242,
+    "reject_v": 14,
+    "n_pts": 40000,
+    "warning": "Poses of /cloud_registered come from fused IEKF when lidar2_update_en=true; Mid points only, but trajectory may be Odin-Stage2 influenced."
+  },
+  "align": null,
+  "n_pairs": 248,
+  "insert_audit_v3": {
+    "n": 248,
+    "gate_frac_med": 0.5,
+    "det_frac_med": 0.5,
+    "queued_frac_med": 0.008886255924170616,
+    "queued_frac_mean": 0.048232041867651274,
+    "frac_frames_block": 0.5,
+    "ikd_add_total_med": 69.0,
+    "note": "V2 'ins_frac' was gate_pass/cand, NOT true ikdtree inserts. queued/cand is points entering PointToAdd/PointNoNeedDownsample. ikd_add_total is Add_Points return for Mid+Odin; downsample=false path does not increment the return counter.",
+    "by_seg_queued": {
+      "still": {
+        "n": 41,
+        "med": 0.0
+      },
+      "turn_left": {
+        "n": 22,
+        "med": 0.0
+      },
+      "turn_right": {
+        "n": 35,
+        "med": 0.047619047619047616
+      },
+      "translate": {
+        "n": 20,
+        "med": 0.0
+      },
+      "combined": {
+        "n": 92,
+        "med": 0.01665034280117532
+      },
+      "other": {
+        "n": 38,
+        "med": 0.02745456448063083
+      }
+    }
+  },
+  "by_segment": {
+    "still": {
+      "n": 41,
+      "nnA_pair_p50": 0.10171670769762453,
+      "nnB_pair_p50": 0.10242604293556734,
+      "d_nn_pair": 0.00018373416170411327,
+      "resA_pair_p50": 0.07223283415928217,
+      "resB_pair_p50": 0.07206013901301844,
+      "d_res_pair": 0.00048793254843193523,
+      "frac_nn_both": 0.8491666666666666,
+      "frac_plane_both": 0.275,
+      "online_d_res": -6.401004209521943e-05,
+      "queued_frac": 0.0,
+      "gate_frac": 0.0,
+      "frac_B_better_res": 0.3902439024390244,
+      "frac_A_better_res": 0.5365853658536586
+    },
+    "turn_left": {
+      "n": 22,
+      "nnA_pair_p50": 0.14359568959804503,
+      "nnB_pair_p50": 0.10968479557468563,
+      "d_nn_pair": -0.0030348564639627526,
+      "resA_pair_p50": 0.11050320303850836,
+      "resB_pair_p50": 0.08172339494241676,
+      "d_res_pair": -0.0010724542075308714,
+      "frac_nn_both": 0.8641666666666667,
+      "frac_plane_both": 0.28041666666666665,
+      "online_d_res": -0.000670548276825278,
+      "queued_frac": 0.0,
+      "gate_frac": 0.0,
+      "frac_B_better_res": 0.6363636363636364,
+      "frac_A_better_res": 0.2727272727272727
+    },
+    "turn_right": {
+      "n": 35,
+      "nnA_pair_p50": 0.11114699518411714,
+      "nnB_pair_p50": 0.10334926215359883,
+      "d_nn_pair": -0.001197109762294285,
+      "resA_pair_p50": 0.07671930574696373,
+      "resB_pair_p50": 0.07756411271083907,
+      "d_res_pair": -0.00029919619124385566,
+      "frac_nn_both": 0.8391666666666666,
+      "frac_plane_both": 0.27166666666666667,
+      "online_d_res": -0.00012957302542226934,
+      "queued_frac": 0.047619047619047616,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.5142857142857142,
+      "frac_A_better_res": 0.4857142857142857
+    },
+    "translate": {
+      "n": 20,
+      "nnA_pair_p50": 0.12464855821855853,
+      "nnB_pair_p50": 0.11230852834846788,
+      "d_nn_pair": -0.0008974167445880412,
+      "resA_pair_p50": 0.09593180811032545,
+      "resB_pair_p50": 0.08898122240703055,
+      "d_res_pair": -0.001518464794222324,
+      "frac_nn_both": 0.8795833333333334,
+      "frac_plane_both": 0.28791666666666665,
+      "online_d_res": -0.0006238786685954234,
+      "queued_frac": 0.0,
+      "gate_frac": 0.0,
+      "frac_B_better_res": 0.55,
+      "frac_A_better_res": 0.4
+    },
+    "combined": {
+      "n": 92,
+      "nnA_pair_p50": 0.14391167114441203,
+      "nnB_pair_p50": 0.10761282422086241,
+      "d_nn_pair": -0.005582644949822584,
+      "resA_pair_p50": 0.11083212969306121,
+      "resB_pair_p50": 0.08136286803610249,
+      "d_res_pair": -0.0028535421415969986,
+      "frac_nn_both": 0.84625,
+      "frac_plane_both": 0.2725,
+      "online_d_res": -0.0005395158134123834,
+      "queued_frac": 0.01665034280117532,
+      "gate_frac": 0.5,
+      "frac_B_better_res": 0.7065217391304348,
+      "frac_A_better_res": 0.2826086956521739
+    },
+    "other": {
+      "n": 38,
+      "nnA_pair_p50": 0.10807839112423687,
+      "nnB_pair_p50": 0.1028668776199691,
+      "d_nn_pair": 0.00019155052003667471,
+      "resA_pair_p50": 0.07474618923473628,
+      "resB_pair_p50": 0.07262231675554232,
+      "d_res_pair": 0.00046739999923736675,
+      "frac_nn_both": 0.8520833333333333,
+      "frac_plane_both": 0.27416666666666667,
+      "online_d_res": -0.00022395083437215524,
+      "queued_frac": 0.02745456448063083,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.42105263157894735,
+      "frac_A_better_res": 0.5526315789473685
+    }
+  },
+  "motion": {
+    "n": 207,
+    "nnA_pair_p50": 0.12563811109457923,
+    "nnB_pair_p50": 0.10690796749115354,
+    "d_nn_pair": -0.002476121998889802,
+    "resA_pair_p50": 0.09522729594004364,
+    "resB_pair_p50": 0.08007247335829293,
+    "d_res_pair": -0.001485272151924455,
+    "frac_nn_both": 0.8491666666666666,
+    "frac_plane_both": 0.2733333333333333,
+    "online_d_res": -0.0003802144601872115,
+    "queued_frac": 0.017772511848341232,
+    "gate_frac": 1.0,
+    "frac_B_better_res": 0.5990338164251208,
+    "frac_A_better_res": 0.37681159420289856
+  },
+  "still": {
+    "n": 41,
+    "nnA_pair_p50": 0.10171670769762453,
+    "nnB_pair_p50": 0.10242604293556734,
+    "d_nn_pair": 0.00018373416170411327,
+    "resA_pair_p50": 0.07223283415928217,
+    "resB_pair_p50": 0.07206013901301844,
+    "d_res_pair": 0.00048793254843193523,
+    "frac_nn_both": 0.8491666666666666,
+    "frac_plane_both": 0.275,
+    "online_d_res": -6.401004209521943e-05,
+    "queued_frac": 0.0,
+    "gate_frac": 0.0,
+    "frac_B_better_res": 0.3902439024390244,
+    "frac_A_better_res": 0.5365853658536586
+  },
+  "b_clock_sweep_full_TWI_TIL": [
+    {
+      "b_clock_ms": -80.0,
+      "n": 104,
+      "nn_p50_med": 0.12278318556187545,
+      "res_p50_med": 0.08971617963714895
+    },
+    {
+      "b_clock_ms": -40.0,
+      "n": 104,
+      "nn_p50_med": 0.11264798857775282,
+      "res_p50_med": 0.08407922159936485
+    },
+    {
+      "b_clock_ms": -20.0,
+      "n": 104,
+      "nn_p50_med": 0.10995687004165636,
+      "res_p50_med": 0.08078294812780995
+    },
+    {
+      "b_clock_ms": 0.0,
+      "n": 104,
+      "nn_p50_med": 0.10896214142060238,
+      "res_p50_med": 0.0793515263940816
+    },
+    {
+      "b_clock_ms": 20.0,
+      "n": 104,
+      "nn_p50_med": 0.1098488739339207,
+      "res_p50_med": 0.07972026310644775
+    },
+    {
+      "b_clock_ms": 40.0,
+      "n": 104,
+      "nn_p50_med": 0.11193143886456491,
+      "res_p50_med": 0.08105147479479613
+    },
+    {
+      "b_clock_ms": 80.0,
+      "n": 104,
+      "nn_p50_med": 0.12060775772353627,
+      "res_p50_med": 0.08643354218347638
+    }
+  ],
+  "b_clock_sweep_naive_ignore_extrinsic": [
+    {
+      "b_clock_ms": -80.0,
+      "n": 104,
+      "nn_p50_med": 0.13376912723582066
+    },
+    {
+      "b_clock_ms": -40.0,
+      "n": 104,
+      "nn_p50_med": 0.12629806714085762
+    },
+    {
+      "b_clock_ms": -20.0,
+      "n": 104,
+      "nn_p50_med": 0.12385474883441339
+    },
+    {
+      "b_clock_ms": 0.0,
+      "n": 104,
+      "nn_p50_med": 0.12195796772985959
+    },
+    {
+      "b_clock_ms": 20.0,
+      "n": 104,
+      "nn_p50_med": 0.12262747179794896
+    },
+    {
+      "b_clock_ms": 40.0,
+      "n": 104,
+      "nn_p50_med": 0.123207542622784
+    },
+    {
+      "b_clock_ms": 80.0,
+      "n": 104,
+      "nn_p50_med": 0.1311418012130637
+    }
+  ],
+  "b_clock_geom_best_nn_full": {
+    "b_clock_ms": 0.0,
+    "n": 104,
+    "nn_p50_med": 0.10896214142060238,
+    "res_p50_med": 0.0793515263940816
+  },
+  "b_clock_geom_best_nn_naive": {
+    "b_clock_ms": 0.0,
+    "n": 104,
+    "nn_p50_med": 0.12195796772985959
+  },
+  "b_clock_geom_best_res_full": {
+    "b_clock_ms": 0.0,
+    "n": 104,
+    "nn_p50_med": 0.10896214142060238,
+    "res_p50_med": 0.0793515263940816
+  },
+  "note_b_clock": "geom-optimal \u2260 physical clock; full uses T_WI*T_IL",
+  "extrinsic_T_IL": [
+    -0.011,
+    -0.02329,
+    0.04412
+  ],
+  "time_axes": {
+    "topics": {
+      "/livox/imu": 23743,
+      "/livox/lidar": 1187,
+      "/odin1/imu": 47073,
+      "/odin1/cloud_raw_ds": 613
+    },
+    "mid_lidar_header_vs_imu": {
+      "n": 1187,
+      "med_ms": -1.6837120056152344,
+      "p10_ms": -2.5249481201171875,
+      "p90_ms": 2.7023792266845716,
+      "mean_ms": -0.906248502401916
+    },
+    "mid_lidar_end_vs_imu": {
+      "n": 1187,
+      "med_ms": -1.7499923706054688,
+      "p10_ms": -2.3337841033935547,
+      "p90_ms": 3.317546844482423,
+      "mean_ms": -0.6626409548315162
+    },
+    "mid_lidar_end_minus_header_ms": 100.11816024780273,
+    "odin_cloud_raw_ds_header_vs_odin_imu": {
+      "n": 613,
+      "med_ms": -0.01621246337890625,
+      "p10_ms": -1.005411148071289,
+      "p90_ms": 0.9897232055664065,
+      "mean_ms": -0.12573410208423608
+    },
+    "odin_cloud_raw_ds_header_vs_mid_imu": {
+      "n": 613,
+      "med_ms": -0.036716461181640625,
+      "p10_ms": -2.2748947143554688,
+      "p90_ms": 2.1949291229248047,
+      "mean_ms": -0.14344047372142799
+    },
+    "odin_imu_vs_mid_imu": {
+      "n": 47073,
+      "med_ms": 0.0021457672119140625,
+      "p10_ms": -2.2192001342773438,
+      "p90_ms": 2.2374153137207053,
+      "mean_ms": 0.0070144535896389274
+    },
+    "note": "These are header/timebase relationships, NOT physical LiDAR clock offset and NOT b_pair / dual-IMU xcorr / NN scan-phase."
+  },
+  "answers": {
+    "1_geom_b_clock_near_0": true,
+    "2_sensitive_to_map_pose_model": true,
+    "3_B_stable_on_independent": false,
+    "4_ready_stage2_trial": false,
+    "mid_only_rank": "similar",
+    "d_res_pair_motion": -0.001485272151924455,
+    "d_nn_pair_motion": -0.002476121998889802,
+    "independent_map": false
+  }
+}
