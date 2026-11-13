@@ -40,6 +40,8 @@
 #include <csignal>
 #include <unistd.h>
 #include <condition_variable>
+#include <numeric>
+#include <vector>
 /// module headers
 #include <omp.h>
 /// Eigen
@@ -72,6 +74,7 @@
 #include <string>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/u_int64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 using namespace std::chrono;
 
 #define LASER_POINT_COV     (0.001)
@@ -182,10 +185,15 @@ std::string odin_pub_time_mode = "A";
 // map / official /cloud_odin_registered. When on: publish fresh Bundle frames only
 // to /cloud_odin_registered_{A,D} from the same UndistortOdinNative cloud.
 bool publish_odin_time_query_ab_en = false;
+// Debug-only: shadow Odin_end→Mid_end SE3 re-expression vs raw Mid_end project.
+// Does NOT touch Stage2 / IEKF / ikdtree / gates / official topics.
+bool odin_cross_time_shadow_en = false;
 double bundle_bias_pre_sec_ = 0.065; // bias used for this Bundle pair (before EMA)
 uint64_t odin_tq_ab_frame_id_ = 0;
 long long n_odin_pub_query_ok = 0;
 long long n_odin_pub_query_fallback = 0;
+long long n_xtform_ok = 0;
+long long n_xtform_skip_hist = 0;
 struct MidPoseSample
 {
     double t = 0.0;
@@ -716,6 +724,258 @@ bool sample_odin_pub_pose(const double t_query, const state_ikfom &state_fb,
     if (qspan)
         *qspan = span;
     return false;
+}
+
+// ---- Mid L1 ↔ world (matches pointBodyToWorld convention) ----
+// p_W = R_WI * (R_IL * p_L + t_IL) + t_WI
+// where offset_R_L_I = R_IL (LiDAR wrt IMU), state.rot/pos = T_WI.
+inline V3D lidar_to_world(const state_ikfom &s, const V3D &p_L)
+{
+    return s.rot * (s.offset_R_L_I * p_L + s.offset_T_L_I) + s.pos;
+}
+inline V3D world_to_lidar(const state_ikfom &s, const V3D &p_W)
+{
+    const V3D p_I = s.rot.conjugate() * (p_W - s.pos);
+    return s.offset_R_L_I.conjugate() * (p_I - s.offset_T_L_I);
+}
+// Cross-time re-expression in Mid L1:
+// p_L(Mid_end) = inv(T_W_L1(Mid_end)) * T_W_L1(Odin_end) * p_L(Odin_end)
+inline V3D reexpress_L1_odin_end_to_mid_end(const state_ikfom &s_mid,
+                                            const state_ikfom &s_odin,
+                                            const V3D &p_L_odin_end)
+{
+    return world_to_lidar(s_mid, lidar_to_world(s_odin, p_L_odin_end));
+}
+
+// Shadow-only: compare Stage2-style (A) vs cross-time SE3 then Mid_end project (B).
+// Publishes /cloud_odin_xtform_{A,B} and /odin_xtform_metrics. No formal side effects.
+void shadow_odin_cross_time_eval(
+    const PointCloudXYZI::Ptr &undistorted,
+    const state_ikfom &state_mid_end,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubA,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubB,
+    const rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr &pubMet)
+{
+    if (!odin_cross_time_shadow_en || !odin_native_deskew_en)
+        return;
+    if (bundle_pair_dt_ < 0.0 || !Measures.lidar2 || Measures.lidar2->empty())
+        return;
+    if (!undistorted || undistorted->empty())
+        return;
+    if (ikdtree.Root_Node == nullptr)
+        return;
+
+    // Candidate physical Odin_end on host clock (D semantics). NOT b_pair.
+    double tA = 0.0, tD = 0.0, odin_span = 0.0, odin_med = 0.0, mid_span = 0.0,
+           H2 = 0.0;
+    odin_tq_compute(tA, tD, odin_span, odin_med, mid_span, H2);
+    const double t_odin_end = tD; // H2 + span
+    const double t_mid_end = lidar_end_time;
+
+    MidPoseQueryKind k_o = MidPoseQueryKind::FailEmpty;
+    MidPoseQueryKind k_m = MidPoseQueryKind::FailEmpty;
+    state_ikfom s_odin, s_mid;
+    double sp_o = 0.0, sp_m = 0.0;
+    const bool ok_o =
+        sample_mid_pose_at(t_odin_end, s_odin, &k_o, &sp_o) &&
+        mid_pose_query_usable(k_o);
+    // Mid_end: prefer exact Stage1 snapshot (just pushed); hist also OK.
+    const bool ok_m =
+        sample_mid_pose_at(t_mid_end, s_mid, &k_m, &sp_m) &&
+        mid_pose_query_usable(k_m);
+    if (!ok_o || !ok_m)
+    {
+        n_xtform_skip_hist++;
+        static int s_skip = 0;
+        if ((++s_skip % 20) == 0)
+        {
+            std::cout << "[odin-xtform] skip hist o=" << mid_pose_query_name(k_o)
+                      << " m=" << mid_pose_query_name(k_m)
+                      << " dt_ms=" << (t_odin_end - t_mid_end) * 1000.0
+                      << " hist=" << mid_pose_hist_.size() << "\n";
+        }
+        return;
+    }
+    // Use Stage1 Mid_end for project-to-world (matches Stage2 pre-update pose).
+    s_mid = state_mid_end;
+    n_xtform_ok++;
+
+    // Same UndistortOdinNative body cloud (already in Mid L1 @ Odin_end).
+    PointCloudXYZI::Ptr odin_L1(new PointCloudXYZI());
+    odin_L1->reserve(undistorted->size());
+    for (const auto &pt : undistorted->points)
+    {
+        if (pt.intensity >= kOdinIntensityTag)
+            odin_L1->push_back(pt);
+    }
+    if (odin_L1->empty())
+        return;
+
+    // Subsample for residual (keep publish denser capped).
+    constexpr int kMaxRes = 2500;
+    constexpr int kMaxPub = 12000;
+    std::vector<int> idx(odin_L1->size());
+    std::iota(idx.begin(), idx.end(), 0);
+    if (static_cast<int>(idx.size()) > kMaxRes)
+    {
+        // Deterministic stride subsample
+        const int step =
+            std::max(1, static_cast<int>(idx.size()) / kMaxRes);
+        std::vector<int> sub;
+        for (size_t i = 0; i < idx.size(); i += static_cast<size_t>(step))
+            sub.push_back(idx[i]);
+        idx.swap(sub);
+    }
+
+    // Relative Mid pose Odin_end → Mid_end (IMU frame): p_I_m = R_rel*p_I_o + t_rel
+    const M3D R_wi_o = s_odin.rot.toRotationMatrix();
+    const M3D R_wi_m = s_mid.rot.toRotationMatrix();
+    const M3D R_rel = R_wi_m.transpose() * R_wi_o;
+    const V3D t_rel = R_wi_m.transpose() * (s_odin.pos - s_mid.pos);
+    const double rel_yaw =
+        std::atan2(R_rel(1, 0), R_rel(0, 0)) * 180.0 / M_PI;
+    const double rel_trans = t_rel.norm();
+    const double dt_ms = (t_odin_end - t_mid_end) * 1000.0;
+
+    PointCloudXYZI::Ptr cloud_A(new PointCloudXYZI());
+    PointCloudXYZI::Ptr cloud_B(new PointCloudXYZI());
+    const int n_reserve = std::min(kMaxPub, static_cast<int>(odin_L1->size()));
+    cloud_A->points.reserve(static_cast<size_t>(n_reserve));
+    cloud_B->points.reserve(static_cast<size_t>(n_reserve));
+
+    std::vector<double> resA, resB, nnA, nnB;
+    resA.reserve(idx.size());
+    resB.reserve(idx.size());
+    nnA.reserve(idx.size());
+    nnB.reserve(idx.size());
+    int passA = 0, passB = 0;
+    const float plane_thr = 0.05f;
+    const double max_res_pass = (lidar2_max_residual > 0.0) ? lidar2_max_residual : 0.06;
+
+    auto score_world = [&](const V3D &p_w, std::vector<double> &res,
+                           std::vector<double> &nn, int &pass) {
+        PointType q;
+        q.x = p_w(0);
+        q.y = p_w(1);
+        q.z = p_w(2);
+        PointVector near_pts;
+        vector<float> sq(NUM_MATCH_POINTS);
+        ikdtree.Nearest_Search(q, NUM_MATCH_POINTS, near_pts, sq);
+        if (near_pts.size() < NUM_MATCH_POINTS)
+            return;
+        nn.push_back(std::sqrt(std::max(0.0f, sq[0])));
+        VF(4) pabcd;
+        if (!esti_plane(pabcd, near_pts, plane_thr))
+            return;
+        const double pd =
+            pabcd(0) * p_w(0) + pabcd(1) * p_w(1) + pabcd(2) * p_w(2) + pabcd(3);
+        res.push_back(std::fabs(pd));
+        if (std::fabs(pd) <= max_res_pass)
+            pass++;
+    };
+
+    for (int i : idx)
+    {
+        const auto &pt = odin_L1->points[static_cast<size_t>(i)];
+        const V3D p_end2(pt.x, pt.y, pt.z);
+        // A: Stage2-style — Odin_end L1 body × Mid_end pose
+        const V3D p_w_A = lidar_to_world(s_mid, p_end2);
+        // B: re-express to Mid_end L1, then × same Mid_end pose
+        //    ≡ lidar_to_world(s_odin, p_end2) when s_mid is consistent
+        const V3D p_end1 = reexpress_L1_odin_end_to_mid_end(s_mid, s_odin, p_end2);
+        const V3D p_w_B = lidar_to_world(s_mid, p_end1);
+        score_world(p_w_A, resA, nnA, passA);
+        score_world(p_w_B, resB, nnB, passB);
+    }
+
+    // Publish world clouds (cap)
+    const int n_pub =
+        std::min(kMaxPub, static_cast<int>(odin_L1->size()));
+    const int step_pub =
+        std::max(1, static_cast<int>(odin_L1->size()) / std::max(1, n_pub));
+    for (int i = 0; i < static_cast<int>(odin_L1->size()); i += step_pub)
+    {
+        const auto &pt = odin_L1->points[static_cast<size_t>(i)];
+        const V3D p_end2(pt.x, pt.y, pt.z);
+        const V3D p_w_A = lidar_to_world(s_mid, p_end2);
+        const V3D p_end1 = reexpress_L1_odin_end_to_mid_end(s_mid, s_odin, p_end2);
+        const V3D p_w_B = lidar_to_world(s_mid, p_end1);
+        PointType a, b;
+        a.x = p_w_A(0);
+        a.y = p_w_A(1);
+        a.z = p_w_A(2);
+        a.intensity = pt.intensity;
+        b.x = p_w_B(0);
+        b.y = p_w_B(1);
+        b.z = p_w_B(2);
+        b.intensity = pt.intensity;
+        cloud_A->push_back(a);
+        cloud_B->push_back(b);
+    }
+    auto pub_cloud =
+        [&](const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub,
+            const PointCloudXYZI::Ptr &cloud, double stamp) {
+            if (!pub || !cloud || cloud->empty() || !scan_pub_en)
+                return;
+            sensor_msgs::msg::PointCloud2 msg;
+            pcl::toROSMsg(*cloud, msg);
+            msg.header.stamp = get_ros_time(stamp);
+            msg.header.frame_id = map_frame;
+            pub->publish(msg);
+        };
+    pub_cloud(pubA, cloud_A, t_mid_end);
+    pub_cloud(pubB, cloud_B, t_mid_end);
+
+    auto med = [](std::vector<double> &v) -> double {
+        if (v.empty())
+            return -1.0;
+        const size_t m = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + static_cast<long>(m), v.end());
+        return v[m];
+    };
+    const double resA_med = med(resA);
+    const double resB_med = med(resB);
+    const double nnA_med = med(nnA);
+    const double nnB_med = med(nnB);
+    const double n_scored = static_cast<double>(std::max(resA.size(), resB.size()));
+    const double passA_frac =
+        resA.empty() ? 0.0 : static_cast<double>(passA) / resA.size();
+    const double passB_frac =
+        resB.empty() ? 0.0 : static_cast<double>(passB) / resB.size();
+
+    if (pubMet)
+    {
+        std_msgs::msg::Float64MultiArray m;
+        // layout: dt_ms, rel_yaw_deg, rel_trans_m, resA, resB, nnA, nnB,
+        //         n_scored, passA, passB, w_norm, t_odin, t_mid, b_pre_ms
+        m.data = {dt_ms,
+                  rel_yaw,
+                  rel_trans,
+                  resA_med,
+                  resB_med,
+                  nnA_med,
+                  nnB_med,
+                  n_scored,
+                  passA_frac,
+                  passB_frac,
+                  gate_gyr_norm(),
+                  t_odin_end,
+                  t_mid_end,
+                  bundle_bias_pre_sec_ * 1000.0};
+        pubMet->publish(m);
+    }
+
+    static int s_log = 0;
+    if ((++s_log % 20) == 0)
+    {
+        std::cout << "[odin-xtform] dt=" << dt_ms << "ms yaw=" << rel_yaw
+                  << "deg trans=" << rel_trans << "m resA=" << resA_med
+                  << " resB=" << resB_med << " dRes=" << (resB_med - resA_med)
+                  << " nnA=" << nnA_med << " nnB=" << nnB_med
+                  << " passA=" << passA_frac << " passB=" << passB_frac
+                  << " w=" << gate_gyr_norm() << " ok=" << n_xtform_ok
+                  << " skip=" << n_xtform_skip_hist << "\n";
+    }
 }
 
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
@@ -2268,6 +2528,7 @@ public:
         this->declare_parameter<bool>("mapping.odin_pose_at_scan_end_en", true);
         this->declare_parameter<std::string>("mapping.odin_pub_time_mode", "A");
         this->declare_parameter<bool>("mapping.publish_odin_time_query_ab_en", false);
+        this->declare_parameter<bool>("mapping.odin_cross_time_shadow_en", false);
         this->declare_parameter<std::string>("common.map_frame", "map");
 
         this->declare_parameter<int>("method.voxelized_pt_num_thres", 100);
@@ -2369,6 +2630,8 @@ public:
                                std::string("A"));
         this->get_parameter_or("mapping.publish_odin_time_query_ab_en",
                                publish_odin_time_query_ab_en, false);
+        this->get_parameter_or("mapping.odin_cross_time_shadow_en",
+                               odin_cross_time_shadow_en, false);
         if (!odin_pub_time_mode.empty())
         {
             const char c = odin_pub_time_mode[0];
@@ -2530,6 +2793,12 @@ public:
             create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered_D", 20);
         pubOdinTqAbId_ =
             create_publisher<std_msgs::msg::UInt64>("/cloud_odin_tq_ab_id", 20);
+        pubOdinXtformA_ =
+            create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_xtform_A", 20);
+        pubOdinXtformB_ =
+            create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_xtform_B", 20);
+        pubOdinXtformMet_ =
+            create_publisher<std_msgs::msg::Float64MultiArray>("/odin_xtform_metrics", 50);
         pubLaserCloudFullTransformed_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_tf", 20);
         pubLaserCloudFull_body_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
@@ -2637,6 +2906,7 @@ public:
                  << " odin_pose_at_end=" << (odin_pose_at_scan_end_en ? "true" : "false")
                  << " odin_pub_time_mode=" << odin_pub_time_mode
                  << " tq_ab_debug=" << (publish_odin_time_query_ab_en ? "true" : "false")
+                 << " xtform_shadow=" << (odin_cross_time_shadow_en ? "true" : "false")
                  << " imu2=" << imu_topic2
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
@@ -2932,6 +3202,13 @@ private:
                 /*** add the feature points to map kdtree ***/
                 map_incremental();
 
+                // Shadow cross-time SE3 test (default off). After map update so
+                // residuals use Mid-updated ikdtree; never writes Odin / Stage2.
+                if (odin_cross_time_shadow_en)
+                    shadow_odin_cross_time_eval(feats_undistort, state_stage1_for_odin_,
+                                                pubOdinXtformA_, pubOdinXtformB_,
+                                                pubOdinXtformMet_);
+
                 // Publish accumulated ikdtree map (stock code left this under if(0)).
                 {
                     static int map_pub_tic = 0;
@@ -3030,6 +3307,9 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdinA_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdinD_;
     rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr pubOdinTqAbId_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubOdinXtformA_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubOdinXtformB_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubOdinXtformMet_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullTransformed_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;

@@ -78,6 +78,9 @@
       odin_pub_time_mode: "A"
       # Debug-only: /cloud_odin_registered_{A,D} + /cloud_odin_tq_ab_id (default false).
       publish_odin_time_query_ab_en: false
+      # Debug-only shadow: Odin_end→Mid_end SE3 vs raw Mid_end project.
+      # Topics: /cloud_odin_xtform_{A,B}, /odin_xtform_metrics. No IEKF/map change.
+      odin_cross_time_shadow_en: false
       lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
