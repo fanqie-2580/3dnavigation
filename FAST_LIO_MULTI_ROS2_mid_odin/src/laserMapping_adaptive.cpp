@@ -941,15 +941,18 @@ bool sync_packages_bundle(MeasureGroup &meas)
                 odin_span = lidar_mean_scantime2;
             else
                 odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-            // Match deskew: t_max = Mid_beg + signed_dt + odin_span (not Mid+span only).
-            lidar_end_time2 = meas.lidar_beg_time + signed_dt + odin_span;
-            if (lidar_end_time2 < lidar_end_time)
-                lidar_end_time2 = lidar_end_time;
+            // Deskew locks Odin scan-center to Mid center (see IMU_Processing).
+            // Horizon = remapped last point, not oscillating header signed_dt.
+            const double mid_span =
+                std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            const double odin_med = cloud_offset_median_sec(meas.lidar2);
+            const double t_max = 0.5 * mid_span - odin_med + odin_span;
+            lidar_end_time2 = meas.lidar_beg_time + std::max(mid_span, t_max);
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = best_i;
             bundle_pair_dt_ = best_dt;
             bundle_pair_signed_dt_ = signed_dt;
-            bundle_mid_span_ = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+            bundle_mid_span_ = mid_span;
             bundle_center_dt_ = center_dt;
         };
 

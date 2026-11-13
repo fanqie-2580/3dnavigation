@@ -560,6 +560,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 **根因**：影子 KF 已只积到 Mid end，但 `last_imu_ = meas.imu.back()` 仍可落到 Odin extend 尾；下一帧 `head > last_lidar_end` → `dt=tail-head`，**Mid end→head 时间洞**。stub 若用 `v_imu.back()` 还可能对正式 KF 负向 predict。  
 **修复**：`last_imu_` 取 `stamp ≤ mid_end` 的最晚样本；stub 只正向补到 `end_time`（用 `last_prop_t`）。日志：`[IMU bookmark] last_imu-mid_end=…ms` 应 ≤0。
 
+### 10r. Deskew 扫描中心锁定（2026-11-13）
+
+**现象**：书签修复后扇形仍在；Bundle `signed/center` 仍 ±50ms 翻转。  
+**机制**：deskew 曾用 `t=(L2+bias−Mid)+offset`，把 header 相位摆动写进逐点时间 → 转弯时选用错误 IMU 段 → **单帧扇形**（非整帧刚体超前）。densify 未订阅，不是显示链问题。  
+**修复**：配对仍用 header+bias；deskew 改为 `t = offset − median(offset) + Mid_span/2`（Odin/Mid 扫描中心对齐）。`lidar_end_time2` 按重映射后的 t_max，不再跟 signed 晃。日志：`[deskew center-lock] cancel_header_center=…ms`。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

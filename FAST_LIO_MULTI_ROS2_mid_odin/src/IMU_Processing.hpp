@@ -578,16 +578,42 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
 
-  // Odin dToF: offset_time relative to USB header. Mapping only attaches L2 when
-  // |(L2+stamp_bias)-Mid| is tight, so folding that small residual into deskew
-  // is safe. Mid-only ticks leave pcl_2 empty (viz holds last body cloud).
+  // Odin dToF: offset_time is relative to USB header. Bundle pairing still uses
+  // (header+bias), but deskew must NOT fold the oscillating header residual —
+  // that ±50ms signed/center swing warps the IMU segment per point → fan smear.
+  // Lock Odin scan-center to Mid scan-center; keep intra-scan offsets.
+  // Mid-only ticks leave pcl_2 empty (viz holds last body cloud).
   if (!pcl_2_out.points.empty())
   {
+    std::vector<double> offs;
+    offs.reserve(pcl_2_out.points.size());
+    for (const auto &pt : pcl_2_out.points)
+      offs.push_back(static_cast<double>(pt.curvature) / 1000.0);
+    double odin_med = 0.0;
+    if (!offs.empty())
+    {
+      const size_t mid = offs.size() / 2;
+      std::nth_element(offs.begin(), offs.begin() + static_cast<long>(mid), offs.end());
+      odin_med = offs[mid];
+    }
+    const double mid_span = std::max(0.0, mid_end_time - pcl_beg_time);
     const double header_off =
         (meas.lidar_beg_time2 + lidar2_stamp_bias_) - meas.lidar_beg_time;
+    // Diagnostics only: how much header residual we are cancelling.
+    static int s_center_lock_log = 0;
+    const double center_residual = header_off + odin_med - 0.5 * mid_span;
+    if ((++s_center_lock_log % 40) == 0)
+    {
+      std::cout << "[deskew center-lock] cancel_header_center="
+                << center_residual * 1000.0
+                << "ms mid_span=" << mid_span * 1000.0
+                << "ms odin_med=" << odin_med * 1000.0 << "ms\n";
+    }
     for (auto &pt : pcl_2_out.points)
     {
-      double t_rel = header_off + static_cast<double>(pt.curvature) / 1000.0;
+      // t = (offset - median) + Mid_center  → scan centers coincide.
+      double t_rel =
+          static_cast<double>(pt.curvature) / 1000.0 - odin_med + 0.5 * mid_span;
       if (t_rel < -kMaxBundleSpan)
         t_rel = -kMaxBundleSpan;
       if (t_rel > kMaxBundleSpan + 0.12)
