@@ -40,7 +40,7 @@ def generate_launch_description():
     )
     enable_color_viz_arg = DeclareLaunchArgument(
         'enable_color_viz',
-        default_value='true',
+        default_value='false',
         description='Mid360-only accum (/viz/accum_mid360); Odin accum is in frame_fuse',
     )
     enable_ct_lio_arg = DeclareLaunchArgument(
@@ -196,7 +196,7 @@ def generate_launch_description():
                 )
             )
 
-        if context.launch_configurations.get('enable_color_viz', 'true') == 'true':
+        if context.launch_configurations.get('enable_color_viz', 'false') == 'true':
             nodes.append(
                 Node(
                     package='fast_lio_multi',

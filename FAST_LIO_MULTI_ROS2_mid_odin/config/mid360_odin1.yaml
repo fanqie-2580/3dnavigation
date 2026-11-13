@@ -96,6 +96,8 @@
       lidar2_soft_wait_sec: 0.025
       # USB L2 stamp leads Mid by ~−65ms at same wall; bias recenters Bundle dt.
       lidar2_stamp_bias_sec: 0.065
+      # Internal Odin pose-time calibration from bag geometry; header stamps are unchanged.
+      lidar2_pose_time_correction_sec: 0.020
       # Pairing-only EMA: bias -= ema * center_dt, clamped [min,max].
       lidar2_bias_ema: 0.05
       lidar2_bias_min: 0.0
@@ -107,6 +109,17 @@
       # Odin → ikdtree: center sync quality (not |ω| gate).
       lidar2_map_insert_en: true
       lidar2_map_insert_max_sync_dt: 0.055
+      # Mid owns map geometry; Odin only densifies existing stable surfaces.
+      lidar2_map_insert_require_support_en: true
+      lidar2_map_insert_support_nn_m: 0.15
+      lidar2_map_insert_support_res_m: 0.05
+      lidar2_map_candidate_min_hits: 3
+      lidar2_map_candidate_voxel_m: 0.20
+      lidar2_map_candidate_radius_m: 0.12
+      lidar2_map_candidate_span_m: 0.15
+      lidar2_map_candidate_ttl_sec: 3.0
+      lidar2_map_candidate_pose_trans_m: 0.05
+      lidar2_map_candidate_pose_yaw_rad: 0.10
       lidar2_map_insert_max_sync_dt_still: 0.055
       lidar2_map_insert_still_gyr: 0.12
       lidar2_map_insert_max_center_dt: 0.025
@@ -141,10 +154,10 @@
       # Points" + map_insert gated off + densify/IEKF extrinsic mismatch.
       extrinsic_L2_gravity_frame: false
       # CAD T_z was 0.0317; still-frame ground Δz Odin-Mid ≈ -0.127m so raise T_z.
-      extrinsic_T_L2_wrt_L1: [0.12157888, 0.00549610, 0.1587]
+      extrinsic_T_L2_wrt_L1: [0.13245180, -0.01039588, 0.1587]
       # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
-      extrinsic_R_L2_wrt_L1: [0.97437006, 0.0, -0.22495105,
-                             0.0, 1.0, 0.0,
+      extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
+                             -0.0007179391, 0.9999997285, 0.0001657493,
                              0.22495105, 0.0, 0.97437006]
       extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
       extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,

@@ -5,6 +5,7 @@
 #include <Eigen/Eigen>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#include <cstdint>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -46,11 +47,15 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     {
         lidar_beg_time  = 0.0;
         lidar_beg_time2 = 0.0;
+        odin_fresh = false;
+        odin_source_seq = 0;
         this->lidar.reset(new PointCloudXYZI());
         this->lidar2.reset(new PointCloudXYZI());
     };
     double lidar_beg_time, lidar_beg_time2;
     double lidar_end_time, lidar_end_time2;
+    bool odin_fresh;
+    std::uint64_t odin_source_seq; // one-shot provenance for publish/map transaction
     PointCloudXYZI::Ptr lidar, lidar2;
     deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu;   // Mid /livox/imu
     deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu2;  // Odin /odin1/imu (native deskew)

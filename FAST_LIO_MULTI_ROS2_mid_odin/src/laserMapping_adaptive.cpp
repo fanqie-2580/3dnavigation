@@ -42,6 +42,7 @@
 #include <condition_variable>
 #include <numeric>
 #include <vector>
+#include <unordered_map>
 /// module headers
 #include <omp.h>
 /// Eigen
@@ -104,11 +105,12 @@ double bundle_center_dt_ = 0.0;      // Odin scan-center − Mid scan-center (s)
 // Gyro of the *current* Bundle IMU window (not latest callback). <0 = unset.
 double bundle_scan_gyr_norm_ = -1.0;
 double bundle_scan_gyr_pitch_ = -1.0;
-// Last good Odin cloud already in map frame. On Mid-only ticks republish this
-// snapshot (update stamp only) — do NOT re-warp old body with the new Mid pose
-// (that caused "wrong shape then jump" on /cloud_odin_registered).
-PointCloudXYZI::Ptr odin_hold_map(new PointCloudXYZI());
-bool odin_hold_map_have = false;
+// One-shot Odin source transaction. A sequence may be published and mapped at
+// most once; Mid-only ticks never reuse prior geometry.
+uint64_t next_odin_source_seq_ = 0;
+uint64_t last_odin_published_seq_ = 0;
+uint64_t last_odin_map_seq_ = 0;
+long long n_odin_viz_fresh = 0, n_odin_viz_empty = 0, n_odin_viz_dup_block = 0;
 double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -137,6 +139,7 @@ vector<double> extrinT4(3, 0.0);
 vector<double> extrinR4(9, 0.0);
 deque<double>                     time_buffer;
 deque<double>                     time_buffer2;
+deque<uint64_t>                   odin_seq_buffer2;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer2;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
@@ -204,6 +207,26 @@ int last_map_odin_queued_ = 0;      // into PointToAdd or PointNoNeedDownsample
 int last_map_odin_queued_ds_ = 0;   // PointToAdd (downsample path)
 int last_map_odin_queued_raw_ = 0;  // PointNoNeedDownsample
 int last_map_ikd_add_total_ = 0;    // Add_Points return sum (Mid+Odin; see limits)
+uint64_t last_map_odin_source_seq_ = 0;
+int last_map_odin_duplicate_blocked_ = 0;
+int last_map_odin_support_blocked_ = 0;
+int last_map_odin_candidate_staged_ = 0;
+int last_map_odin_candidate_promoted_ = 0;
+bool last_map_odin_fresh_flag_ = false;
+bool lidar2_map_insert_require_support_en = true;
+double lidar2_map_insert_support_nn_m = 0.15;
+double lidar2_map_insert_support_res_m = 0.05;
+int lidar2_map_candidate_min_hits = 3;
+double lidar2_map_candidate_voxel_m = 0.20;
+double lidar2_map_candidate_radius_m = 0.12;
+double lidar2_map_candidate_span_m = 0.15;
+double lidar2_map_candidate_ttl_sec = 3.0;
+double lidar2_map_candidate_pose_trans_m = 0.05;
+double lidar2_map_candidate_pose_yaw_rad = 0.10;
+struct OdinVoxelKey { int x,y,z; bool operator==(const OdinVoxelKey &o) const { return x==o.x&&y==o.y&&z==o.z; } };
+struct OdinVoxelKeyHash { size_t operator()(const OdinVoxelKey &k) const noexcept { size_t h=static_cast<size_t>(k.x)*73856093u; h^=static_cast<size_t>(k.y)*19349663u; h^=static_cast<size_t>(k.z)*83492791u; return h; } };
+struct OdinMapCandidate { PointType mean; PointType min_pt; PointType max_pt; int hits=0; uint64_t last_seq=0; double last_seen=0.0; V3D first_pos=V3D::Zero(); double first_yaw=0.0; };
+std::unordered_map<OdinVoxelKey,OdinMapCandidate,OdinVoxelKeyHash> odin_map_candidates;
 bool last_map_odin_block_flag_ = true;
 // Deprecated alias kept for log compatibility: gate_pass (NOT true ikdtree inserts).
 int &last_map_odin_ins_ = last_map_odin_gate_pass_;
@@ -276,6 +299,8 @@ double bundle_mid_push_wall_ = -1.0;
 // at the same wall time. Add this to L2 when computing Bundle |dt| so pairing
 // centers near 0 instead of walking the max_sync edge.
 double lidar2_stamp_bias_sec = 0.065;
+// Geometry-only internal pose-time calibration; headers are never rewritten.
+double lidar2_pose_time_correction_sec = 0.020;
 // Soft Odin IEKF: Mid updates first at LASER_POINT_COV, then Odin at cov*scale.
 // Stage2 also applies per-point time uncertainty (ω·|dt_to_mid_end|·lever).
 double lidar2_residual_cov_scale = 100.0;
@@ -543,6 +568,17 @@ void pointBodyToWorld(PointType const * const pi, PointType * const po)
     po->intensity = pi->intensity;
 }
 
+void pointBodyToWorldWithState(PointType const * const pi, PointType * const po,
+                               const state_ikfom &s)
+{
+    V3D p_body(pi->x, pi->y, pi->z);
+    V3D p_global(s.rot * (s.offset_R_L_I * p_body + s.offset_T_L_I) + s.pos);
+    po->x = p_global(0);
+    po->y = p_global(1);
+    po->z = p_global(2);
+    po->intensity = pi->intensity;
+}
+
 template<typename T>
 void pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
 {
@@ -709,7 +745,11 @@ inline void odin_tq_compute(double &tA, double &tD, double &odin_span,
         odin_med = 0.0;
         H2 = lidar_end_time;
     }
-    tA = mid_center + (odin_span - odin_med);
+    // Bag geometry shows the Odin pose belongs on the opposite side of the
+    // Mid scan center. Plus/minus differ by 2*(span-med); the old plus sign
+    // created a 97.1 ms-equivalent yaw error that grew with angular velocity.
+    tA = mid_center - (odin_span - odin_med) -
+         lidar2_pose_time_correction_sec;
     tD = H2 + odin_span; // Odin_header + span (no pairing bias)
 }
 
@@ -1118,8 +1158,6 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    // Mid-only IEKF: only buffer latest Odin body cloud; pose in Mid timer with
-    // the same state_point as /cloud_registered (avoids stale stamp × new body).
     if (!lidar2_update_en)
     {
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
@@ -1136,22 +1174,25 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     }
 
     mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar2)
+    const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+    if (stamp < last_timestamp_lidar2)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer2.clear();
+        time_buffer2.clear();
+        odin_seq_buffer2.clear();
     }
 
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
-    // Odin points are not guaranteed time-ordered; sync uses points.back().curvature.
     if (!ptr->empty())
         std::sort(ptr->points.begin(), ptr->points.end(),
                   [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
     ptr->header.seq = 1; //trick
     lidar_buffer2.push_back(ptr);
-    time_buffer2.push_back(rclcpp::Time(msg->header.stamp).seconds());
-    last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
+    time_buffer2.push_back(stamp);
+    odin_seq_buffer2.push_back(++next_odin_source_seq_);
+    last_timestamp_lidar2 = stamp;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     first_lidar_scan_check = true;
@@ -1180,18 +1221,22 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
     mtx_buffer.lock();
-    if (rclcpp::Time(msg->header.stamp).seconds() < last_timestamp_lidar2)
+    const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+    if (stamp < last_timestamp_lidar2)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer2.clear();
+        time_buffer2.clear();
+        odin_seq_buffer2.clear();
     }
-    last_timestamp_lidar2 = rclcpp::Time(msg->header.stamp).seconds();
+    last_timestamp_lidar2 = stamp;
     
-    PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr, 1);
     ptr->header.seq = 1; //trick
     lidar_buffer2.push_back(ptr);
-    time_buffer2.push_back(last_timestamp_lidar2);
+    time_buffer2.push_back(stamp);
+    odin_seq_buffer2.push_back(++next_odin_source_seq_);
     
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -1258,7 +1303,11 @@ bool sync_packages_async(MeasureGroup &meas)
     {
         lidar_buffer2.clear();
         time_buffer2.clear();
+        odin_seq_buffer2.clear();
     }
+
+    meas.odin_fresh = false;
+    meas.odin_source_seq = 0;
 
     if ( (lidar_buffer.empty() && lidar_buffer2.empty()) || imu_buffer.empty()) {
         return false;
@@ -1274,6 +1323,7 @@ bool sync_packages_async(MeasureGroup &meas)
         {
             lidar_buffer2.pop_front();
             time_buffer2.pop_front();
+            odin_seq_buffer2.pop_front();
             n_skip_l2_sync++;
         }
         lidar_use_num_now_ = 1;
@@ -1289,6 +1339,7 @@ bool sync_packages_async(MeasureGroup &meas)
             // Discard Odin-only async packages (would IMU-prop Mid to L2 time).
             lidar_buffer2.pop_front();
             time_buffer2.pop_front();
+            odin_seq_buffer2.pop_front();
             n_skip_l2_sync++;
             return false;
         }
@@ -1373,11 +1424,14 @@ bool sync_packages_async(MeasureGroup &meas)
                     n_skip_l2_sync++;
                     lidar_buffer2.pop_front();
                     time_buffer2.pop_front();
+                    odin_seq_buffer2.pop_front();
                     return false;
                 }
             }
             meas.lidar2 = lidar_buffer2.front();
             meas.lidar_beg_time2 = time_buffer2.front();
+            meas.odin_fresh = true;
+            meas.odin_source_seq = odin_seq_buffer2.front();
             pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             if (async_debug) cout << "\033[32;1mSecond LiDAR!, " << meas.lidar2->points.size() << "\033[0m" << endl;
             current_lidar_num = 2;
@@ -1421,6 +1475,7 @@ bool sync_packages_async(MeasureGroup &meas)
 
         lidar_buffer2.pop_front();
         time_buffer2.pop_front();
+        odin_seq_buffer2.pop_front();
         lidar_pushed = false;
         return true;
     }
@@ -1453,6 +1508,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             {
                 lidar_buffer2.pop_front();
                 time_buffer2.pop_front();
+                odin_seq_buffer2.pop_front();
                 n_skip_l2_sync++;
             }
             found_out = false;
@@ -1531,6 +1587,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = best_i;
+            meas.odin_fresh = true;
+            meas.odin_source_seq = odin_seq_buffer2[best_i];
             bundle_pair_dt_ = best_dt;
             bundle_pair_signed_dt_ = signed_dt;
             bundle_mid_span_ = mid_span;
@@ -1559,6 +1617,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             lidar_end_time2 = lidar_end_time;
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = 0;
+            meas.odin_fresh = false;
+            meas.odin_source_seq = 0;
             bundle_pair_dt_ = -1.0;
             bundle_pair_signed_dt_ = 0.0;
             bundle_mid_span_ = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
@@ -1713,10 +1773,12 @@ bool sync_packages_bundle(MeasureGroup &meas)
         time_buffer.pop_front();
         if (bundle_pair_dt_ >= 0.0)
         {
-            for (size_t i = 0; i <= bundle_pair_index_ && !lidar_buffer2.empty(); i++)
+            for (size_t i = 0; i <= bundle_pair_index_ &&
+                               !lidar_buffer2.empty() && !odin_seq_buffer2.empty(); i++)
             {
                 lidar_buffer2.pop_front();
                 time_buffer2.pop_front();
+                odin_seq_buffer2.pop_front();
             }
         }
 
@@ -1740,7 +1802,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
                  << " gyr_latest=" << last_imu_gyr_norm << "\033[0m" << endl;
         }
         else
-            cout << "\033[33;1mBundle Mid-only (hold Odin viz) gyr_scan="
+            cout << "\033[33;1mBundle Mid-only (Odin viz empty) gyr_scan="
                  << bundle_scan_gyr_norm_ << "\033[0m" << endl;
         return true;
     }
@@ -1808,6 +1870,11 @@ void map_incremental()
     const float det_r2 = DET_RANGE * DET_RANGE;
     const double now_ros = rclcpp::Clock(RCL_ROS_TIME).now().seconds();
     const double gyr_for_insert = gate_gyr_norm();
+    const uint64_t odin_seq = Measures.odin_source_seq;
+    const bool fresh_odin_frame =
+        bundle_enabled && Measures.odin_fresh && odin_seq != 0;
+    const bool duplicate_odin_seq =
+        fresh_odin_frame && odin_seq == last_odin_map_seq_;
     if (lidar2_map_insert_gyr_gate > 0.0 &&
         gyr_for_insert >= lidar2_map_insert_gyr_gate)
     {
@@ -1835,6 +1902,7 @@ void map_incremental()
           std::fabs(bundle_center_dt_) > lidar2_map_insert_max_center_dt));
     const bool block_odin_insert =
         !lidar2_map_insert_en || !odin_pose_update_allowed() || !last_odin_iekf_ok ||
+        !fresh_odin_frame || duplicate_odin_seq ||
         (lidar2_map_insert_gyr_gate > 0.0 &&
          gyr_for_insert >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until || sync_too_loose_for_map;
@@ -1846,7 +1914,68 @@ void map_incremental()
     last_map_odin_queued_ds_ = 0;
     last_map_odin_queued_raw_ = 0;
     last_map_ikd_add_total_ = 0;
+    last_map_odin_source_seq_ = odin_seq;
+    last_map_odin_duplicate_blocked_ = 0;
+    last_map_odin_support_blocked_ = 0;
+    last_map_odin_candidate_staged_ = 0;
+    last_map_odin_candidate_promoted_ = 0;
+    last_map_odin_fresh_flag_ = fresh_odin_frame;
     last_map_odin_block_flag_ = block_odin_insert;
+    PointVector support_near;
+    std::vector<float> support_sq;
+    support_near.reserve(NUM_MATCH_POINTS);
+    support_sq.reserve(NUM_MATCH_POINTS);
+    auto update_odin_candidate = [&](const PointType &p, PointType &promoted) -> int {
+        const double inv = 1.0 / std::max(0.05, lidar2_map_candidate_voxel_m);
+        const OdinVoxelKey base{static_cast<int>(std::floor(p.x*inv)),
+                                static_cast<int>(std::floor(p.y*inv)),
+                                static_cast<int>(std::floor(p.z*inv))};
+        OdinVoxelKey best_key = base;
+        auto best_it = odin_map_candidates.end();
+        const double r2 = lidar2_map_candidate_radius_m * lidar2_map_candidate_radius_m;
+        double best_d2 = r2;
+        for (int dz=-1; dz<=1; ++dz)
+          for (int dy=-1; dy<=1; ++dy)
+            for (int dx=-1; dx<=1; ++dx)
+            {
+                const OdinVoxelKey kk{base.x+dx, base.y+dy, base.z+dz};
+                auto it=odin_map_candidates.find(kk);
+                if (it==odin_map_candidates.end()) continue;
+                if (now_ros-it->second.last_seen > lidar2_map_candidate_ttl_sec)
+                { odin_map_candidates.erase(it); continue; }
+                const double ddx=it->second.mean.x-p.x, ddy=it->second.mean.y-p.y, ddz=it->second.mean.z-p.z;
+                const double d2=ddx*ddx+ddy*ddy+ddz*ddz;
+                if (d2<=best_d2) { best_d2=d2; best_key=kk; best_it=it; }
+            }
+        if (best_it == odin_map_candidates.end())
+        {
+            OdinMapCandidate cand; cand.mean=p; cand.min_pt=p; cand.max_pt=p; cand.hits=1;
+            cand.last_seq=Measures.odin_source_seq; cand.last_seen=now_ros;
+            cand.first_pos=state_point_odin_pub_.pos;
+            cand.first_yaw=yaw_from_rot(state_point_odin_pub_.rot.toRotationMatrix());
+            odin_map_candidates.emplace(base,cand); return 1;
+        }
+        auto &c=best_it->second; c.last_seen=now_ros;
+        if (Measures.odin_source_seq==c.last_seq) return 1;
+        c.last_seq=Measures.odin_source_seq; ++c.hits;
+        c.mean.x+=(p.x-c.mean.x)/c.hits; c.mean.y+=(p.y-c.mean.y)/c.hits; c.mean.z+=(p.z-c.mean.z)/c.hits;
+        c.min_pt.x=std::min(c.min_pt.x,p.x); c.min_pt.y=std::min(c.min_pt.y,p.y); c.min_pt.z=std::min(c.min_pt.z,p.z);
+        c.max_pt.x=std::max(c.max_pt.x,p.x); c.max_pt.y=std::max(c.max_pt.y,p.y); c.max_pt.z=std::max(c.max_pt.z,p.z);
+        const double sx=c.max_pt.x-c.min_pt.x, sy=c.max_pt.y-c.min_pt.y, sz=c.max_pt.z-c.min_pt.z;
+        const double span=std::sqrt(sx*sx+sy*sy+sz*sz);
+        const double dpos=(state_point_odin_pub_.pos-c.first_pos).norm();
+        double dyaw=yaw_from_rot(state_point_odin_pub_.rot.toRotationMatrix())-c.first_yaw;
+        dyaw=std::atan2(std::sin(dyaw),std::cos(dyaw));
+        const bool pose_div=dpos>=lidar2_map_candidate_pose_trans_m || std::fabs(dyaw)>=lidar2_map_candidate_pose_yaw_rad;
+        if (c.hits>=lidar2_map_candidate_min_hits && span<=lidar2_map_candidate_span_m && pose_div)
+        { promoted=c.mean; promoted.intensity=kOdinIntensityTag; odin_map_candidates.erase(best_it); return 2; }
+        return 1;
+    };
+    static int s_candidate_cleanup = 0;
+    if ((++s_candidate_cleanup % 100) == 0)
+        for (auto it=odin_map_candidates.begin(); it!=odin_map_candidates.end();)
+            if (now_ros-it->second.last_seen > lidar2_map_candidate_ttl_sec)
+                it=odin_map_candidates.erase(it); else ++it;
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1860,6 +1989,8 @@ void map_incremental()
             if (block_odin_insert)
             {
                 last_map_odin_blk_++;
+                if (duplicate_odin_seq)
+                    last_map_odin_duplicate_blocked_++;
                 continue;
             }
             last_map_odin_gate_pass_++;
@@ -1873,8 +2004,69 @@ void map_incremental()
             continue;
         if (is_odin_pt)
             last_map_odin_det_pass_++;
-        /* transform to world frame */
-        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        /* Odin must use the same corrected tA pose as the orange observation;
+         * Mid remains on the final IEKF/Stage2 state. */
+        if (is_odin_pt && have_state_odin_pub_)
+            pointBodyToWorldWithState(&(feats_down_body->points[i]),
+                                      &(feats_down_world->points[i]),
+                                      state_point_odin_pub_);
+        else
+            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+
+        bool candidate_promoted_this = false;
+        // Mid-owned map: Odin may densify an existing stable surface, or promote
+        // a spatially and viewpoint-confirmed Odin-only voxel. Not omega-gated.
+        if (is_odin_pt && lidar2_map_insert_require_support_en)
+        {
+            support_near.clear();
+            support_sq.clear();
+            ikdtree.Nearest_Search(feats_down_world->points[i], NUM_MATCH_POINTS,
+                                   support_near, support_sq);
+            bool supported = support_near.size() >= NUM_MATCH_POINTS;
+            if (supported && lidar2_map_insert_support_nn_m > 0.0)
+                supported = support_sq.back() <=
+                            lidar2_map_insert_support_nn_m * lidar2_map_insert_support_nn_m;
+            if (supported && lidar2_map_insert_support_res_m > 0.0)
+            {
+                VF(4) support_plane;
+                supported = esti_plane(support_plane, support_near,
+                                       static_cast<float>(lidar2_map_insert_support_res_m));
+                if (supported)
+                {
+                    const float pd =
+                        support_plane(0) * feats_down_world->points[i].x +
+                        support_plane(1) * feats_down_world->points[i].y +
+                        support_plane(2) * feats_down_world->points[i].z +
+                        support_plane(3);
+                    supported = std::fabs(pd) <=
+                                static_cast<float>(lidar2_map_insert_support_res_m);
+                }
+            }
+            if (!supported)
+            {
+                PointType promoted;
+                const int candidate_state=update_odin_candidate(feats_down_world->points[i],promoted);
+                if (candidate_state==2)
+                {
+                    feats_down_world->points[i]=promoted;
+                    candidate_promoted_this = true;
+                    last_map_odin_candidate_promoted_++;
+                }
+                else
+                {
+                    if (candidate_state==1) last_map_odin_candidate_staged_++;
+                    last_map_odin_support_blocked_++;
+                    continue;
+                }
+            }
+        }
+        if (candidate_promoted_this)
+        {
+            PointToAdd.push_back(feats_down_world->points[i]);
+            last_map_odin_queued_++;
+            last_map_odin_queued_ds_++;
+            continue;
+        }
         /* decide if need add to map */
         bool queued = false;
         bool queued_raw = false;
@@ -1932,6 +2124,25 @@ void map_incremental()
     last_map_ikd_add_total_ =
         ikdtree.Add_Points(PointToAdd, true) +
         ikdtree.Add_Points(PointNoNeedDownsample, false);
+    if (fresh_odin_frame && !block_odin_insert && last_map_odin_gate_pass_ > 0)
+        last_odin_map_seq_ = odin_seq;
+    static int s_map_tx = 0;
+    if ((++s_map_tx % 20) == 0)
+        std::cout << "[odin-map-tx] seq=" << odin_seq
+                  << " fresh=" << (fresh_odin_frame ? 1 : 0)
+                  << " dup_block=" << last_map_odin_duplicate_blocked_
+                  << " sup_blk=" << last_map_odin_support_blocked_
+                  << " cand_stage=" << last_map_odin_candidate_staged_
+                  << " cand_promote=" << last_map_odin_candidate_promoted_
+                  << " cand=" << last_map_odin_cand_
+                  << " pass=" << last_map_odin_gate_pass_
+                  << " det=" << last_map_odin_det_pass_
+                  << " q=" << last_map_odin_queued_
+                  << " ds=" << last_map_odin_queued_ds_
+                  << " raw=" << last_map_odin_queued_raw_
+                  << " ikd=" << last_map_ikd_add_total_
+                  << " block=" << (block_odin_insert ? 1 : 0)
+                  << " last_seq=" << last_odin_map_seq_ << "\n";
     return;
 }
 
@@ -2031,25 +2242,21 @@ void publish_odin_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubOdin,
     const PointCloudXYZI::Ptr &undistorted)
 {
-    // Fresh Odin → map + cache. Mid-only → republish last map snapshot (no re-pose).
-    // No |ω| freeze: deskew + time-aware Stage2 should keep live Odin usable.
+    // Fresh source sequence only. Mid-only publishes an honest empty cloud;
+    // previous Odin geometry is never re-stamped as a new observation.
     if (!pubOdin || !scan_pub_en)
         return;
     if (!p_imu->IMU_inited())
         return;
     const double odin_stamp =
         (publish_odin_time_ > 0.0) ? publish_odin_time_ : publish_lidar_time;
-    auto pub_hold = [&]() {
-        if (!odin_hold_map_have || !odin_hold_map || odin_hold_map->empty())
-            return;
-        sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*odin_hold_map, laserCloudmsg);
-        laserCloudmsg.header.stamp = get_ros_time(odin_stamp);
-        laserCloudmsg.header.frame_id = map_frame;
-        pubOdin->publish(laserCloudmsg);
-    };
+
+    const uint64_t seq = Measures.odin_source_seq;
+    const bool duplicate_seq = seq != 0 && seq == last_odin_published_seq_;
+    const bool fresh = Measures.odin_fresh && seq != 0 && !duplicate_seq;
+
     PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
-    if (undistorted && !undistorted->empty())
+    if (fresh && undistorted && !undistorted->empty())
     {
         odin_body->reserve(undistorted->size());
         for (const auto &pt : undistorted->points)
@@ -2060,23 +2267,42 @@ void publish_odin_from_undistorted(
         if (odin_body->empty() && current_lidar_num == 2)
             *odin_body = *undistorted;
     }
-    if (!odin_body->empty())
+    if (fresh && !odin_body->empty())
     {
         const int size = static_cast<int>(odin_body->size());
         PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
         for (int i = 0; i < size; i++)
             RGBpointBodyToWorld(&odin_body->points[i], &laserCloudWorld->points[i]);
-        *odin_hold_map = *laserCloudWorld;
-        odin_hold_map_have = true;
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         laserCloudmsg.header.stamp = get_ros_time(odin_stamp);
         laserCloudmsg.header.frame_id = map_frame;
         pubOdin->publish(laserCloudmsg);
+        last_odin_published_seq_ = seq;
+        n_odin_viz_fresh++;
+        static int s_pub_tx = 0;
+        if ((++s_pub_tx % 20) == 0)
+            std::cout << "[odin-pub-tx] seq=" << seq << " fresh=1 pts=" << size
+                      << " empty_total=" << n_odin_viz_empty
+                      << " dup_block=" << n_odin_viz_dup_block << "\n";
         publish_odin_time_ = -1.0;
         return;
     }
-    pub_hold();
+
+    PointCloudXYZI::Ptr empty(new PointCloudXYZI());
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*empty, laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubOdin->publish(laserCloudmsg);
+    n_odin_viz_empty++;
+    if (duplicate_seq)
+        n_odin_viz_dup_block++;
+    static int s_empty_tx = 0;
+    if ((++s_empty_tx % 20) == 0)
+        std::cout << "[odin-pub-tx] seq=" << seq << " fresh=" << (fresh ? 1 : 0)
+                  << " empty=1 dup_block=" << n_odin_viz_dup_block
+                  << " empty_total=" << n_odin_viz_empty << "\n";
     publish_odin_time_ = -1.0;
 }
 
@@ -2682,6 +2908,7 @@ public:
         this->declare_parameter<double>("mapping.lidar2_max_sync_dt", 0.08);
         this->declare_parameter<double>("mapping.lidar2_soft_wait_sec", 0.025);
         this->declare_parameter<double>("mapping.lidar2_stamp_bias_sec", 0.065);
+        this->declare_parameter<double>("mapping.lidar2_pose_time_correction_sec", 0.020);
         this->declare_parameter<double>("mapping.lidar2_residual_cov_scale", 100.0);
         this->declare_parameter<double>("mapping.lidar2_max_residual", 0.06);
         this->declare_parameter<double>("mapping.lidar2_time_sigma_sec", 0.025);
@@ -2690,6 +2917,16 @@ public:
         this->declare_parameter<double>("mapping.lidar2_bias_max", 0.12);
         this->declare_parameter<bool>("mapping.lidar2_map_insert_en", false);
         this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt", 0.055);
+        this->declare_parameter<bool>("mapping.lidar2_map_insert_require_support_en", true);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_support_nn_m", 0.25);
+        this->declare_parameter<double>("mapping.lidar2_map_insert_support_res_m", 0.05);
+        this->declare_parameter<int>("mapping.lidar2_map_candidate_min_hits", 3);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_voxel_m", 0.20);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_radius_m", 0.12);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_span_m", 0.15);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_ttl_sec", 3.0);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_pose_trans_m", 0.05);
+        this->declare_parameter<double>("mapping.lidar2_map_candidate_pose_yaw_rad", 0.10);
         this->declare_parameter<double>("mapping.lidar2_map_insert_max_sync_dt_still", 0.055);
         this->declare_parameter<double>("mapping.lidar2_map_insert_still_gyr", 0.12);
         this->declare_parameter<double>("mapping.lidar2_map_insert_max_center_dt", 0.025);
@@ -2805,6 +3042,8 @@ public:
         this->get_parameter_or("mapping.lidar2_max_sync_dt", lidar2_max_sync_dt, 0.08);
         this->get_parameter_or("mapping.lidar2_soft_wait_sec", lidar2_soft_wait_sec, 0.025);
         this->get_parameter_or("mapping.lidar2_stamp_bias_sec", lidar2_stamp_bias_sec, 0.065);
+        this->get_parameter_or("mapping.lidar2_pose_time_correction_sec",
+                               lidar2_pose_time_correction_sec, 0.020);
         this->get_parameter_or("mapping.lidar2_residual_cov_scale", lidar2_residual_cov_scale, 100.0);
         this->get_parameter_or("mapping.lidar2_max_residual", lidar2_max_residual, 0.06);
         this->get_parameter_or("mapping.lidar2_time_sigma_sec", lidar2_time_sigma_sec, 0.025);
@@ -2813,6 +3052,19 @@ public:
         this->get_parameter_or("mapping.lidar2_bias_max", lidar2_bias_max, 0.12);
         this->get_parameter_or("mapping.lidar2_map_insert_en", lidar2_map_insert_en, false);
         this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt", lidar2_map_insert_max_sync_dt, 0.055);
+        this->get_parameter_or("mapping.lidar2_map_insert_require_support_en",
+                               lidar2_map_insert_require_support_en, true);
+        this->get_parameter_or("mapping.lidar2_map_insert_support_nn_m",
+                               lidar2_map_insert_support_nn_m, 0.25);
+        this->get_parameter_or("mapping.lidar2_map_insert_support_res_m",
+                               lidar2_map_insert_support_res_m, 0.05);
+        this->get_parameter_or("mapping.lidar2_map_candidate_min_hits", lidar2_map_candidate_min_hits, 3);
+        this->get_parameter_or("mapping.lidar2_map_candidate_voxel_m", lidar2_map_candidate_voxel_m, 0.20);
+        this->get_parameter_or("mapping.lidar2_map_candidate_radius_m", lidar2_map_candidate_radius_m, 0.12);
+        this->get_parameter_or("mapping.lidar2_map_candidate_span_m", lidar2_map_candidate_span_m, 0.15);
+        this->get_parameter_or("mapping.lidar2_map_candidate_ttl_sec", lidar2_map_candidate_ttl_sec, 3.0);
+        this->get_parameter_or("mapping.lidar2_map_candidate_pose_trans_m", lidar2_map_candidate_pose_trans_m, 0.05);
+        this->get_parameter_or("mapping.lidar2_map_candidate_pose_yaw_rad", lidar2_map_candidate_pose_yaw_rad, 0.10);
         this->get_parameter_or("mapping.lidar2_map_insert_max_sync_dt_still",
                                lidar2_map_insert_max_sync_dt_still, 0.055);
         this->get_parameter_or("mapping.lidar2_map_insert_still_gyr",
@@ -2865,7 +3117,10 @@ public:
             if (p_pre->lidar_type[1] == (int)AVIA)
                 sub_pcl_livox2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic2, 20, livox_pcl_cbk2);
             else
-                sub_pcl_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic2, rclcpp::SensorDataQoS(), standard_pcl_cbk2);
+            {
+                auto odin_qos = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
+                sub_pcl_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic2, odin_qos, standard_pcl_cbk2);
+            }
         }
 
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
@@ -3013,6 +3268,7 @@ public:
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " soft_wait=" << lidar2_soft_wait_sec * 1000.0 << "ms"
                  << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
+                 << " pose_time_corr=" << lidar2_pose_time_correction_sec * 1000.0 << "ms"
                  << " odin_native_deskew=" << (odin_native_deskew_en ? "true" : "false")
                  << " odin_pose_at_end=" << (odin_pose_at_scan_end_en ? "true" : "false")
                  << " odin_pub_time_mode=" << odin_pub_time_mode
@@ -3025,6 +3281,10 @@ public:
                  << " insert_max_dt=" << lidar2_map_insert_max_sync_dt * 1000.0 << "ms"
                  << " still_dt=" << lidar2_map_insert_max_sync_dt_still * 1000.0 << "ms"
                  << "@|w|<" << lidar2_map_insert_still_gyr
+                 << " insert_support=" << (lidar2_map_insert_require_support_en ? "true" : "false")
+                 << " support_nn=" << lidar2_map_insert_support_nn_m << "m"
+                 << " support_res=" << lidar2_map_insert_support_res_m << "m"
+                 << " cand_hits=" << lidar2_map_candidate_min_hits
                  << " insert_gyr_gate=" << lidar2_map_insert_gyr_gate
                  << "rad/s cooldown=" << lidar2_map_insert_cooldown_sec << "s"
                  << endl
@@ -3164,14 +3424,30 @@ private:
                         init_pts.reserve(feats_down_size);
                         for (int i = 0; i < feats_down_size; i++)
                         {
-                            if (!odin_pose_update_allowed() &&
-                                feats_down_body->points[i].intensity >= kOdinIntensityTag)
+                            const bool is_init_odin =
+                                feats_down_body->points[i].intensity >= kOdinIntensityTag;
+                            const bool init_odin_ok =
+                                Measures.odin_fresh && Measures.odin_source_seq != 0 &&
+                                Measures.odin_source_seq != last_odin_map_seq_ &&
+                                odin_pose_update_allowed();
+                            if (is_init_odin &&
+                                (!init_odin_ok || !have_state_odin_pub_))
                                 continue;
-                            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                            if (is_init_odin)
+                                pointBodyToWorldWithState(&(feats_down_body->points[i]),
+                                                          &(feats_down_world->points[i]),
+                                                          state_point_odin_pub_);
+                            else
+                                pointBodyToWorld(&(feats_down_body->points[i]),
+                                                 &(feats_down_world->points[i]));
                             init_pts.push_back(feats_down_world->points[i]);
                         }
                         if (!init_pts.empty())
                             ikdtree.Add_Points(init_pts, true);
+                        if (Measures.odin_fresh && Measures.odin_source_seq != 0 &&
+                            Measures.odin_source_seq != last_odin_map_seq_ &&
+                            odin_pose_update_allowed())
+                            last_odin_map_seq_ = Measures.odin_source_seq;
                         if (current_lidar_num == 1 || bundle_enabled)
                             lidar1_ikd_init = true;
                         if (current_lidar_num == 2 || bundle_enabled || !lidar2_update_en)
