@@ -194,6 +194,11 @@ long long n_odin_pub_query_ok = 0;
 long long n_odin_pub_query_fallback = 0;
 long long n_xtform_ok = 0;
 long long n_xtform_skip_hist = 0;
+// Last map_incremental Odin insert audit (counts only; does not change gates).
+int last_map_odin_cand_ = 0;
+int last_map_odin_ins_ = 0;
+int last_map_odin_blk_ = 0;
+bool last_map_odin_block_flag_ = true;
 struct MidPoseSample
 {
     double t = 0.0;
@@ -843,17 +848,18 @@ void shadow_odin_cross_time_eval(
     cloud_A->points.reserve(static_cast<size_t>(n_reserve));
     cloud_B->points.reserve(static_cast<size_t>(n_reserve));
 
-    std::vector<double> resA, resB, nnA, nnB;
-    resA.reserve(idx.size());
-    resB.reserve(idx.size());
-    nnA.reserve(idx.size());
-    nnB.reserve(idx.size());
-    int passA = 0, passB = 0;
+    // Per-point paired scoring (same index for A/B). Also track unpaired
+    // success counts to expose selection bias of the V1 median metric.
+    std::vector<double> resA_all, resB_all, nnA_all, nnB_all;
+    std::vector<double> resA_pair, resB_pair, nnA_pair, nnB_pair;
+    resA_all.reserve(idx.size());
+    resB_all.reserve(idx.size());
+    int passA = 0, passB = 0, passA_pair = 0, passB_pair = 0;
+    int n_plane_A = 0, n_plane_B = 0, n_plane_both = 0;
     const float plane_thr = 0.05f;
     const double max_res_pass = (lidar2_max_residual > 0.0) ? lidar2_max_residual : 0.06;
 
-    auto score_world = [&](const V3D &p_w, std::vector<double> &res,
-                           std::vector<double> &nn, int &pass) {
+    auto score_one = [&](const V3D &p_w, double &nn_out, double &res_out) -> bool {
         PointType q;
         q.x = p_w(0);
         q.y = p_w(1);
@@ -862,16 +868,14 @@ void shadow_odin_cross_time_eval(
         vector<float> sq(NUM_MATCH_POINTS);
         ikdtree.Nearest_Search(q, NUM_MATCH_POINTS, near_pts, sq);
         if (near_pts.size() < NUM_MATCH_POINTS)
-            return;
-        nn.push_back(std::sqrt(std::max(0.0f, sq[0])));
+            return false;
+        nn_out = std::sqrt(std::max(0.0f, sq[0]));
         VF(4) pabcd;
         if (!esti_plane(pabcd, near_pts, plane_thr))
-            return;
-        const double pd =
-            pabcd(0) * p_w(0) + pabcd(1) * p_w(1) + pabcd(2) * p_w(2) + pabcd(3);
-        res.push_back(std::fabs(pd));
-        if (std::fabs(pd) <= max_res_pass)
-            pass++;
+            return false;
+        res_out = std::fabs(pabcd(0) * p_w(0) + pabcd(1) * p_w(1) +
+                            pabcd(2) * p_w(2) + pabcd(3));
+        return true;
     };
 
     for (int i : idx)
@@ -884,8 +888,37 @@ void shadow_odin_cross_time_eval(
         //    ≡ lidar_to_world(s_odin, p_end2) when s_mid is consistent
         const V3D p_end1 = reexpress_L1_odin_end_to_mid_end(s_mid, s_odin, p_end2);
         const V3D p_w_B = lidar_to_world(s_mid, p_end1);
-        score_world(p_w_A, resA, nnA, passA);
-        score_world(p_w_B, resB, nnB, passB);
+        double nn_a = 0, res_a = 0, nn_b = 0, res_b = 0;
+        const bool ok_a = score_one(p_w_A, nn_a, res_a);
+        const bool ok_b = score_one(p_w_B, nn_b, res_b);
+        if (ok_a)
+        {
+            n_plane_A++;
+            nnA_all.push_back(nn_a);
+            resA_all.push_back(res_a);
+            if (res_a <= max_res_pass)
+                passA++;
+        }
+        if (ok_b)
+        {
+            n_plane_B++;
+            nnB_all.push_back(nn_b);
+            resB_all.push_back(res_b);
+            if (res_b <= max_res_pass)
+                passB++;
+        }
+        if (ok_a && ok_b)
+        {
+            n_plane_both++;
+            nnA_pair.push_back(nn_a);
+            nnB_pair.push_back(nn_b);
+            resA_pair.push_back(res_a);
+            resB_pair.push_back(res_b);
+            if (res_a <= max_res_pass)
+                passA_pair++;
+            if (res_b <= max_res_pass)
+                passB_pair++;
+        }
     }
 
     // Publish world clouds (cap)
@@ -933,21 +966,29 @@ void shadow_odin_cross_time_eval(
         std::nth_element(v.begin(), v.begin() + static_cast<long>(m), v.end());
         return v[m];
     };
-    const double resA_med = med(resA);
-    const double resB_med = med(resB);
-    const double nnA_med = med(nnA);
-    const double nnB_med = med(nnB);
-    const double n_scored = static_cast<double>(std::max(resA.size(), resB.size()));
+    // Prefer paired medians (same point set); fall back to unpaired for logging.
+    const double resA_med = med(resA_pair.empty() ? resA_all : resA_pair);
+    const double resB_med = med(resB_pair.empty() ? resB_all : resB_pair);
+    const double nnA_med = med(nnA_pair.empty() ? nnA_all : nnA_pair);
+    const double nnB_med = med(nnB_pair.empty() ? nnB_all : nnB_pair);
+    const double n_try = static_cast<double>(idx.size());
     const double passA_frac =
-        resA.empty() ? 0.0 : static_cast<double>(passA) / resA.size();
+        resA_pair.empty()
+            ? (resA_all.empty() ? 0.0 : static_cast<double>(passA) / resA_all.size())
+            : static_cast<double>(passA_pair) / resA_pair.size();
     const double passB_frac =
-        resB.empty() ? 0.0 : static_cast<double>(passB) / resB.size();
+        resB_pair.empty()
+            ? (resB_all.empty() ? 0.0 : static_cast<double>(passB) / resB_all.size())
+            : static_cast<double>(passB_pair) / resB_pair.size();
 
     if (pubMet)
     {
         std_msgs::msg::Float64MultiArray m;
-        // layout: dt_ms, rel_yaw_deg, rel_trans_m, resA, resB, nnA, nnB,
-        //         n_scored, passA, passB, w_norm, t_odin, t_mid, b_pre_ms
+        // layout v2:
+        // 0 dt_ms, 1 rel_yaw_deg, 2 rel_trans_m, 3 resA, 4 resB, 5 nnA, 6 nnB,
+        // 7 n_try, 8 passA, 9 passB, 10 w_norm, 11 t_odin, 12 t_mid, 13 b_pre_ms,
+        // 14 n_plane_A, 15 n_plane_B, 16 n_plane_both,
+        // 17 map_odin_cand, 18 map_odin_ins, 19 map_odin_blk, 20 map_block_flag
         m.data = {dt_ms,
                   rel_yaw,
                   rel_trans,
@@ -955,13 +996,20 @@ void shadow_odin_cross_time_eval(
                   resB_med,
                   nnA_med,
                   nnB_med,
-                  n_scored,
+                  n_try,
                   passA_frac,
                   passB_frac,
                   gate_gyr_norm(),
                   t_odin_end,
                   t_mid_end,
-                  bundle_bias_pre_sec_ * 1000.0};
+                  bundle_bias_pre_sec_ * 1000.0,
+                  static_cast<double>(n_plane_A),
+                  static_cast<double>(n_plane_B),
+                  static_cast<double>(n_plane_both),
+                  static_cast<double>(last_map_odin_cand_),
+                  static_cast<double>(last_map_odin_ins_),
+                  static_cast<double>(last_map_odin_blk_),
+                  last_map_odin_block_flag_ ? 1.0 : 0.0};
         pubMet->publish(m);
     }
 
@@ -972,7 +1020,9 @@ void shadow_odin_cross_time_eval(
                   << "deg trans=" << rel_trans << "m resA=" << resA_med
                   << " resB=" << resB_med << " dRes=" << (resB_med - resA_med)
                   << " nnA=" << nnA_med << " nnB=" << nnB_med
-                  << " passA=" << passA_frac << " passB=" << passB_frac
+                  << " planeA/B/both=" << n_plane_A << "/" << n_plane_B << "/"
+                  << n_plane_both << " mapIns=" << last_map_odin_ins_ << "/"
+                  << last_map_odin_cand_ << "(blk=" << last_map_odin_blk_ << ")"
                   << " w=" << gate_gyr_norm() << " ok=" << n_xtform_ok
                   << " skip=" << n_xtform_skip_hist << "\n";
     }
@@ -1772,6 +1822,10 @@ void map_incremental()
         (lidar2_map_insert_gyr_gate > 0.0 &&
          gyr_for_insert >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until || sync_too_loose_for_map;
+    last_map_odin_cand_ = 0;
+    last_map_odin_ins_ = 0;
+    last_map_odin_blk_ = 0;
+    last_map_odin_block_flag_ = block_odin_insert;
     for (int i = 0; i < feats_down_size; i++)
     {
         const bool is_odin_pt =
@@ -1779,6 +1833,16 @@ void map_incremental()
             (!bundle_enabled && current_lidar_num == 2);
         // Turn + cooldown: stamp lag makes Odin look wrong then snap — do not
         // lock those frames into ikdtree (ikdtree won't undo bad inserts).
+        if (is_odin_pt)
+        {
+            last_map_odin_cand_++;
+            if (block_odin_insert)
+            {
+                last_map_odin_blk_++;
+                continue;
+            }
+            last_map_odin_ins_++;
+        }
         if (is_odin_pt && block_odin_insert)
             continue;
         const float bx = feats_down_body->points[i].x;
