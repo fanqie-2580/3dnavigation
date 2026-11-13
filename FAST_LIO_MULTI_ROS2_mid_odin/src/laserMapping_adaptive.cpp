@@ -165,8 +165,17 @@ MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 // Stage1 pose for /cloud_odin_registered (Stage2 must not yank orange viz).
+// With odin_pose_at_scan_end: interpolated Mid pose @ Odin scan-end (Mid clock).
 state_ikfom state_point_odin_pub_;
 bool have_state_odin_pub_ = false;
+double publish_odin_time_ = -1.0; // >=0: orange header = Odin-end on Mid clock
+bool odin_pose_at_scan_end_en = true;
+struct MidPoseSample
+{
+    double t = 0.0;
+    state_ikfom s;
+};
+std::deque<MidPoseSample> mid_pose_hist_;
 vect3 pos_lid;
 
 nav_msgs::msg::Path path;
@@ -509,6 +518,78 @@ void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
     po->y = p_global(1);
     po->z = p_global(2);
     po->intensity = pi->intensity;
+}
+
+inline Eigen::Quaterniond quat_from_state(const state_ikfom &s)
+{
+    // MTK SO3 coeffs = (x, y, z, w) — same as geoQuat assignment.
+    return Eigen::Quaterniond(s.rot.coeffs()[3], s.rot.coeffs()[0],
+                              s.rot.coeffs()[1], s.rot.coeffs()[2])
+        .normalized();
+}
+
+inline void set_state_rot(state_ikfom &s, const Eigen::Quaterniond &q_in)
+{
+    Eigen::Quaterniond q = q_in.normalized();
+    s.rot = q.toRotationMatrix();
+}
+
+void push_mid_pose_hist(const double t, const state_ikfom &s)
+{
+    MidPoseSample m;
+    m.t = t;
+    m.s = s;
+    mid_pose_hist_.push_back(m);
+    while (mid_pose_hist_.size() > 50)
+        mid_pose_hist_.pop_front();
+    while (mid_pose_hist_.size() > 2 &&
+           mid_pose_hist_.front().t < t - 0.60)
+        mid_pose_hist_.pop_front();
+}
+
+// Mid continuous pose at time t (Mid clock). Bracket slerp; short extrapolate OK.
+bool sample_mid_pose_at(const double t, state_ikfom &out)
+{
+    if (mid_pose_hist_.empty())
+        return false;
+    if (mid_pose_hist_.size() == 1 || t <= mid_pose_hist_.front().t + 1e-9)
+    {
+        out = mid_pose_hist_.front().s;
+        return true;
+    }
+    size_t i = 0;
+    while (i + 1 < mid_pose_hist_.size() && mid_pose_hist_[i + 1].t < t)
+        ++i;
+    if (i + 1 >= mid_pose_hist_.size())
+    {
+        out = mid_pose_hist_.back().s;
+        const double dt = t - mid_pose_hist_.back().t;
+        if (dt > 1e-4 && dt < 0.15 && mid_pose_hist_.size() >= 2)
+        {
+            const auto &a = mid_pose_hist_[mid_pose_hist_.size() - 2];
+            const auto &b = mid_pose_hist_.back();
+            const double dtab = std::max(1e-4, b.t - a.t);
+            const Eigen::Quaterniond qa = quat_from_state(a.s);
+            const Eigen::Quaterniond qb = quat_from_state(b.s);
+            const Eigen::AngleAxisd aa(qa.conjugate() * qb);
+            V3D omega = aa.axis() * aa.angle() / dtab;
+            out.pos = b.s.pos + b.s.vel * dt;
+            set_state_rot(out, Eigen::Quaterniond(qb.toRotationMatrix() * Exp(omega, dt)));
+        }
+        return true;
+    }
+    const auto &a = mid_pose_hist_[i];
+    const auto &b = mid_pose_hist_[i + 1];
+    double u = (t - a.t) / std::max(1e-6, b.t - a.t);
+    if (u < 0.0)
+        u = 0.0;
+    if (u > 1.0)
+        u = 1.0;
+    out = (u < 0.5) ? a.s : b.s;
+    out.pos = (1.0 - u) * a.s.pos + u * b.s.pos;
+    out.vel = (1.0 - u) * a.s.vel + u * b.s.vel;
+    set_state_rot(out, quat_from_state(a.s).slerp(u, quat_from_state(b.s)));
+    return true;
 }
 
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
@@ -1457,12 +1538,14 @@ void publish_odin_from_undistorted(
         return;
     if (!p_imu->IMU_inited())
         return;
+    const double odin_stamp =
+        (publish_odin_time_ > 0.0) ? publish_odin_time_ : publish_lidar_time;
     auto pub_hold = [&]() {
         if (!odin_hold_map_have || !odin_hold_map || odin_hold_map->empty())
             return;
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*odin_hold_map, laserCloudmsg);
-        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+        laserCloudmsg.header.stamp = get_ros_time(odin_stamp);
         laserCloudmsg.header.frame_id = map_frame;
         pubOdin->publish(laserCloudmsg);
     };
@@ -1488,12 +1571,14 @@ void publish_odin_from_undistorted(
         odin_hold_map_have = true;
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        laserCloudmsg.header.stamp = get_ros_time(publish_lidar_time);
+        laserCloudmsg.header.stamp = get_ros_time(odin_stamp);
         laserCloudmsg.header.frame_id = map_frame;
         pubOdin->publish(laserCloudmsg);
+        publish_odin_time_ = -1.0;
         return;
     }
     pub_hold();
+    publish_odin_time_ = -1.0;
 }
 
 void publish_mid_from_undistorted(
@@ -1940,6 +2025,7 @@ public:
         this->declare_parameter<std::string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
         this->declare_parameter<bool>("mapping.odin_native_deskew_en", true);
+        this->declare_parameter<bool>("mapping.odin_pose_at_scan_end_en", true);
         this->declare_parameter<std::string>("common.map_frame", "map");
 
         this->declare_parameter<int>("method.voxelized_pt_num_thres", 100);
@@ -2036,6 +2122,7 @@ public:
         this->get_parameter_or("common.imu_topic2", imu_topic2, std::string("/odin1/imu"));
         this->get_parameter_or("common.map_frame", map_frame, std::string("map"));
         this->get_parameter_or("mapping.odin_native_deskew_en", odin_native_deskew_en, true);
+        this->get_parameter_or("mapping.odin_pose_at_scan_end_en", odin_pose_at_scan_end_en, true);
 
         this->get_parameter_or("method.voxelized_pt_num_thres", voxelized_pt_num_thres, 100);
         this->get_parameter_or("method.effect_pt_num_ratio_thres", effect_pt_num_ratio_thres, 0.4);
@@ -2271,6 +2358,7 @@ public:
                  << " soft_wait=" << lidar2_soft_wait_sec * 1000.0 << "ms"
                  << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
                  << " odin_native_deskew=" << (odin_native_deskew_en ? "true" : "false")
+                 << " odin_pose_at_end=" << (odin_pose_at_scan_end_en ? "true" : "false")
                  << " imu2=" << imu_topic2
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
@@ -2499,9 +2587,35 @@ private:
                 apply_odin_pose_factor();
                 state_point = kf.get_x();
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-                // Stash Stage1 for Odin publish after map_incremental.
+                // Mid Stage1 history @ Mid scan end (for Odin-end pose query).
+                push_mid_pose_hist(lidar_end_time, state_stage1);
+                // Orange: prefer Mid pose at Odin scan-end on Mid clock, not Mid_end.
+                // t_odin_end_mid = (L2_header + bias) + odin_span = lidar_end_time2 + bias
+                // when native path set physical Odin end on USB clock.
                 state_point_odin_pub_ = state_stage1;
+                publish_odin_time_ = -1.0;
                 have_state_odin_pub_ = true;
+                if (odin_pose_at_scan_end_en && odin_native_deskew_en &&
+                    bundle_pair_dt_ >= 0.0 && Measures.lidar2 &&
+                    !Measures.lidar2->empty())
+                {
+                    const double t_odin_end_mid =
+                        Measures.lidar_end_time2 + lidar2_stamp_bias_sec;
+                    state_ikfom s_at_end;
+                    if (sample_mid_pose_at(t_odin_end_mid, s_at_end))
+                    {
+                        state_point_odin_pub_ = s_at_end;
+                        publish_odin_time_ = t_odin_end_mid;
+                        static int s_odin_end_pose_log = 0;
+                        if ((++s_odin_end_pose_log % 40) == 0)
+                        {
+                            std::cout << "[odin-pose-at-end] vs_mid_end="
+                                      << (t_odin_end_mid - lidar_end_time) * 1000.0
+                                      << "ms center=" << bundle_center_dt_ * 1000.0
+                                      << "ms hist=" << mid_pose_hist_.size() << "\n";
+                        }
+                    }
+                }
                 // Refresh climb/pitch gates from Mid state for the next frame.
                 last_mid_vz = state_point.vel(2);
                 last_mid_pitch = mid_pitch_from_rot(state_point.rot.toRotationMatrix());

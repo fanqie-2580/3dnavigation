@@ -69,6 +69,9 @@
       # Odin intra-scan on /odin1/imu, then one Mid Stage1 rigid map pose.
       # Avoids mapping each Odin point onto Mid IMU time (cross-sensor delay).
       odin_native_deskew_en: true
+      # Orange map pose at Odin scan-end (Mid-clock via stamp_bias), not Mid_end.
+      # Fixes whole-frame yaw error ≈ ω·center_dt when ends disagree.
+      odin_pose_at_scan_end_en: true
       lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20

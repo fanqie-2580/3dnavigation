@@ -593,6 +593,14 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 参数：`odin_native_deskew_en: true`，`imu_topic2: /odin1/imu`。日志：`[odin-native deskew] imu2=… poses=…`。
 
+### 10v. 橙云位姿锚到 Odin scan-end（2026-11-13）
+
+**根因（native 后仍残影）**：native 把点压到 **Odin end**，发布却乘 **Stage1 @ Mid_end**；`center_dt` p95≈47 ms → 转弯时整帧刚体偏航 ≈ ω·Δt（1 rad/s → ~2.7°）。属 C/F，不是再调 bias。
+
+**修复**：保留 native deskew；维护 Mid Stage1 位姿历史；橙云用 `T_map(t_odin_end_mid)`，`t = lidar_end_time2 + stamp_bias`；header 同步该时刻。不改 Bundle/Stage2/EMA/写图门。
+
+参数：`odin_pose_at_scan_end_en: true`。日志：`[odin-pose-at-end] vs_mid_end=…ms`。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
