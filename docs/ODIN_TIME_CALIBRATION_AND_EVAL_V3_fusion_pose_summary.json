@@ -1,0 +1,319 @@
+{
+  "map_source": "fusion_cloud_registered_pose_contaminated",
+  "map_meta": {
+    "n_cand": 262,
+    "n_keep": 239,
+    "reject_w": 22,
+    "reject_v": 1,
+    "n_pts": 40000,
+    "warning": "Poses of /cloud_registered come from fused IEKF when lidar2_update_en=true; Mid points only, but trajectory may be Odin-Stage2 influenced."
+  },
+  "align": null,
+  "n_pairs": 356,
+  "insert_audit_v3": {
+    "n": 356,
+    "gate_frac_med": 1.0,
+    "det_frac_med": 1.0,
+    "queued_frac_med": 0.008004938249135882,
+    "queued_frac_mean": 0.016901744650729144,
+    "frac_frames_block": 0.46348314606741575,
+    "ikd_add_total_med": 10.0,
+    "note": "V2 'ins_frac' was gate_pass/cand, NOT true ikdtree inserts. queued/cand is points entering PointToAdd/PointNoNeedDownsample. ikd_add_total is Add_Points return for Mid+Odin; downsample=false path does not increment the return counter.",
+    "by_seg_queued": {
+      "still": {
+        "n": 338,
+        "med": 0.007924419913809183
+      },
+      "turn_right": {
+        "n": 5,
+        "med": 0.17723076923076922
+      },
+      "translate": {
+        "n": 2,
+        "med": 0.09090604850404943
+      },
+      "combined": {
+        "n": 9,
+        "med": 0.2566105769230769
+      },
+      "other": {
+        "n": 2,
+        "med": 0.07793594306049823
+      }
+    }
+  },
+  "by_segment": {
+    "still": {
+      "n": 338,
+      "nnA_pair_p50": 0.1306336132806737,
+      "nnB_pair_p50": 0.13045745001793735,
+      "d_nn_pair": -0.00010084881359190105,
+      "resA_pair_p50": 0.08068409466397908,
+      "resB_pair_p50": 0.0804001288997434,
+      "d_res_pair": -7.506481033597856e-05,
+      "frac_nn_both": 0.8675,
+      "frac_plane_both": 0.27666666666666667,
+      "online_d_res": -5.65475385655434e-05,
+      "queued_frac": 0.007924419913809183,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.4911242603550296,
+      "frac_A_better_res": 0.4289940828402367
+    },
+    "turn_left": null,
+    "turn_right": {
+      "n": 5,
+      "nnA_pair_p50": 0.1591160726788793,
+      "nnB_pair_p50": 0.14079398995198258,
+      "d_nn_pair": 0.004475686489161232,
+      "resA_pair_p50": 0.11408290067088034,
+      "resB_pair_p50": 0.09449408098210577,
+      "d_res_pair": 0.004410905651172331,
+      "frac_nn_both": 0.9083333333333333,
+      "frac_plane_both": 0.2833333333333333,
+      "online_d_res": -0.0007072230923468315,
+      "queued_frac": 0.17723076923076922,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.0,
+      "frac_A_better_res": 1.0
+    },
+    "translate": {
+      "n": 2,
+      "nnA_pair_p50": 0.15403248951635648,
+      "nnB_pair_p50": 0.14811789058321556,
+      "d_nn_pair": -0.005239115452856533,
+      "resA_pair_p50": 0.08731964355812388,
+      "resB_pair_p50": 0.0829328280478264,
+      "d_res_pair": -0.0038467500057106363,
+      "frac_nn_both": 0.9075,
+      "frac_plane_both": 0.2875,
+      "online_d_res": -0.0005221842393486886,
+      "queued_frac": 0.09090604850404943,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.5,
+      "frac_A_better_res": 0.5
+    },
+    "combined": {
+      "n": 9,
+      "nnA_pair_p50": 0.1799511112122025,
+      "nnB_pair_p50": 0.1550101502679985,
+      "d_nn_pair": -0.0024057289362802714,
+      "resA_pair_p50": 0.12756554249480628,
+      "resB_pair_p50": 0.10484159941137916,
+      "d_res_pair": -0.0022660627153865964,
+      "frac_nn_both": 0.9158333333333334,
+      "frac_plane_both": 0.2816666666666667,
+      "online_d_res": -0.0003952895401053702,
+      "queued_frac": 0.2566105769230769,
+      "gate_frac": 1.0,
+      "frac_B_better_res": 0.6666666666666666,
+      "frac_A_better_res": 0.3333333333333333
+    },
+    "other": {
+      "n": 2,
+      "nnA_pair_p50": 0.17151455585113645,
+      "nnB_pair_p50": 0.16460774973147368,
+      "d_nn_pair": -0.002143569673354273,
+      "resA_pair_p50": 0.10149312147115563,
+      "resB_pair_p50": 0.10258968029320949,
+      "d_res_pair": -0.0015187359709031775,
+      "frac_nn_both": 0.9366666666666668,
+      "frac_plane_both": 0.30125,
+      "online_d_res": 4.3304375308472753e-05,
+      "queued_frac": 0.07793594306049823,
+      "gate_frac": 0.5,
+      "frac_B_better_res": 0.5,
+      "frac_A_better_res": 0.5
+    }
+  },
+  "motion": {
+    "n": 18,
+    "nnA_pair_p50": 0.17918893934493377,
+    "nnB_pair_p50": 0.15457568616946007,
+    "d_nn_pair": -0.002104556543091232,
+    "resA_pair_p50": 0.11274942271421029,
+    "resB_pair_p50": 0.10069852666379352,
+    "d_res_pair": 0.001109074216431305,
+    "frac_nn_both": 0.9125000000000001,
+    "frac_plane_both": 0.2833333333333333,
+    "online_d_res": -0.000314247284811775,
+    "queued_frac": 0.16655132767588282,
+    "gate_frac": 1.0,
+    "frac_B_better_res": 0.4444444444444444,
+    "frac_A_better_res": 0.5555555555555556
+  },
+  "still": {
+    "n": 338,
+    "nnA_pair_p50": 0.1306336132806737,
+    "nnB_pair_p50": 0.13045745001793735,
+    "d_nn_pair": -0.00010084881359190105,
+    "resA_pair_p50": 0.08068409466397908,
+    "resB_pair_p50": 0.0804001288997434,
+    "d_res_pair": -7.506481033597856e-05,
+    "frac_nn_both": 0.8675,
+    "frac_plane_both": 0.27666666666666667,
+    "online_d_res": -5.65475385655434e-05,
+    "queued_frac": 0.007924419913809183,
+    "gate_frac": 1.0,
+    "frac_B_better_res": 0.4911242603550296,
+    "frac_A_better_res": 0.4289940828402367
+  },
+  "b_clock_sweep_full_TWI_TIL": [
+    {
+      "b_clock_ms": -80.0,
+      "n": 18,
+      "nn_p50_med": 0.17375837936138044,
+      "res_p50_med": 0.12181908425518281
+    },
+    {
+      "b_clock_ms": -40.0,
+      "n": 18,
+      "nn_p50_med": 0.16207456982695634,
+      "res_p50_med": 0.11199357979792346
+    },
+    {
+      "b_clock_ms": -20.0,
+      "n": 18,
+      "nn_p50_med": 0.16049929633270332,
+      "res_p50_med": 0.1016882192444475
+    },
+    {
+      "b_clock_ms": 0.0,
+      "n": 18,
+      "nn_p50_med": 0.15968769472160152,
+      "res_p50_med": 0.10116875852140107
+    },
+    {
+      "b_clock_ms": 20.0,
+      "n": 18,
+      "nn_p50_med": 0.15883242943994558,
+      "res_p50_med": 0.10231265003674014
+    },
+    {
+      "b_clock_ms": 40.0,
+      "n": 18,
+      "nn_p50_med": 0.16311433406468218,
+      "res_p50_med": 0.10135572779019353
+    },
+    {
+      "b_clock_ms": 80.0,
+      "n": 18,
+      "nn_p50_med": 0.16842893996288835,
+      "res_p50_med": 0.10668740301866764
+    }
+  ],
+  "b_clock_sweep_naive_ignore_extrinsic": [
+    {
+      "b_clock_ms": -80.0,
+      "n": 18,
+      "nn_p50_med": 0.17638657062010304
+    },
+    {
+      "b_clock_ms": -40.0,
+      "n": 18,
+      "nn_p50_med": 0.16666536866563103
+    },
+    {
+      "b_clock_ms": -20.0,
+      "n": 18,
+      "nn_p50_med": 0.163305658380483
+    },
+    {
+      "b_clock_ms": 0.0,
+      "n": 18,
+      "nn_p50_med": 0.1605089264030079
+    },
+    {
+      "b_clock_ms": 20.0,
+      "n": 18,
+      "nn_p50_med": 0.16210244624213033
+    },
+    {
+      "b_clock_ms": 40.0,
+      "n": 18,
+      "nn_p50_med": 0.16469044363292915
+    },
+    {
+      "b_clock_ms": 80.0,
+      "n": 18,
+      "nn_p50_med": 0.1697556668240965
+    }
+  ],
+  "b_clock_geom_best_nn_full": {
+    "b_clock_ms": 20.0,
+    "n": 18,
+    "nn_p50_med": 0.15883242943994558,
+    "res_p50_med": 0.10231265003674014
+  },
+  "b_clock_geom_best_nn_naive": {
+    "b_clock_ms": 0.0,
+    "n": 18,
+    "nn_p50_med": 0.1605089264030079
+  },
+  "b_clock_geom_best_res_full": {
+    "b_clock_ms": 0.0,
+    "n": 18,
+    "nn_p50_med": 0.15968769472160152,
+    "res_p50_med": 0.10116875852140107
+  },
+  "note_b_clock": "geom-optimal \u2260 physical clock; full uses T_WI*T_IL",
+  "extrinsic_T_IL": [
+    -0.011,
+    -0.02329,
+    0.04412
+  ],
+  "time_axes": {
+    "topics": {
+      "/livox/imu": 15712,
+      "/livox/lidar": 786,
+      "/odin1/imu": 31289,
+      "/odin1/cloud_raw_ds": 636
+    },
+    "mid_lidar_header_vs_imu": {
+      "n": 786,
+      "med_ms": -0.7232427597045898,
+      "p10_ms": -1.1559724807739258,
+      "p90_ms": -0.23114681243896484,
+      "mean_ms": -0.8263618284812714
+    },
+    "mid_lidar_end_vs_imu": {
+      "n": 786,
+      "med_ms": -0.49304962158203125,
+      "p10_ms": -1.5327930450439453,
+      "p90_ms": -0.20492076873779297,
+      "mean_ms": -0.5706448591392459
+    },
+    "mid_lidar_end_minus_header_ms": 100.22509098052979,
+    "odin_cloud_raw_ds_header_vs_odin_imu": {
+      "n": 636,
+      "med_ms": 0.00035762786865234375,
+      "p10_ms": -1.0336637496948242,
+      "p90_ms": 1.0166168212890625,
+      "mean_ms": -0.30854025726798195
+    },
+    "odin_cloud_raw_ds_header_vs_mid_imu": {
+      "n": 636,
+      "med_ms": -0.022292137145996094,
+      "p10_ms": -2.118349075317383,
+      "p90_ms": 2.010941505432129,
+      "mean_ms": -0.29456652935196015
+    },
+    "odin_imu_vs_mid_imu": {
+      "n": 31289,
+      "med_ms": -0.0030994415283203125,
+      "p10_ms": -2.0604610443115234,
+      "p90_ms": 2.055692672729492,
+      "mean_ms": 0.0020817373189743575
+    },
+    "note": "These are header/timebase relationships, NOT physical LiDAR clock offset and NOT b_pair / dual-IMU xcorr / NN scan-phase."
+  },
+  "answers": {
+    "1_geom_b_clock_near_0": true,
+    "2_sensitive_to_map_pose_model": true,
+    "3_B_stable_on_independent": false,
+    "4_ready_stage2_trial": false,
+    "mid_only_rank": "similar",
+    "d_res_pair_motion": 0.001109074216431305,
+    "d_nn_pair_motion": -0.002104556543091232,
+    "independent_map": false
+  }
+}

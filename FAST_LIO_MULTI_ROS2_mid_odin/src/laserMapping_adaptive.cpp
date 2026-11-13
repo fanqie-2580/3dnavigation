@@ -195,10 +195,18 @@ long long n_odin_pub_query_fallback = 0;
 long long n_xtform_ok = 0;
 long long n_xtform_skip_hist = 0;
 // Last map_incremental Odin insert audit (counts only; does not change gates).
+// Stages: cand → gate_pass → det_pass → queued → (ikd_add_total is whole-frame).
 int last_map_odin_cand_ = 0;
-int last_map_odin_ins_ = 0;
+int last_map_odin_gate_pass_ = 0;
 int last_map_odin_blk_ = 0;
+int last_map_odin_det_pass_ = 0;
+int last_map_odin_queued_ = 0;      // into PointToAdd or PointNoNeedDownsample
+int last_map_odin_queued_ds_ = 0;   // PointToAdd (downsample path)
+int last_map_odin_queued_raw_ = 0;  // PointNoNeedDownsample
+int last_map_ikd_add_total_ = 0;    // Add_Points return sum (Mid+Odin; see limits)
 bool last_map_odin_block_flag_ = true;
+// Deprecated alias kept for log compatibility: gate_pass (NOT true ikdtree inserts).
+int &last_map_odin_ins_ = last_map_odin_gate_pass_;
 struct MidPoseSample
 {
     double t = 0.0;
@@ -984,11 +992,11 @@ void shadow_odin_cross_time_eval(
     if (pubMet)
     {
         std_msgs::msg::Float64MultiArray m;
-        // layout v2:
-        // 0 dt_ms, 1 rel_yaw_deg, 2 rel_trans_m, 3 resA, 4 resB, 5 nnA, 6 nnB,
-        // 7 n_try, 8 passA, 9 passB, 10 w_norm, 11 t_odin, 12 t_mid, 13 b_pre_ms,
-        // 14 n_plane_A, 15 n_plane_B, 16 n_plane_both,
-        // 17 map_odin_cand, 18 map_odin_ins, 19 map_odin_blk, 20 map_block_flag
+        // layout v3:
+        // 0–16 same as v2 (18 was gate_pass mislabeled "ins"),
+        // 17 cand, 18 gate_pass, 19 blk, 20 block_flag,
+        // 21 det_pass, 22 queued, 23 ikd_add_total (whole frame),
+        // 24 queued_ds, 25 queued_raw
         m.data = {dt_ms,
                   rel_yaw,
                   rel_trans,
@@ -1007,9 +1015,14 @@ void shadow_odin_cross_time_eval(
                   static_cast<double>(n_plane_B),
                   static_cast<double>(n_plane_both),
                   static_cast<double>(last_map_odin_cand_),
-                  static_cast<double>(last_map_odin_ins_),
+                  static_cast<double>(last_map_odin_gate_pass_),
                   static_cast<double>(last_map_odin_blk_),
-                  last_map_odin_block_flag_ ? 1.0 : 0.0};
+                  last_map_odin_block_flag_ ? 1.0 : 0.0,
+                  static_cast<double>(last_map_odin_det_pass_),
+                  static_cast<double>(last_map_odin_queued_),
+                  static_cast<double>(last_map_ikd_add_total_),
+                  static_cast<double>(last_map_odin_queued_ds_),
+                  static_cast<double>(last_map_odin_queued_raw_)};
         pubMet->publish(m);
     }
 
@@ -1021,8 +1034,11 @@ void shadow_odin_cross_time_eval(
                   << " resB=" << resB_med << " dRes=" << (resB_med - resA_med)
                   << " nnA=" << nnA_med << " nnB=" << nnB_med
                   << " planeA/B/both=" << n_plane_A << "/" << n_plane_B << "/"
-                  << n_plane_both << " mapIns=" << last_map_odin_ins_ << "/"
-                  << last_map_odin_cand_ << "(blk=" << last_map_odin_blk_ << ")"
+                  << n_plane_both << " mapOdin cand/gate/det/q="
+                  << last_map_odin_cand_ << "/" << last_map_odin_gate_pass_ << "/"
+                  << last_map_odin_det_pass_ << "/" << last_map_odin_queued_
+                  << "(blk=" << last_map_odin_blk_
+                  << " ikdTot=" << last_map_ikd_add_total_ << ")"
                   << " w=" << gate_gyr_norm() << " ok=" << n_xtform_ok
                   << " skip=" << n_xtform_skip_hist << "\n";
     }
@@ -1823,8 +1839,13 @@ void map_incremental()
          gyr_for_insert >= lidar2_map_insert_gyr_gate) ||
         now_ros < odin_map_insert_block_until || sync_too_loose_for_map;
     last_map_odin_cand_ = 0;
-    last_map_odin_ins_ = 0;
+    last_map_odin_gate_pass_ = 0;
     last_map_odin_blk_ = 0;
+    last_map_odin_det_pass_ = 0;
+    last_map_odin_queued_ = 0;
+    last_map_odin_queued_ds_ = 0;
+    last_map_odin_queued_raw_ = 0;
+    last_map_ikd_add_total_ = 0;
     last_map_odin_block_flag_ = block_odin_insert;
     for (int i = 0; i < feats_down_size; i++)
     {
@@ -1841,7 +1862,7 @@ void map_incremental()
                 last_map_odin_blk_++;
                 continue;
             }
-            last_map_odin_ins_++;
+            last_map_odin_gate_pass_++;
         }
         if (is_odin_pt && block_odin_insert)
             continue;
@@ -1850,9 +1871,13 @@ void map_incremental()
         const float bz = feats_down_body->points[i].z;
         if ((bx * bx + by * by + bz * bz) > det_r2)
             continue;
+        if (is_odin_pt)
+            last_map_odin_det_pass_++;
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
         /* decide if need add to map */
+        bool queued = false;
+        bool queued_raw = false;
         if (!Nearest_Points[i].empty())
         {
             const PointVector &points_near = Nearest_Points[i];
@@ -1865,26 +1890,48 @@ void map_incremental()
             float dist  = calc_dist(feats_down_world->points[i],mid_point);
             if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_surf && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_surf && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_surf){
                 PointNoNeedDownsample.push_back(feats_down_world->points[i]);
-                continue;
+                queued = true;
+                queued_raw = true;
             }
-            for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
+            else
             {
-                if (points_near.size() < NUM_MATCH_POINTS) break;
-                if (calc_dist(points_near[readd_i], mid_point) < dist)
+                for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
                 {
-                    need_add = false;
-                    break;
+                    if (points_near.size() < NUM_MATCH_POINTS) break;
+                    if (calc_dist(points_near[readd_i], mid_point) < dist)
+                    {
+                        need_add = false;
+                        break;
+                    }
+                }
+                if (need_add)
+                {
+                    PointToAdd.push_back(feats_down_world->points[i]);
+                    queued = true;
                 }
             }
-            if (need_add) PointToAdd.push_back(feats_down_world->points[i]);
         }
         else
         {
             PointToAdd.push_back(feats_down_world->points[i]);
+            queued = true;
+        }
+        if (is_odin_pt && queued)
+        {
+            last_map_odin_queued_++;
+            if (queued_raw)
+                last_map_odin_queued_raw_++;
+            else
+                last_map_odin_queued_ds_++;
         }
     }
-    ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
+    // Add_Points return: counts voxel-accepted inserts when downsample_on=true;
+    // when downsample_on=false the implementation does NOT increment the counter
+    // (still inserts). Return is Mid+Odin mixed — cannot attribute to Odin alone
+    // without splitting Add_Points calls (would reorder inserts; not done here).
+    last_map_ikd_add_total_ =
+        ikdtree.Add_Points(PointToAdd, true) +
+        ikdtree.Add_Points(PointNoNeedDownsample, false);
     return;
 }
 
