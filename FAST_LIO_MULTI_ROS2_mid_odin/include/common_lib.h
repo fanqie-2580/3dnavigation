@@ -52,7 +52,8 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     double lidar_beg_time, lidar_beg_time2;
     double lidar_end_time, lidar_end_time2;
     PointCloudXYZI::Ptr lidar, lidar2;
-    deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu;
+    deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu;   // Mid /livox/imu
+    deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu2;  // Odin /odin1/imu (native deskew)
 };
 
 struct Pose6D

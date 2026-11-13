@@ -18,6 +18,8 @@
       # Lidar-frame Odin for IEKF (downsample dual-stream). Viz stays on /odin1/cloud_raw_ds.
       lid_topic2: "/odin1/cloud_l2_body"
       imu_topic: "/livox/imu"
+      # Odin device IMU for scan-local deskew (not Mid /livox/imu).
+      imu_topic2: "/odin1/imu"
 
     method:
       voxelized_pt_num_thres: 1000
@@ -64,6 +66,9 @@
       # Soft densify (/viz/accum_*) is optional viz only — truth map = /Laser_map.
       lidar2_update_en: true
       lidar2_point_update_en: true
+      # Odin intra-scan on /odin1/imu, then one Mid Stage1 rigid map pose.
+      # Avoids mapping each Odin point onto Mid IMU time (cross-sensor delay).
+      odin_native_deskew_en: true
       lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
@@ -105,8 +110,13 @@
                     0.0, 0.0, 1.0]
       extrinsic_T2: [0.0, 0.0, 0.0]
       extrinsic_R2: [1.0, 0.0, 0.0,
-                     0.0, 1.0, 0.0,
-                     0.0, 0.0, 1.0]
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      # Official T_imu_L: Odin lidar in Odin IMU (wiki). Used by native deskew.
+      extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0,
+                                   0.0, 1.0, 0.0,
+                                   0.0, 0.0, 1.0]
       # L2_wrt_L1 = Odin lidar in Mid360 lidar (X fwd, Y left, Z up).
       # Derived 2026-11-06:
       #   T_base_odinIMU (hand/CAD) t=[0.313654,-0.028974,0.104418] R=I

@@ -42,6 +42,18 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   // Same convention as Bundle sync: physical Mid time ≈ L2_stamp + bias.
   void set_lidar2_stamp_bias(const double bias_sec) { lidar2_stamp_bias_ = bias_sec; }
+  // Odin scan-local deskew on /odin1/imu, then one rigid T_L2_wrt_L1 into Mid L1.
+  void set_odin_native_deskew(const bool en) { odin_native_deskew_ = en; }
+  void set_lidar2_wrt_lidar1(const M3D &R, const V3D &T)
+  {
+    Lidar2_R_wrt_Lidar1_ = R;
+    Lidar2_T_wrt_Lidar1_ = T;
+  }
+  void set_odin_imu_extrinsic(const V3D &transl, const M3D &rot)
+  {
+    Odin_Lidar_T_wrt_IMU_ = transl;
+    Odin_Lidar_R_wrt_IMU_ = rot;
+  }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_, const bool &multi_lidar, int lidar_num = 1);
   bool IMU_inited() const { return !imu_need_init_; }
@@ -57,6 +69,9 @@ class ImuProcess
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out, int lidar_num = 1);
   void UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+  // Deskew Odin cloud in its own lidar frame using imu2; leaves points at scan-end.
+  bool UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &meas,
+                           const V3D &bg, const V3D &ba);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   sensor_msgs::msg::Imu::ConstSharedPtr last_imu_;
@@ -65,6 +80,10 @@ class ImuProcess
   vector<M3D>    v_rot_pcl_;
   M3D Lidar_R_wrt_IMU;
   V3D Lidar_T_wrt_IMU;
+  M3D Lidar2_R_wrt_Lidar1_ = Eye3d;
+  V3D Lidar2_T_wrt_Lidar1_ = Zero3d;
+  M3D Odin_Lidar_R_wrt_IMU_ = Eye3d;
+  V3D Odin_Lidar_T_wrt_IMU_ = Zero3d;
   V3D mean_acc;
   V3D mean_gyr;
   V3D angvel_last;
@@ -72,6 +91,7 @@ class ImuProcess
   double start_timestamp_;
   double last_lidar_end_time_, last_lidar_end_time_2;
   double lidar2_stamp_bias_ = 0.0;
+  bool   odin_native_deskew_ = false;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -332,6 +352,185 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   }
 }
 
+bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &meas,
+                                     const V3D &bg, const V3D &ba)
+{
+  // Odin points stay in Odin lidar frame. Time = header + offset_time (curvature ms).
+  // Integrate /odin1/imu on that clock; compensate every point to this scan's end.
+  if (cloud.points.empty() || meas.imu2.size() < 2)
+    return false;
+
+  constexpr double kMaxDt = 0.20;
+  const double beg = meas.lidar_beg_time2;
+  double span = 0.0;
+  for (const auto &pt : cloud.points)
+    span = std::max(span, static_cast<double>(pt.curvature) / 1000.0);
+  if (span < 1e-4)
+    return false;
+  const double end = beg + span;
+
+  auto v_imu = meas.imu2;
+  // Ensure coverage: drop samples far before beg; keep at least one prior sample.
+  while (v_imu.size() > 2 &&
+         get_time_sec(v_imu[1]->header.stamp) < beg - 1e-4)
+    v_imu.pop_front();
+
+  const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc.norm());
+  const M3D R_LI = Odin_Lidar_R_wrt_IMU_;
+  const V3D T_LI = Odin_Lidar_T_wrt_IMU_;
+  const M3D R_IL = R_LI.transpose();
+
+  // Relative IMU pose chain in a local frame that starts at Identity @ beg.
+  std::vector<Pose6D> poses;
+  poses.reserve(v_imu.size() + 2);
+
+  M3D R = Eye3d;
+  V3D pos = Zero3d;
+  V3D vel = Zero3d;
+  V3D angvel = Zero3d;
+  V3D acc_s = Zero3d;
+  double last_t = beg;
+  poses.push_back(set_pose6d(0.0, acc_s, angvel, vel, pos, R));
+
+  input_ikfom in;
+  for (size_t i = 0; i + 1 < v_imu.size(); i++)
+  {
+    const auto &head = v_imu[i];
+    const auto &tail = v_imu[i + 1];
+    const double t_head = get_time_sec(head->header.stamp);
+    const double t_tail = get_time_sec(tail->header.stamp);
+    if (t_tail < beg)
+      continue;
+
+    V3D angvel_avr, acc_avr;
+    angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+        0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+        0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+    acc_avr << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+        0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+        0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+    angvel_avr -= bg;
+    acc_avr = acc_avr * acc_scale - ba;
+
+    double t0 = std::max(t_head, last_t);
+    double t1 = t_tail;
+    bool hit_end = false;
+    if (t1 > end + 1e-9)
+    {
+      t1 = end;
+      hit_end = true;
+    }
+    double dt = t1 - t0;
+    if (dt <= 1e-9)
+    {
+      if (hit_end)
+        break;
+      continue;
+    }
+
+    // Constant-ω / constant-a integration in the local frame (grav≈0 relative).
+    R = R * Exp(angvel_avr, dt);
+    const V3D acc_world = R * acc_avr;
+    pos += vel * dt + 0.5 * acc_world * dt * dt;
+    vel += acc_world * dt;
+    angvel = angvel_avr;
+    acc_s = acc_world;
+    last_t = t1;
+    poses.push_back(set_pose6d(last_t - beg, acc_s, angvel, vel, pos, R));
+    if (hit_end || t_tail >= end - 1e-9)
+      break;
+  }
+
+  // Stub to exact scan end if IMU stopped early.
+  if (end - last_t > 1e-6 && !poses.empty())
+  {
+    const double dt = std::min(kMaxDt, end - last_t);
+    R = R * Exp(angvel, dt);
+    pos += vel * dt + 0.5 * acc_s * dt * dt;
+    vel += acc_s * dt;
+    last_t = end;
+    poses.push_back(set_pose6d(span, acc_s, angvel, vel, pos, R));
+  }
+
+  if (poses.size() <= 1)
+    return false;
+
+  const M3D R_end = R;
+  const V3D pos_end = pos;
+  const M3D R_end_T = R_end.transpose();
+
+  std::vector<int> order(cloud.points.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](int a, int b) {
+    return cloud.points[a].curvature < cloud.points[b].curvature;
+  });
+
+  auto apply_pose = [&](PointType &pt, const double t_off,
+                        const M3D &R0, const V3D &pos0, const V3D &vel0,
+                        const V3D &acc0, const V3D &gyr0, const double t0) {
+    const double dt = t_off - t0;
+    if (std::fabs(dt) > kMaxDt)
+      return;
+    const M3D R_i = R0 * Exp(gyr0, dt);
+    const V3D P_i(pt.x, pt.y, pt.z);
+    const V3D T_ei = pos0 + vel0 * dt + 0.5 * acc0 * dt * dt - pos_end;
+    const V3D P_compensate =
+        R_IL * (R_end_T * (R_i * (R_LI * P_i + T_LI) + T_ei) - T_LI);
+    pt.x = P_compensate(0);
+    pt.y = P_compensate(1);
+    pt.z = P_compensate(2);
+  };
+
+  size_t idx = order.size();
+  M3D R_imu;
+  V3D vel_imu, pos_imu, acc_imu, angvel_avr;
+  for (auto it_kp = poses.end() - 1; it_kp != poses.begin(); it_kp--)
+  {
+    auto head = it_kp - 1;
+    auto tail = it_kp;
+    R_imu << MAT_FROM_ARRAY(head->rot);
+    vel_imu << VEC_FROM_ARRAY(head->vel);
+    pos_imu << VEC_FROM_ARRAY(head->pos);
+    acc_imu << VEC_FROM_ARRAY(tail->acc);
+    angvel_avr << VEC_FROM_ARRAY(tail->gyr);
+    while (idx > 0)
+    {
+      PointType &pt = cloud.points[order[idx - 1]];
+      const double t = static_cast<double>(pt.curvature) / 1000.0;
+      if (t <= head->offset_time)
+        break;
+      --idx;
+      apply_pose(pt, t, R_imu, pos_imu, vel_imu, acc_imu, angvel_avr,
+                 head->offset_time);
+    }
+  }
+  if (idx > 0)
+  {
+    auto head = poses.begin();
+    R_imu << MAT_FROM_ARRAY(head->rot);
+    vel_imu << VEC_FROM_ARRAY(head->vel);
+    pos_imu << VEC_FROM_ARRAY(head->pos);
+    acc_imu << VEC_FROM_ARRAY(head->acc);
+    angvel_avr << VEC_FROM_ARRAY(head->gyr);
+    for (size_t i = 0; i < idx; i++)
+    {
+      PointType &pt = cloud.points[order[i]];
+      const double t = static_cast<double>(pt.curvature) / 1000.0;
+      apply_pose(pt, t, R_imu, pos_imu, vel_imu, acc_imu, angvel_avr,
+                 head->offset_time);
+    }
+  }
+
+  static int s_odin_native_log = 0;
+  if ((++s_odin_native_log % 40) == 0)
+  {
+    std::cout << "[odin-native deskew] imu2=" << meas.imu2.size()
+              << " poses=" << poses.size() << " span=" << span * 1000.0
+              << "ms pts=" << cloud.points.size() << "\n";
+  }
+  return true;
+}
+
 void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
 {
   /*** add the imu of the last frame-tail to the of current frame-head ***/
@@ -349,10 +548,17 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   // Official KF integrates once to Mid end. Deskew may need a longer horizon
   // (signed_dt + odin_span); that path uses a shadow copy so we never
   // predict(+dt) then predict(-dt) on the real filter (non-inverse + Q inject).
+  // With Odin-native deskew, Mid IMU horizon stays at Mid end (no cross-sensor).
   const double pcl_beg_time = meas.lidar_beg_time;
   const double mid_end_time = meas.lidar_end_time;
+  const bool native_odin =
+      odin_native_deskew_ && meas.lidar2 && !meas.lidar2->empty() &&
+      meas.imu2.size() >= 2;
+  // When native mode is on, lidar_end_time2 is on the Odin/USB clock — never
+  // use it as a Mid-IMU propagation horizon (even on imu2-thin fallback).
   const double deskew_end_time =
-      std::max(mid_end_time, meas.lidar_end_time2);
+      odin_native_deskew_ ? mid_end_time
+                         : std::max(mid_end_time, meas.lidar_end_time2);
 
   PointCloudXYZI pcl_1_out = *(meas.lidar);
   PointCloudXYZI pcl_2_out = *(meas.lidar2);
@@ -578,53 +784,87 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   deskew_cloud(pcl_1_out, meas.lidar_beg_time);
 
-  // Odin dToF: offset_time is relative to USB header. Bundle pairing still uses
-  // (header+bias), but deskew must NOT fold the oscillating header residual —
-  // that ±50ms signed/center swing warps the IMU segment per point → fan smear.
-  // Lock Odin scan-center to Mid scan-center; keep intra-scan offsets.
   // Mid-only ticks leave pcl_2 empty (viz holds last body cloud).
   if (!pcl_2_out.points.empty())
   {
-    std::vector<double> offs;
-    offs.reserve(pcl_2_out.points.size());
-    for (const auto &pt : pcl_2_out.points)
-      offs.push_back(static_cast<double>(pt.curvature) / 1000.0);
-    double odin_med = 0.0;
-    if (!offs.empty())
+    bool native_ok = false;
+    if (native_odin)
     {
-      const size_t mid = offs.size() / 2;
-      std::nth_element(offs.begin(), offs.begin() + static_cast<long>(mid), offs.end());
-      odin_med = offs[mid];
+      // Knife: Odin intra-scan on /odin1/imu (same device clock), then one rigid
+      // T_L2_wrt_L1. Do NOT map each Odin point onto Mid IMU time.
+      const state_ikfom st = kf_state.get_x();
+      native_ok = UndistortOdinNative(pcl_2_out, meas, st.bg, st.ba);
+      if (native_ok)
+      {
+        for (auto &pt : pcl_2_out.points)
+        {
+          const V3D p(pt.x, pt.y, pt.z);
+          const V3D q = Lidar2_R_wrt_Lidar1_ * p + Lidar2_T_wrt_Lidar1_;
+          pt.x = q(0);
+          pt.y = q(1);
+          pt.z = q(2);
+        }
+      }
+      else
+      {
+        static int s_odin_native_fb = 0;
+        if ((++s_odin_native_fb % 20) == 0)
+          std::cout << "[odin-native deskew] fallback→Mid-IMU path (imu2 thin)\n";
+      }
     }
-    const double mid_span = std::max(0.0, mid_end_time - pcl_beg_time);
-    const double header_off =
-        (meas.lidar_beg_time2 + lidar2_stamp_bias_) - meas.lidar_beg_time;
-    // Diagnostics only: how much header residual we are cancelling.
-    static int s_center_lock_log = 0;
-    const double center_residual = header_off + odin_med - 0.5 * mid_span;
-    if ((++s_center_lock_log % 40) == 0)
+
+    if (!native_ok)
     {
-      std::cout << "[deskew center-lock] cancel_header_center="
-                << center_residual * 1000.0
-                << "ms mid_span=" << mid_span * 1000.0
-                << "ms odin_med=" << odin_med * 1000.0 << "ms\n";
+      // Legacy: center-lock Odin offsets onto Mid IMU timeline + SE3 deskew.
+      // Non-native fill already mapped L2→L1; native-enabled path keeps Odin
+      // lidar frame until here — apply T_L2 once before Mid-IMU deskew.
+      if (odin_native_deskew_)
+      {
+        for (auto &pt : pcl_2_out.points)
+        {
+          const V3D p(pt.x, pt.y, pt.z);
+          const V3D q = Lidar2_R_wrt_Lidar1_ * p + Lidar2_T_wrt_Lidar1_;
+          pt.x = q(0);
+          pt.y = q(1);
+          pt.z = q(2);
+        }
+      }
+      std::vector<double> offs;
+      offs.reserve(pcl_2_out.points.size());
+      for (const auto &pt : pcl_2_out.points)
+        offs.push_back(static_cast<double>(pt.curvature) / 1000.0);
+      double odin_med = 0.0;
+      if (!offs.empty())
+      {
+        const size_t mid = offs.size() / 2;
+        std::nth_element(offs.begin(), offs.begin() + static_cast<long>(mid),
+                         offs.end());
+        odin_med = offs[mid];
+      }
+      const double mid_span = std::max(0.0, mid_end_time - pcl_beg_time);
+      const double header_off =
+          (meas.lidar_beg_time2 + lidar2_stamp_bias_) - meas.lidar_beg_time;
+      static int s_center_lock_log = 0;
+      const double center_residual = header_off + odin_med - 0.5 * mid_span;
+      if ((++s_center_lock_log % 40) == 0)
+      {
+        std::cout << "[deskew center-lock] cancel_header_center="
+                  << center_residual * 1000.0
+                  << "ms mid_span=" << mid_span * 1000.0
+                  << "ms odin_med=" << odin_med * 1000.0 << "ms\n";
+      }
+      for (auto &pt : pcl_2_out.points)
+      {
+        double t_rel =
+            static_cast<double>(pt.curvature) / 1000.0 - odin_med + 0.5 * mid_span;
+        if (t_rel < -kMaxBundleSpan)
+          t_rel = -kMaxBundleSpan;
+        if (t_rel > kMaxBundleSpan + 0.12)
+          t_rel = kMaxBundleSpan + 0.12;
+        pt.curvature = static_cast<float>(t_rel * 1000.0);
+      }
+      deskew_cloud(pcl_2_out, meas.lidar_beg_time);
     }
-    for (auto &pt : pcl_2_out.points)
-    {
-      // t = (offset - median) + Mid_center  → scan centers coincide.
-      // header_off is intentionally NOT added (cancel_header_center log only).
-      double t_rel =
-          static_cast<double>(pt.curvature) / 1000.0 - odin_med + 0.5 * mid_span;
-      if (t_rel < -kMaxBundleSpan)
-        t_rel = -kMaxBundleSpan;
-      if (t_rel > kMaxBundleSpan + 0.12)
-        t_rel = kMaxBundleSpan + 0.12;
-      pt.curvature = static_cast<float>(t_rel * 1000.0);
-    }
-    // Full SE3 via the same shadow IMUpose chain as Mid (per-interval R/T).
-    // Do NOT use single-sample Exp(ω,t−tend): 94ms spans with varying ω re-fan
-    // the cloud. Times are already center-locked — no header residual here.
-    deskew_cloud(pcl_2_out, meas.lidar_beg_time);
   }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360

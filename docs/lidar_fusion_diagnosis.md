@@ -581,6 +581,18 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 **根因**：`Exp(ω_sample, t−t_end)` 用瞬时角速度代替影子 `IMUpose` 逐区间姿态；高转时 `gyr_scan` vs `gyr_latest` 差 30–70% → 单帧扇形。`cancel_header_center` 只是已取消的 header 量，不是残余。  
 **修复**：保留 center-lock 时间；Odin 与 Mid 一样走 `deskew_cloud`（完整相对 SE3）。不改 EMA/Stage2/写图门/外参。
 
+### 10u. Odin-native IMU deskew（2026-11-13）
+
+**根因（A–F 核查后）**：Odin 点被映射到 Mid IMU 时间轴；跨传感器延迟非稳定常量（bias≈116 ms 近饱和，center p95≈47 ms）。完整 SE3 把错误 Δt 放大成扇形。Stage1/densify/decay/double-deskew 已排除。
+
+**修复（最小结构边界）**：
+1. 订阅 `/odin1/imu` → `meas.imu2`
+2. Odin 点保留在 Odin lidar 系；用 `T_L2_wrt_odin_imu`（wiki）在 Odin IMU 轴上 deskew 到本扫描 end
+3. 再一次刚体 `T_L2_wrt_L1` 进 Mid L1；橙色仍用 Mid Stage1 整帧投影
+4. Mid 处理 / Stage2 / bias EMA / 写图门不变；`imu2` 不足时回退旧 center-lock+Mid-IMU 路径
+
+参数：`odin_native_deskew_en: true`，`imu_topic2: /odin1/imu`。日志：`[odin-native deskew] imu2=… poses=…`。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

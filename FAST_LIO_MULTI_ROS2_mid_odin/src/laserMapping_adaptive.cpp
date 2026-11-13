@@ -79,7 +79,8 @@ float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 
-string lid_topic, lid_topic2, imu_topic, map_frame = "map";
+string lid_topic, lid_topic2, imu_topic, imu_topic2, map_frame = "map";
+bool odin_native_deskew_en = true;
 bool multi_lidar = false, async_debug = false, publish_tf_results = false, publish_odom_tf = true, bundle_enabled = false;
 // Smooth map→body TF for RViz only; /Odometry stays raw IEKF pose.
 double tf_pose_ema = 0.15;
@@ -106,6 +107,7 @@ double effect_pt_num_ratio_thres = 0.4;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = 0, last_timestamp_imu = -1.0;
+double last_timestamp_imu2 = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_surf = 0;
 double cube_len = 0, lidar_end_time = 0, lidar_end_time2 = 0, first_lidar_time = 0.0;
@@ -132,6 +134,9 @@ deque<double>                     time_buffer2;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer2;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
+deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer2; // /odin1/imu
+vector<double> extrinT_odin_imu(3, 0.0);
+vector<double> extrinR_odin_imu(9, 0.0);
 mutex mtx_buffer;
 mutex mtx_state; // Mid pose snapshot for Odin callback (timer vs sub threads)
 condition_variable sig_buffer;
@@ -690,6 +695,29 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     sig_buffer.notify_all();
 }
 
+void imu2_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+{
+    if (!first_lidar_scan_check || !odin_native_deskew_en)
+        return;
+
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    double timestamp = rclcpp::Time(msg->header.stamp).seconds();
+
+    mtx_buffer.lock();
+    if (timestamp < last_timestamp_imu2)
+    {
+        std::cerr << "odin imu loop back, clear buffer" << std::endl;
+        imu_buffer2.clear();
+    }
+    last_timestamp_imu2 = timestamp;
+    imu_buffer2.push_back(msg);
+    // Bound memory (~2s @ 400Hz).
+    while (imu_buffer2.size() > 1000)
+        imu_buffer2.pop_front();
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
 bool sync_packages_async(MeasureGroup &meas)
 {
     // Mid-only: never pull Odin into IEKF (Odin is published from cbk2 via L2 TF).
@@ -934,7 +962,10 @@ bool sync_packages_bundle(MeasureGroup &meas)
         auto fill_odin_meas = [&](size_t best_i, double best_dt, double signed_dt,
                                   double center_dt) {
             meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best_i]));
-            pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
+            // Native deskew keeps Odin lidar frame until after /odin1/imu SE3;
+            // legacy Mid-IMU deskew needs L2→L1 first.
+            if (!odin_native_deskew_en)
+                pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, T_L2_for_iekf());
             meas.lidar_beg_time2 = time_buffer2[best_i];
             double odin_span = 0.0;
             for (const auto &pt : meas.lidar2->points)
@@ -950,13 +981,21 @@ bool sync_packages_bundle(MeasureGroup &meas)
                 odin_span = lidar_mean_scantime2;
             else
                 odin_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-            // Deskew locks Odin scan-center to Mid center (see IMU_Processing).
-            // Horizon = remapped last point, not oscillating header signed_dt.
+
             const double mid_span =
                 std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-            const double odin_med = cloud_offset_median_sec(meas.lidar2);
-            const double t_max = 0.5 * mid_span - odin_med + odin_span;
-            lidar_end_time2 = meas.lidar_beg_time + std::max(mid_span, t_max);
+            if (odin_native_deskew_en)
+            {
+                // Physical Odin scan end on the Odin/USB clock (imu2 axis).
+                lidar_end_time2 = meas.lidar_beg_time2 + odin_span;
+            }
+            else
+            {
+                // Deskew locks Odin scan-center to Mid center (see IMU_Processing).
+                const double odin_med = cloud_offset_median_sec(meas.lidar2);
+                const double t_max = 0.5 * mid_span - odin_med + odin_span;
+                lidar_end_time2 = meas.lidar_beg_time + std::max(mid_span, t_max);
+            }
             meas.lidar_end_time2 = lidar_end_time2;
             bundle_pair_index_ = best_i;
             bundle_pair_dt_ = best_dt;
@@ -980,6 +1019,7 @@ bool sync_packages_bundle(MeasureGroup &meas)
             if (count_skip)
                 n_skip_l2_sync++;
             meas.lidar2.reset(new PointCloudXYZI());
+            meas.imu2.clear();
             meas.lidar_beg_time2 = meas.lidar_beg_time;
             lidar_end_time2 = lidar_end_time;
             meas.lidar_end_time2 = lidar_end_time2;
@@ -1065,21 +1105,57 @@ bool sync_packages_bundle(MeasureGroup &meas)
             }
         }
 
-        if (last_timestamp_imu < lidar_end_time || last_timestamp_imu < lidar_end_time2)
-        {
+        // Mid IMU only needs Mid scan end. Odin-native uses imu2 on Odin clock.
+        const bool need_odin_imu2 =
+            odin_native_deskew_en && bundle_pair_dt_ >= 0.0 &&
+            meas.lidar2 && !meas.lidar2->empty();
+        if (last_timestamp_imu < lidar_end_time)
             return false;
-        }
+        if (!odin_native_deskew_en && last_timestamp_imu < lidar_end_time2)
+            return false;
+        // Wait for imu2 only after we've seen at least one sample (avoid forever
+        // stall when /odin1/imu is absent → empty imu2 → Mid-IMU fallback).
+        if (need_odin_imu2 && last_timestamp_imu2 > 0.0 &&
+            last_timestamp_imu2 < meas.lidar_end_time2)
+            return false;
 
-        /*** push imu data, and pop from imu buffer ***/
+        /*** push Mid imu data, and pop from imu buffer ***/
         double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
         meas.imu.clear();
-        while ((!imu_buffer.empty()) && (imu_time < lidar_end_time || imu_time < lidar_end_time2))
+        const double mid_imu_horizon =
+            odin_native_deskew_en ? lidar_end_time
+                                 : std::max(lidar_end_time, lidar_end_time2);
+        while ((!imu_buffer.empty()) && (imu_time < mid_imu_horizon))
         {
             imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-            if (imu_time > lidar_end_time && imu_time > lidar_end_time2)
+            if (imu_time > mid_imu_horizon)
                 break;
             meas.imu.push_back(imu_buffer.front());
             imu_buffer.pop_front();
+        }
+
+        /*** attach Odin imu2 covering this L2 scan (native deskew) ***/
+        meas.imu2.clear();
+        if (need_odin_imu2)
+        {
+            const double beg2 = meas.lidar_beg_time2;
+            const double end2 = meas.lidar_end_time2;
+            // Drop stale samples well before this scan.
+            while (!imu_buffer2.empty() &&
+                   get_time_sec(imu_buffer2.front()->header.stamp) < beg2 - 0.15)
+                imu_buffer2.pop_front();
+            for (const auto &im : imu_buffer2)
+            {
+                const double t = get_time_sec(im->header.stamp);
+                if (t < beg2 - 0.02)
+                    continue;
+                if (t > end2 + 1e-4)
+                    break;
+                meas.imu2.push_back(im);
+            }
+            while (!imu_buffer2.empty() &&
+                   get_time_sec(imu_buffer2.front()->header.stamp) <= end2 + 1e-4)
+                imu_buffer2.pop_front();
         }
 
         // Scan-window gyro for gates (not latest callback — avoids still-after-turn
@@ -1113,14 +1189,19 @@ bool sync_packages_bundle(MeasureGroup &meas)
         if (bundle_pair_dt_ >= 0.0)
         {
             const double mid_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-            const double odin_h =
-                std::max(0.0, meas.lidar_end_time2 - meas.lidar_beg_time);
-            const double extend_ms = std::max(0.0, odin_h - mid_span) * 1000.0;
+            const double odin_h = odin_native_deskew_en
+                ? std::max(0.0, meas.lidar_end_time2 - meas.lidar_beg_time2)
+                : std::max(0.0, meas.lidar_end_time2 - meas.lidar_beg_time);
+            const double extend_ms =
+                odin_native_deskew_en
+                    ? 0.0
+                    : std::max(0.0, odin_h - mid_span) * 1000.0;
             cout << "\033[36;1mBundle tight dt=" << bundle_pair_dt_ * 1000.0
                  << "ms signed=" << bundle_pair_signed_dt_ * 1000.0
                  << "ms center=" << bundle_center_dt_ * 1000.0
                  << "ms extend=" << extend_ms
-                 << "ms gyr_scan=" << bundle_scan_gyr_norm_
+                 << "ms imu2=" << meas.imu2.size()
+                 << " gyr_scan=" << bundle_scan_gyr_norm_
                  << " gyr_latest=" << last_imu_gyr_norm << "\033[0m" << endl;
         }
         else
@@ -1857,6 +1938,8 @@ public:
         this->declare_parameter<std::string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<std::string>("common.lid_topic2", "/livox/lidar");
         this->declare_parameter<std::string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
+        this->declare_parameter<bool>("mapping.odin_native_deskew_en", true);
         this->declare_parameter<std::string>("common.map_frame", "map");
 
         this->declare_parameter<int>("method.voxelized_pt_num_thres", 100);
@@ -1924,6 +2007,8 @@ public:
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_R2", {});
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L2_wrt_L1", {});
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L2_wrt_L1", {});
+        this->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L2_wrt_odin_imu", {});
+        this->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L2_wrt_odin_imu", {});
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L1_wrt_drone", {});
         this->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L1_wrt_drone", {});
 
@@ -1948,7 +2033,9 @@ public:
         this->get_parameter_or("common.lid_topic", lid_topic, std::string("/livox/lidar"));
         this->get_parameter_or("common.lid_topic2", lid_topic2, std::string("/livox/lidar"));
         this->get_parameter_or("common.imu_topic", imu_topic, std::string("/livox/imu"));
+        this->get_parameter_or("common.imu_topic2", imu_topic2, std::string("/odin1/imu"));
         this->get_parameter_or("common.map_frame", map_frame, std::string("map"));
+        this->get_parameter_or("mapping.odin_native_deskew_en", odin_native_deskew_en, true);
 
         this->get_parameter_or("method.voxelized_pt_num_thres", voxelized_pt_num_thres, 100);
         this->get_parameter_or("method.effect_pt_num_ratio_thres", effect_pt_num_ratio_thres, 0.4);
@@ -2023,8 +2110,16 @@ public:
         this->get_parameter_or("mapping.extrinsic_R2", extrinR2, std::vector<double>());
         this->get_parameter_or("mapping.extrinsic_T_L2_wrt_L1", extrinT3, std::vector<double>());
         this->get_parameter_or("mapping.extrinsic_R_L2_wrt_L1", extrinR3, std::vector<double>());
+        this->get_parameter_or("mapping.extrinsic_T_L2_wrt_odin_imu", extrinT_odin_imu,
+                               std::vector<double>{-0.02663, 0.03447, 0.02174});
+        this->get_parameter_or("mapping.extrinsic_R_L2_wrt_odin_imu", extrinR_odin_imu,
+                               std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
         this->get_parameter_or("mapping.extrinsic_T_L1_wrt_drone", extrinT4, std::vector<double>());
         this->get_parameter_or("mapping.extrinsic_R_L1_wrt_drone", extrinR4, std::vector<double>());
+        if (extrinT_odin_imu.size() != 3)
+            extrinT_odin_imu = {-0.02663, 0.03447, 0.02174};
+        if (extrinR_odin_imu.size() != 9)
+            extrinR_odin_imu = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
         this->get_parameter_or("publish.path_en", path_en, true);
         this->get_parameter_or("publish.scan_publish_en", scan_pub_en, true);
@@ -2051,6 +2146,13 @@ public:
         }
 
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (odin_native_deskew_en && multi_lidar)
+        {
+            sub_imu2_ = this->create_subscription<sensor_msgs::msg::Imu>(
+                imu_topic2, rclcpp::SensorDataQoS(), imu2_cbk);
+            std::cout << "\033[32;1mOdin-native deskew IMU: " << imu_topic2
+                      << "\033[0m" << std::endl;
+        }
         if (lidar2_pose_factor_en)
         {
             sub_odin_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -2119,6 +2221,14 @@ public:
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
         // Deskew must use the same L2 stamp bias as Bundle pairing.
         p_imu->set_lidar2_stamp_bias(lidar2_stamp_bias_sec);
+        p_imu->set_odin_native_deskew(odin_native_deskew_en);
+        {
+            V3D T_odin_li;
+            M3D R_odin_li;
+            T_odin_li << VEC_FROM_ARRAY(extrinT_odin_imu);
+            R_odin_li << MAT_FROM_ARRAY(extrinR_odin_imu);
+            p_imu->set_odin_imu_extrinsic(T_odin_li, R_odin_li);
+        }
 
         // for multi lidar tf only
         if (multi_lidar)
@@ -2149,6 +2259,8 @@ public:
             }
             if (extrinsic_imu_to_lidars)
                 LiDAR2_R_yaml = LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0);
+            p_imu->set_lidar2_wrt_lidar1(LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0),
+                                         LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3));
             cout << "\033[32;1mMulti LiDAR on!" << endl;
             cout << "lidar_type[0]: " << p_pre->lidar_type[0] << ", " << "lidar_type[1]: " << p_pre->lidar_type[1] << endl
                  << "lidar2_update_en: " << (lidar2_update_en ? "true" : "false")
@@ -2158,6 +2270,8 @@ public:
                  << " max_sync_dt=" << lidar2_max_sync_dt << "s"
                  << " soft_wait=" << lidar2_soft_wait_sec * 1000.0 << "ms"
                  << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
+                 << " odin_native_deskew=" << (odin_native_deskew_en ? "true" : "false")
+                 << " imu2=" << imu_topic2
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
                  << " odin_map_insert=" << (lidar2_map_insert_en ? "true" : "false")
@@ -2485,6 +2599,7 @@ private:
     //----------------------------------------
     // Subscribers
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu2_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc2_;
