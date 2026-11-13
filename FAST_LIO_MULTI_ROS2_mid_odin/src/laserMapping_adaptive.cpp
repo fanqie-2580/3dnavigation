@@ -2235,10 +2235,17 @@ public:
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         if (odin_native_deskew_en && multi_lidar)
         {
+            // Publisher (/odin1/imu) is RELIABLE KeepLast(~4000). SensorDataQoS
+            // is BEST_EFFORT KeepLast(5) → DDS drops most of the 400 Hz stream
+            // between Mid ticks → native deskew only sees ~25/45 samples and
+            // integrates across gaps (turn fan). Match reliability + deep queue.
+            rclcpp::QoS imu2_qos(rclcpp::KeepLast(4000));
+            imu2_qos.reliable();
+            imu2_qos.durability_volatile();
             sub_imu2_ = this->create_subscription<sensor_msgs::msg::Imu>(
-                imu_topic2, rclcpp::SensorDataQoS(), imu2_cbk);
+                imu_topic2, imu2_qos, imu2_cbk);
             std::cout << "\033[32;1mOdin-native deskew IMU: " << imu_topic2
-                      << "\033[0m" << std::endl;
+                      << " QoS=RELIABLE,KeepLast(4000)\033[0m" << std::endl;
         }
         if (lidar2_pose_factor_en)
         {

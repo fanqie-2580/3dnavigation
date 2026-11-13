@@ -601,6 +601,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 参数：`odin_pose_at_scan_end_en: true`。日志：`[odin-pose-at-end] vs_mid_end=…ms`。
 
+### 10w. Odin IMU 订阅 QoS 补满（2026-11-13）
+
+**根因（10u+10v 后仍拖影）**：`/odin1/imu` 发布 RELIABLE KeepLast(4000)，`sub_imu2_` 曾用 `SensorDataQoS()`→BEST_EFFORT KeepLast(5)。独立订阅 ~398 Hz 无空洞，但 native 日志每 94 ms 扫描仅中位 ~25 个 imu2（理论含前置窗 ~45）→ 跨空洞平均 ω 积分造成帧内弯。
+
+**修复**：`sub_imu2_` 改为 RELIABLE KeepLast(4000)。不改 bias / t_query / Stage2 / 写图。预期 `[odin-native deskew] imu2≈45`。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
