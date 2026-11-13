@@ -170,12 +170,25 @@ state_ikfom state_point_odin_pub_;
 bool have_state_odin_pub_ = false;
 double publish_odin_time_ = -1.0; // >=0: orange header = Odin-end on Mid clock
 bool odin_pose_at_scan_end_en = true;
+// Debug-only A/D online time-query ablation (default OFF). Does not touch IEKF /
+// map / official /cloud_odin_registered. When on: publish fresh Bundle frames only
+// to /cloud_odin_registered_{A,D} from the same UndistortOdinNative cloud.
+bool publish_odin_time_query_ab_en = false;
+double bundle_bias_pre_sec_ = 0.065; // bias used for this Bundle pair (before EMA)
 struct MidPoseSample
 {
     double t = 0.0;
     state_ikfom s;
 };
 std::deque<MidPoseSample> mid_pose_hist_;
+enum class MidPoseQueryKind
+{
+    FailEmpty = 0,
+    ClampFront, // t before hist — NOT valid for A/D scoring
+    ClampBack,  // t past hist without short extrap — NOT valid
+    Interp,     // bracketed slerp inside hist
+    Extrap      // short forward extrap past hist back
+};
 vect3 pos_lid;
 
 nav_msgs::msg::Path path;
@@ -548,13 +561,31 @@ void push_mid_pose_hist(const double t, const state_ikfom &s)
 }
 
 // Mid continuous pose at time t (Mid clock). Bracket slerp; short extrapolate OK.
-bool sample_mid_pose_at(const double t, state_ikfom &out)
+// kind_out / span_out describe coverage (ClampFront must not score as valid A/D).
+bool sample_mid_pose_at(const double t, state_ikfom &out,
+                        MidPoseQueryKind *kind_out = nullptr,
+                        double *span_out = nullptr)
 {
+    auto set_meta = [&](MidPoseQueryKind k, double span) {
+        if (kind_out)
+            *kind_out = k;
+        if (span_out)
+            *span_out = span;
+    };
     if (mid_pose_hist_.empty())
+    {
+        set_meta(MidPoseQueryKind::FailEmpty, 0.0);
         return false;
+    }
     if (mid_pose_hist_.size() == 1 || t <= mid_pose_hist_.front().t + 1e-9)
     {
         out = mid_pose_hist_.front().s;
+        const double dt = t - mid_pose_hist_.front().t;
+        // Exact/near front OK as interp; earlier than front = clamp (invalid for A/D).
+        if (t < mid_pose_hist_.front().t - 1e-4)
+            set_meta(MidPoseQueryKind::ClampFront, dt);
+        else
+            set_meta(MidPoseQueryKind::Interp, 0.0);
         return true;
     }
     size_t i = 0;
@@ -575,7 +606,12 @@ bool sample_mid_pose_at(const double t, state_ikfom &out)
             V3D omega = aa.axis() * aa.angle() / dtab;
             out.pos = b.s.pos + b.s.vel * dt;
             set_state_rot(out, Eigen::Quaterniond(qb.toRotationMatrix() * Exp(omega, dt)));
+            set_meta(MidPoseQueryKind::Extrap, dt);
         }
+        else if (std::fabs(dt) <= 1e-4)
+            set_meta(MidPoseQueryKind::Interp, 0.0);
+        else
+            set_meta(MidPoseQueryKind::ClampBack, dt);
         return true;
     }
     const auto &a = mid_pose_hist_[i];
@@ -589,7 +625,31 @@ bool sample_mid_pose_at(const double t, state_ikfom &out)
     out.pos = (1.0 - u) * a.s.pos + u * b.s.pos;
     out.vel = (1.0 - u) * a.s.vel + u * b.s.vel;
     set_state_rot(out, quat_from_state(a.s).slerp(u, quat_from_state(b.s)));
+    set_meta(MidPoseQueryKind::Interp, 0.0);
     return true;
+}
+
+inline bool mid_pose_query_usable(MidPoseQueryKind k)
+{
+    return k == MidPoseQueryKind::Interp || k == MidPoseQueryKind::Extrap;
+}
+
+inline const char *mid_pose_query_name(MidPoseQueryKind k)
+{
+    switch (k)
+    {
+    case MidPoseQueryKind::FailEmpty:
+        return "fail";
+    case MidPoseQueryKind::ClampFront:
+        return "clamp_front";
+    case MidPoseQueryKind::ClampBack:
+        return "clamp_back";
+    case MidPoseQueryKind::Interp:
+        return "interp";
+    case MidPoseQueryKind::Extrap:
+        return "extrap";
+    }
+    return "?";
 }
 
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
@@ -1083,6 +1143,8 @@ bool sync_packages_bundle(MeasureGroup &meas)
             bundle_pair_signed_dt_ = signed_dt;
             bundle_mid_span_ = mid_span;
             bundle_center_dt_ = center_dt;
+            // Snapshot bias used for THIS pair before EMA (A/D debug + logs).
+            bundle_bias_pre_sec_ = lidar2_stamp_bias_sec;
             // Pairing-only EMA: drive mean center residual toward 0.
             if (lidar2_bias_ema > 0.0)
             {
@@ -1581,6 +1643,121 @@ void publish_odin_from_undistorted(
     publish_odin_time_ = -1.0;
 }
 
+// Debug-only: same UndistortOdinNative body → map under tA vs tD Stage1 queries.
+// Official /cloud_odin_registered is untouched. Mid-only / hold: do not publish.
+void publish_odin_time_query_ab(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubA,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubD,
+    const PointCloudXYZI::Ptr &undistorted)
+{
+    if (!publish_odin_time_query_ab_en || !scan_pub_en)
+        return;
+    if (!pubA && !pubD)
+        return;
+    if (!p_imu || !p_imu->IMU_inited())
+        return;
+    // Real Bundle Odin only — never republish hold on Mid-only frames.
+    if (bundle_pair_dt_ < 0.0 || !Measures.lidar2 || Measures.lidar2->empty())
+        return;
+    if (!odin_native_deskew_en)
+        return;
+
+    PointCloudXYZI::Ptr odin_body(new PointCloudXYZI());
+    if (undistorted && !undistorted->empty())
+    {
+        odin_body->reserve(undistorted->size());
+        for (const auto &pt : undistorted->points)
+        {
+            if (pt.intensity >= kOdinIntensityTag)
+                odin_body->push_back(pt);
+        }
+        if (odin_body->empty() && current_lidar_num == 2)
+            *odin_body = *undistorted;
+    }
+    if (!odin_body || odin_body->empty())
+        return;
+
+    const double mid_span =
+        (bundle_mid_span_ > 1e-4)
+            ? bundle_mid_span_
+            : std::max(0.0, lidar_end_time - Measures.lidar_beg_time);
+    const double mid_center = lidar_end_time - 0.5 * mid_span;
+    double odin_span = 0.0;
+    for (const auto &pt : Measures.lidar2->points)
+        odin_span =
+            std::max(odin_span, static_cast<double>(pt.curvature) / 1000.0);
+    if (odin_span < 1e-4)
+        odin_span = std::max(
+            0.0, Measures.lidar_end_time2 - Measures.lidar_beg_time2);
+    const double odin_med = cloud_offset_median_sec(Measures.lidar2);
+    const double H2 = Measures.lidar_beg_time2;
+    const double tA = mid_center + (odin_span - odin_med);
+    const double tD = H2 + odin_span; // H2 + 0 + span (raw Odin end stamp)
+    const double b_pre = bundle_bias_pre_sec_;
+
+    auto publish_one =
+        [&](const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub,
+            const double t_query, const char *tag) {
+            if (!pub)
+                return;
+            MidPoseQueryKind kind = MidPoseQueryKind::FailEmpty;
+            double qspan = 0.0;
+            state_ikfom s_q;
+            if (!sample_mid_pose_at(t_query, s_q, &kind, &qspan) ||
+                !mid_pose_query_usable(kind))
+            {
+                static int s_skip = 0;
+                if ((++s_skip % 20) == 0)
+                {
+                    std::cout << "[odin-tq-ab] skip " << tag
+                              << " kind=" << mid_pose_query_name(kind)
+                              << " span_ms=" << qspan * 1000.0
+                              << " t_vs_mid_end_ms="
+                              << (t_query - lidar_end_time) * 1000.0 << "\n";
+                }
+                return;
+            }
+            const state_ikfom state_bak = state_point;
+            state_point = s_q;
+            const int size = static_cast<int>(odin_body->size());
+            PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+            for (int i = 0; i < size; i++)
+                RGBpointBodyToWorld(&odin_body->points[i],
+                                    &laserCloudWorld->points[i]);
+            state_point = state_bak;
+            sensor_msgs::msg::PointCloud2 laserCloudmsg;
+            pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+            laserCloudmsg.header.stamp = get_ros_time(t_query);
+            laserCloudmsg.header.frame_id = map_frame;
+            pub->publish(laserCloudmsg);
+        };
+
+    publish_one(pubA, tA, "A");
+    publish_one(pubD, tD, "D");
+
+    static int s_ab_log = 0;
+    if ((++s_ab_log % 20) == 0)
+    {
+        MidPoseQueryKind kA = MidPoseQueryKind::FailEmpty;
+        MidPoseQueryKind kD = MidPoseQueryKind::FailEmpty;
+        double spA = 0.0, spD = 0.0;
+        state_ikfom tmp;
+        sample_mid_pose_at(tA, tmp, &kA, &spA);
+        sample_mid_pose_at(tD, tmp, &kD, &spD);
+        std::cout << "[odin-tq-ab] H2_vs_mid_end="
+                  << (H2 - lidar_end_time) * 1000.0
+                  << "ms span=" << odin_span * 1000.0
+                  << "ms med=" << odin_med * 1000.0
+                  << "ms center_dt=" << bundle_center_dt_ * 1000.0
+                  << "ms b_pre=" << b_pre * 1000.0
+                  << "ms tA_vs_end=" << (tA - lidar_end_time) * 1000.0
+                  << "ms(" << mid_pose_query_name(kA) << ")"
+                  << " tD_vs_end=" << (tD - lidar_end_time) * 1000.0
+                  << "ms(" << mid_pose_query_name(kD) << ")"
+                  << " hist=" << mid_pose_hist_.size() << "\n";
+    }
+}
+
 void publish_mid_from_undistorted(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubMid,
     const PointCloudXYZI::Ptr &undistorted)
@@ -2026,6 +2203,7 @@ public:
         this->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
         this->declare_parameter<bool>("mapping.odin_native_deskew_en", true);
         this->declare_parameter<bool>("mapping.odin_pose_at_scan_end_en", true);
+        this->declare_parameter<bool>("mapping.publish_odin_time_query_ab_en", false);
         this->declare_parameter<std::string>("common.map_frame", "map");
 
         this->declare_parameter<int>("method.voxelized_pt_num_thres", 100);
@@ -2123,6 +2301,8 @@ public:
         this->get_parameter_or("common.map_frame", map_frame, std::string("map"));
         this->get_parameter_or("mapping.odin_native_deskew_en", odin_native_deskew_en, true);
         this->get_parameter_or("mapping.odin_pose_at_scan_end_en", odin_pose_at_scan_end_en, true);
+        this->get_parameter_or("mapping.publish_odin_time_query_ab_en",
+                               publish_odin_time_query_ab_en, false);
 
         this->get_parameter_or("method.voxelized_pt_num_thres", voxelized_pt_num_thres, 100);
         this->get_parameter_or("method.effect_pt_num_ratio_thres", effect_pt_num_ratio_thres, 0.4);
@@ -2261,6 +2441,11 @@ public:
         pubLaserCloudFull_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudOdin_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered", 20);
         g_pub_odin_registered = pubLaserCloudOdin_;
+        // Debug A/D topics always created; publishing gated by publish_odin_time_query_ab_en.
+        pubLaserCloudOdinA_ =
+            create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered_A", 20);
+        pubLaserCloudOdinD_ =
+            create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_registered_D", 20);
         pubLaserCloudFullTransformed_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_tf", 20);
         pubLaserCloudFull_body_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
@@ -2366,6 +2551,7 @@ public:
                  << " stamp_bias=" << lidar2_stamp_bias_sec * 1000.0 << "ms"
                  << " odin_native_deskew=" << (odin_native_deskew_en ? "true" : "false")
                  << " odin_pose_at_end=" << (odin_pose_at_scan_end_en ? "true" : "false")
+                 << " tq_ab_debug=" << (publish_odin_time_query_ab_en ? "true" : "false")
                  << " imu2=" << imu_topic2
                  << " odin_cov_scale=" << lidar2_residual_cov_scale
                  << " max_odin_res=" << lidar2_max_residual << "m"
@@ -2694,6 +2880,9 @@ private:
                 }
                 else
                     publish_odin_from_undistorted(pubLaserCloudOdin_, feats_undistort);
+                // After official orange: debug A/D from same UndistortOdinNative body.
+                publish_odin_time_query_ab(pubLaserCloudOdinA_, pubLaserCloudOdinD_,
+                                           feats_undistort);
                 if (!lidar2_update_en)
                     flush_pending_odin_to_map(publish_lidar_time);
             }
@@ -2747,6 +2936,8 @@ private:
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdin_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdinA_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudOdinD_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullTransformed_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;

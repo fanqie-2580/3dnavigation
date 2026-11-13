@@ -72,6 +72,9 @@
       # Orange map pose at Odin scan-end (Mid-clock via stamp_bias), not Mid_end.
       # Fixes whole-frame yaw error ≈ ω·center_dt when ends disagree.
       odin_pose_at_scan_end_en: true
+      # Debug-only: /cloud_odin_registered_{A,D} (default false). Does not change
+      # IEKF / map / official orange. Enable via launch override for online A vs D.
+      publish_odin_time_query_ab_en: false
       lidar2_pose_factor_en: false
       lidar2_pose_alpha: 0.03
       lidar2_pose_max_dt: 0.20
