@@ -620,7 +620,40 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
         t_rel = kMaxBundleSpan + 0.12;
       pt.curvature = static_cast<float>(t_rel * 1000.0);
     }
-    deskew_cloud(pcl_2_out, meas.lidar_beg_time);
+    // Rotation-only deskew to Mid end. Full SE3 deskew on a secondary lidar
+    // with residual timing error shears the cloud into a fan; Mid already owns
+    // translation via IEKF. Keep curvature (=t) for Stage2 time weights.
+    auto gyro_at = [&](double t) -> V3D {
+      if (IMUpose.size() < 2)
+        return angvel_last;
+      for (size_t i = 1; i < IMUpose.size(); i++)
+      {
+        if (t <= IMUpose[i].offset_time)
+        {
+          V3D g;
+          g << VEC_FROM_ARRAY(IMUpose[i].gyr);
+          return g;
+        }
+      }
+      V3D g;
+      g << VEC_FROM_ARRAY(IMUpose.back().gyr);
+      return g;
+    };
+    const double t_end = mid_span;
+    for (auto &pt : pcl_2_out.points)
+    {
+      const double t = static_cast<double>(pt.curvature) / 1000.0;
+      if (std::fabs(t - t_end) > kMaxUndistortDt)
+        continue;
+      // P_end = Exp(ω, t - t_end) * P_t  (constant-ω body rotation)
+      const V3D w = gyro_at(t);
+      const M3D R_comp = Exp(w, t - t_end);
+      V3D p(pt.x, pt.y, pt.z);
+      p = R_comp * p;
+      pt.x = static_cast<float>(p(0));
+      pt.y = static_cast<float>(p(1));
+      pt.z = static_cast<float>(p(2));
+    }
   }
 
   for (auto &pt : pcl_1_out.points) pt.intensity = 10.0f;   // Mid360

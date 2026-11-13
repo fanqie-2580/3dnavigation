@@ -79,16 +79,20 @@
       lidar2_soft_wait_sec: 0.025
       # USB L2 stamp leads Mid by ~−65ms at same wall; bias recenters Bundle dt.
       lidar2_stamp_bias_sec: 0.065
-      lidar2_residual_cov_scale: 50.0
-      lidar2_max_residual: 0.08
-      # Extra timing sigma (s) in Stage2 per-point weights (with ω·|dt|·lever).
-      lidar2_time_sigma_sec: 0.008
-      # Odin → ikdtree: structural time-cov replaces |ω| / hard-turn freeze.
-      # Sync window matches couple; gyr gate off (0).
+      # Pairing-only EMA: bias -= ema * center_dt, clamped [min,max].
+      lidar2_bias_ema: 0.05
+      lidar2_bias_min: 0.0
+      lidar2_bias_max: 0.12
+      # Weak Stage2 (time-weighted); orange viz uses Stage1 pose.
+      lidar2_residual_cov_scale: 100.0
+      lidar2_max_residual: 0.06
+      lidar2_time_sigma_sec: 0.025
+      # Odin → ikdtree: center sync quality (not |ω| gate).
       lidar2_map_insert_en: true
       lidar2_map_insert_max_sync_dt: 0.055
       lidar2_map_insert_max_sync_dt_still: 0.055
       lidar2_map_insert_still_gyr: 0.12
+      lidar2_map_insert_max_center_dt: 0.025
       lidar2_map_insert_gyr_gate: 0.0
       lidar2_map_insert_cooldown_sec: 0.0
 

@@ -566,6 +566,16 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 **机制**：deskew 曾用 `t=(L2+bias−Mid)+offset`，把 header 相位摆动写进逐点时间 → 转弯时选用错误 IMU 段 → **单帧扇形**（非整帧刚体超前）。densify 未订阅，不是显示链问题。  
 **修复**：配对仍用 header+bias；deskew 改为 `t = offset − median(offset) + Mid_span/2`（Odin/Mid 扫描中心对齐）。`lidar_end_time2` 按重映射后的 t_max，不再跟 signed 晃。日志：`[deskew center-lock] cancel_header_center=…ms`。
 
+### 10s. 扇形打包修复（2026-11-13）
+
+仍扇形时一次性落地（无 `|ω|` 门）：
+
+1. Odin **仅旋转** deskew 到 Mid end（不做 SE3 平移剪切）  
+2. `/cloud_odin_registered` 用 **Stage1** 位姿发布（Stage2 不拧橙色）  
+3. `stamp_bias` 对 `center_dt` 做 EMA（只影响配对）  
+4. Stage2 更弱：`cov_scale=100`，`time_sigma=0.025`，`max_residual=0.06`  
+5. 写图要求 `|center_dt|≤0.025`（同步质量，非转速门）
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
