@@ -365,11 +365,14 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   V3D angvel_prop = angvel_last;
   V3D acc_s_prop = acc_s_last;
 
+  // Track last integrated IMU time so stub never rewinds from v_imu.back()
+  // when the buffer extends past end_time (Odin horizon).
   auto propagate_imu =
       [&](esekfom::esekf<state_ikfom, 12, input_ikfom> &kf, const double end_time,
           const bool record_pose, std::vector<Pose6D> *pose_out,
           V3D &angvel_io, V3D &acc_s_io) {
         state_ikfom st = kf.get_x();
+        double last_prop_t = last_lidar_end_time_;
         if (record_pose && pose_out)
         {
           pose_out->clear();
@@ -406,12 +409,14 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
             dt = t_tail - get_time_sec(head->header.stamp);
 
           // Clip interval that crosses end_time so KF stops exactly on anchor.
+          bool hit_end = false;
           if (t_tail > end_time + 1e-9)
           {
             const double t0 = (get_time_sec(head->header.stamp) < last_lidar_end_time_)
                                   ? last_lidar_end_time_
                                   : get_time_sec(head->header.stamp);
             dt = end_time - t0;
+            hit_end = true;
             if (dt <= 1e-9)
               break;
           }
@@ -429,27 +434,26 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
           acc_s_io = st.rot * (acc_avr - st.ba);
           for (int i = 0; i < 3; i++)
             acc_s_io[i] += st.grav[i];
+          last_prop_t = hit_end ? end_time : t_tail;
           if (record_pose && pose_out)
           {
-            const double offs_t =
-                std::min(t_tail, end_time) - pcl_beg_time;
+            const double offs_t = last_prop_t - pcl_beg_time;
             pose_out->push_back(set_pose6d(offs_t, acc_s_io, angvel_io, st.vel,
                                            st.pos, st.rot.toRotationMatrix()));
           }
-          if (t_tail >= end_time - 1e-9)
+          if (hit_end || t_tail >= end_time - 1e-9)
             break;
         }
 
-        // Stub from last IMU sample to end_time if still short.
-        const double t_imu_last = get_time_sec(v_imu.back()->header.stamp);
-        double note = end_time > t_imu_last ? 1.0 : -1.0;
-        dt = note * (end_time - t_imu_last);
-        if (std::fabs(dt) > kMaxBundleSpan)
-          dt = note * kMaxBundleSpan;
-        if (std::fabs(dt) > 1e-6)
+        // Forward stub only — never rewind from a later buffer tail.
+        dt = end_time - last_prop_t;
+        if (dt > kMaxBundleSpan)
+          dt = kMaxBundleSpan;
+        if (dt > 1e-6)
         {
           kf.predict(dt, Q, in);
           st = kf.get_x();
+          last_prop_t = end_time;
           if (record_pose && pose_out)
           {
             const double offs_t = end_time - pcl_beg_time;
@@ -473,8 +477,31 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   // Deskew compensates into this Mid-end state; IMUpose may extend past it.
   state_ikfom imu_state = kf_state.get_x();
-  last_imu_ = meas.imu.back();
+  // Official bookmark must not jump past Mid end. meas.imu may include the
+  // Odin extend window; advancing last_imu_ there leaves a hole next frame
+  // (head already > last_lidar_end → dt=tail-head skips Mid-end→head).
+  last_imu_ = meas.imu.front();
+  for (auto it = meas.imu.rbegin(); it != meas.imu.rend(); ++it)
+  {
+    if (get_time_sec((*it)->header.stamp) <= mid_end_time + 1e-6)
+    {
+      last_imu_ = *it;
+      break;
+    }
+  }
   last_lidar_end_time_ = mid_end_time;
+  if (deskew_end_time > mid_end_time + 1e-3)
+  {
+    static int s_imu_bookmark_log = 0;
+    if ((++s_imu_bookmark_log % 40) == 0)
+    {
+      const double limu = get_time_sec(last_imu_->header.stamp);
+      std::cout << "[IMU bookmark] last_imu-mid_end="
+                << (limu - mid_end_time) * 1000.0
+                << "ms extend=" << (deskew_end_time - mid_end_time) * 1000.0
+                << "ms (official bookmark must stay <=0)\n";
+    }
+  }
 
   // Deskew one cloud: point time = lidar_beg_offset + curvature_ms/1000, relative to pcl_beg.
   // Supports t < 0 (Odin USB header earlier than Mid beg after header remap).

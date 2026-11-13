@@ -554,6 +554,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 参数：`mapping.lidar2_time_sigma_sec`（默认 0.008）。
 
+### 10q. 正式 KF 的 `last_imu_` 越界（2026-11-13）
+
+**现场**：无门控后 RViz 橙色扇形来自 `/cloud_odin_registered`（非 densify；`/odin1/cloud_in_map` 订阅数 0）。  
+**根因**：影子 KF 已只积到 Mid end，但 `last_imu_ = meas.imu.back()` 仍可落到 Odin extend 尾；下一帧 `head > last_lidar_end` → `dt=tail-head`，**Mid end→head 时间洞**。stub 若用 `v_imu.back()` 还可能对正式 KF 负向 predict。  
+**修复**：`last_imu_` 取 `stamp ≤ mid_end` 的最晚样本；stub 只正向补到 `end_time`（用 `last_prop_t`）。日志：`[IMU bookmark] last_imu-mid_end=…ms` 应 ≤0。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**
