@@ -570,11 +570,16 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 仍扇形时一次性落地（无 `|ω|` 门）：
 
-1. Odin **仅旋转** deskew 到 Mid end（不做 SE3 平移剪切）  
+1. ~~Odin 仅旋转 deskew~~ → **10t 已撤销**（单点 ω 近似整段会再扇）  
 2. `/cloud_odin_registered` 用 **Stage1** 位姿发布（Stage2 不拧橙色）  
 3. `stamp_bias` 对 `center_dt` 做 EMA（只影响配对）  
 4. Stage2 更弱：`cov_scale=100`，`time_sigma=0.025`，`max_residual=0.06`  
 5. 写图要求 `|center_dt|≤0.025`（同步质量，非转速门）
+
+### 10t. 恢复 center-lock + 完整 SE3 deskew（2026-11-13）
+
+**根因**：`Exp(ω_sample, t−t_end)` 用瞬时角速度代替影子 `IMUpose` 逐区间姿态；高转时 `gyr_scan` vs `gyr_latest` 差 30–70% → 单帧扇形。`cancel_header_center` 只是已取消的 header 量，不是残余。  
+**修复**：保留 center-lock 时间；Odin 与 Mid 一样走 `deskew_cloud`（完整相对 SE3）。不改 EMA/Stage2/写图门/外参。
 
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
