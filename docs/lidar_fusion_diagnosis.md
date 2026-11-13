@@ -607,6 +607,12 @@ RViz 橙色 live = `/odin1/cloud_in_map`（`odin_independent_accum`，`project_w
 
 **修复**：`sub_imu2_` 改为 RELIABLE KeepLast(4000)。不改 bias / t_query / Stage2 / 写图。预期 `[odin-native deskew] imu2≈45`。
 
+### 10x. pose-at-end 改用配对中心关系（2026-11-13）
+
+**根因（QoS 后 imu2≈39 仍扇）**：`t_query=end2+bias` 使 `vs_mid_end≈center`（代数必然），bias EMA 非物理时钟且达 120 ms 上限 → 查询时刻随配对拍频 ±50 ms 漂。样本饥饿已排除。
+
+**修复**：`t_query = Mid_center + (odin_span − odin_med)`；预期 `vs_mid_end≈−1…−4 ms` 且与 `center_dt` 解耦。不改 Bundle/bias EMA/native 积分。次嫌疑：native 未减重力且借用 Mid bg/ba。
+
 ### 10f. 转动错位→弹回 根因（2026-11-12，不用冷却）
 
 **两阶段结论**

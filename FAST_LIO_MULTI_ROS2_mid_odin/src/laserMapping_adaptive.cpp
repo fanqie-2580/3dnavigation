@@ -2596,9 +2596,10 @@ private:
                 pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
                 // Mid Stage1 history @ Mid scan end (for Odin-end pose query).
                 push_mid_pose_hist(lidar_end_time, state_stage1);
-                // Orange: prefer Mid pose at Odin scan-end on Mid clock, not Mid_end.
-                // t_odin_end_mid = (L2_header + bias) + odin_span = lidar_end_time2 + bias
-                // when native path set physical Odin end on USB clock.
+                // Orange: Mid pose at this Bundle's Odin-end under center-pair semantics.
+                // NOT end2+bias (that tracked EMA center_dt and drifted ±50ms).
+                // t_query = Mid_center + (odin_span - odin_med)
+                //         → vs_mid_end ≈ span-med-mid_span/2 ≈ −1…−4 ms, decoupled from center.
                 state_point_odin_pub_ = state_stage1;
                 publish_odin_time_ = -1.0;
                 have_state_odin_pub_ = true;
@@ -2606,8 +2607,21 @@ private:
                     bundle_pair_dt_ >= 0.0 && Measures.lidar2 &&
                     !Measures.lidar2->empty())
                 {
+                    const double mid_span =
+                        (bundle_mid_span_ > 1e-4)
+                            ? bundle_mid_span_
+                            : std::max(0.0, lidar_end_time - Measures.lidar_beg_time);
+                    const double mid_center = lidar_end_time - 0.5 * mid_span;
+                    double odin_span = 0.0;
+                    for (const auto &pt : Measures.lidar2->points)
+                        odin_span = std::max(
+                            odin_span, static_cast<double>(pt.curvature) / 1000.0);
+                    if (odin_span < 1e-4)
+                        odin_span = std::max(
+                            0.0, Measures.lidar_end_time2 - Measures.lidar_beg_time2);
+                    const double odin_med = cloud_offset_median_sec(Measures.lidar2);
                     const double t_odin_end_mid =
-                        Measures.lidar_end_time2 + lidar2_stamp_bias_sec;
+                        mid_center + (odin_span - odin_med);
                     state_ikfom s_at_end;
                     if (sample_mid_pose_at(t_odin_end_mid, s_at_end))
                     {
@@ -2619,6 +2633,9 @@ private:
                             std::cout << "[odin-pose-at-end] vs_mid_end="
                                       << (t_odin_end_mid - lidar_end_time) * 1000.0
                                       << "ms center=" << bundle_center_dt_ * 1000.0
+                                      << "ms expect≈"
+                                      << (odin_span - odin_med - 0.5 * mid_span) *
+                                             1000.0
                                       << "ms hist=" << mid_pose_hist_.size() << "\n";
                         }
                     }
