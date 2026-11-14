@@ -1117,8 +1117,9 @@ int main(int argc, char** argv)
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
     downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
-    // Keep leaf >= ~0.15–0.2 to avoid PCL VoxelGrid integer overflow on large maps.
-    // 0.4 was safe but made /Global_cloud_map look too sparse.
+    // Display density: 0.1 looks dense indoors; very large outdoor extents may
+    // need a larger leaf to avoid PCL VoxelGrid index overflow (timer restores
+    // unfiltered copy if filter empties).
     downSizeFilterGlobal.setLeafSize(global_map_leaf_size, global_map_leaf_size, global_map_leaf_size);
     std::cout << "global_map_leaf_size: " << global_map_leaf_size << std::endl;
     memset(point_selected_surf, true, sizeof(point_selected_surf));
@@ -1204,8 +1205,12 @@ int main(int argc, char** argv)
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map += *filter_global_cloud_map_t;
             }
+            // Publish the accumulated (filtered) map, not only the last chunk.
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
-            pcl::toROSMsg(*filter_global_cloud_map_t, laserCloudmsg);
+            {
+                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                pcl::toROSMsg(*global_cloud_map, laserCloudmsg);
+            }
             // Points are camera_init coords. stamp=now()+frame world made RViz
             // re-apply latest TF to historical map → motion smear illusion.
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
