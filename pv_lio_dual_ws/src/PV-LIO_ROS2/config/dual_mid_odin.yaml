@@ -8,8 +8,10 @@
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
       lidar2_stamp_bias_sec: 0.0
-      lidar2_max_sync_dt: 0.15
-      lidar2_soft_wait_sec: 0.10
+      # Stationary “jitter” was Mid↔Odin composition flicker: ~30% unpaired when
+      # end-time phase drifted past 100ms. Widen window so soft-wait can catch Odin.
+      lidar2_max_sync_dt: 0.20
+      lidar2_soft_wait_sec: 0.18
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1

@@ -97,14 +97,17 @@ string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
-double lidar2_max_sync_dt = 0.15;          // ~1 Mid period; Mid/Odin phase drifts
-double lidar2_soft_wait_sec = 0.10;        // wait up to one Mid frame for late Odin
+double lidar2_max_sync_dt = 0.20;          // phase drift measured up to ~0.13s
+double lidar2_soft_wait_sec = 0.18;        // >1 Odin period so late frames can arrive
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
 double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
 double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
 double bundle_end_dt = 0.0;                // mid_end - (odin_end + bias)
+// One-frame hold of last good Odin to bridge unpaired gaps (stops body flicker).
+PointCloudXYZI::Ptr last_odin_fused(new PointCloudXYZI());
+double last_odin_fused_wall = -1.0;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -557,7 +560,38 @@ bool sync_packages(MeasureGroup &meas)
             if (lidar2_soft_wait_sec > 0.0 &&
                 (wall_sec - bundle_mid_push_wall) < lidar2_soft_wait_sec)
                 return false; // keep Mid unconsumed
-            fill_mid_only();
+            // Last chance: accept a slightly late/early Odin rather than Mid-only
+            // flicker (realtime body centroid jumped ~1.4m on composition flips).
+            double best_any = 1e9;
+            size_t best_any_i = 0;
+            double signed_any = 0.0, end_any = 0.0;
+            for (size_t i = 0; i < time_buffer2.size(); ++i)
+            {
+                if (!lidar_buffer2[i] || lidar_buffer2[i]->empty()) continue;
+                double span2 = 0.0;
+                for (const auto &pt : lidar_buffer2[i]->points)
+                    span2 = std::max(span2, double(pt.curvature) / 1000.0);
+                if (span2 < 1e-4)
+                    span2 = cloud_offset_median_sec(lidar_buffer2[i]) * 2.0;
+                const double odin_end_on_mid =
+                    time_buffer2[i] + lidar2_stamp_bias_sec + span2;
+                const double score = std::fabs(odin_end_on_mid - lidar_end_time);
+                if (score < best_any)
+                {
+                    best_any = score;
+                    best_any_i = i;
+                    end_any = lidar_end_time - odin_end_on_mid;
+                    const double med = cloud_offset_median_sec(lidar_buffer2[i]);
+                    const double mid_span =
+                        std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+                    signed_any = meas.lidar_beg_time + 0.5 * mid_span -
+                                 (time_buffer2[i] + lidar2_stamp_bias_sec + med);
+                }
+            }
+            if (best_any <= std::max(lidar2_max_sync_dt * 1.5, 0.30))
+                fill_odin(best_any_i, best_any, signed_any, end_any);
+            else
+                fill_mid_only();
         }
     }
 
@@ -981,8 +1015,8 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.15);
-    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.10);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.20);
+    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.18);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
     node->get_parameter("common.lid_topic2", lid_topic2);
@@ -1244,17 +1278,40 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
             const char *odin_skip = "none";
+            const double now_wall = omp_get_wtime();
+            auto append_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) {
+                feats_undistort->points.insert(feats_undistort->points.end(),
+                                               odin_cloud.points.begin(), odin_cloud.points.end());
+                feats_undistort->width = feats_undistort->size();
+                feats_undistort->height = 1;
+                odin_used_now = odin_cloud.size();
+                odin_skip = tag;
+            };
 
             if (!multi_lidar_en)
                 odin_skip = "multi_off";
-            else if (!Measures.lidar2_fresh)
-                odin_skip = "unpaired";
-            else if (!Measures.lidar2 || Measures.lidar2->empty())
-                odin_skip = "empty_l2";
-            else if (Measures.imu2.size() < 2)
-                odin_skip = "imu2_short";
             else if (feats_undistort->empty())
                 odin_skip = "mid_empty";
+            else if (!Measures.lidar2_fresh || !Measures.lidar2 || Measures.lidar2->empty()
+                     || Measures.imu2.size() < 2)
+            {
+                // Bridge a missed pair with last good Odin. Window must exceed
+                // soft_wait (~0.18s) + Mid period: wait itself makes wall-gap
+                // from last ok often ~0.25–0.35s, so 0.12s never fired.
+                if (last_odin_fused && !last_odin_fused->empty() &&
+                    last_odin_fused_wall > 0.0 &&
+                    (now_wall - last_odin_fused_wall) <= 0.40)
+                {
+                    PointCloudXYZI hold = *last_odin_fused;
+                    append_odin_body(hold, "hold_1");
+                }
+                else if (!Measures.lidar2_fresh)
+                    odin_skip = "unpaired";
+                else if (!Measures.lidar2 || Measures.lidar2->empty())
+                    odin_skip = "empty_l2";
+                else
+                    odin_skip = "imu2_short";
+            }
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
@@ -1271,12 +1328,16 @@ int main(int argc, char** argv)
                     T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
                     pcl::transformPointCloud(odin_cloud, odin_cloud, T);
                     for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
-                    feats_undistort->points.insert(feats_undistort->points.end(),
-                                                   odin_cloud.points.begin(), odin_cloud.points.end());
-                    feats_undistort->width = feats_undistort->size();
-                    feats_undistort->height = 1;
-                    odin_used_now = odin_cloud.size();
-                    odin_skip = "ok";
+                    *last_odin_fused = odin_cloud;
+                    last_odin_fused_wall = now_wall;
+                    append_odin_body(odin_cloud, "ok");
+                }
+                else if (last_odin_fused && !last_odin_fused->empty() &&
+                         last_odin_fused_wall > 0.0 &&
+                         (now_wall - last_odin_fused_wall) <= 0.40)
+                {
+                    PointCloudXYZI hold = *last_odin_fused;
+                    append_odin_body(hold, "hold_deskew");
                 }
                 else
                     odin_skip = "deskew_fail";
