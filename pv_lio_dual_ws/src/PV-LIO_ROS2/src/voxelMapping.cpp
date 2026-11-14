@@ -137,6 +137,8 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
+// Last deskewed Odin scan in Mid-lidar body frame (after T_L2), for RViz.
+PointCloudXYZI::Ptr odin_body_last(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 std::vector<M3D> var_down_body;
@@ -797,6 +799,36 @@ void transformLidar(const state_ikfom &state_point, const PointCloudXYZI::Ptr &i
     }
 }
 
+// Odin that entered this scan (deskew + T_L2), same 25 m gate as Global insert.
+void publish_frame_odin_world(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubOdinCloud)
+{
+    if (!pubOdinCloud) return;
+    PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
+    if (odin_body_last && !odin_body_last->empty())
+    {
+        constexpr float kMapMaxRange = 25.0f;
+        const float r2max = kMapMaxRange * kMapMaxRange;
+        body_f->points.reserve(odin_body_last->size());
+        for (const auto &pt : odin_body_last->points)
+        {
+            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+            if (r2 > r2max) continue;
+            body_f->points.push_back(pt);
+        }
+        body_f->width = body_f->points.size();
+        body_f->height = 1;
+    }
+    PointCloudXYZI::Ptr world_odin(new PointCloudXYZI);
+    if (!body_f->empty())
+        transformLidar(state_point, body_f, world_odin);
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(*world_odin, msg);
+    msg.header.stamp = sec_to_stamp(lidar_end_time);
+    msg.header.frame_id = "camera_init";
+    pubOdinCloud->publish(msg);
+}
+
 M3D transformLiDARCovToWorld(Eigen::Vector3d &p_lidar, const esekfom::esekf<state_ikfom, 12, input_ikfom>& kf, const Eigen::Matrix3d& COV_lidar)
 {
     M3D point_crossmat;
@@ -1169,6 +1201,7 @@ int main(int argc, char** argv)
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
     auto pubLaserCloudFull_body = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 100);
+    auto pubLaserCloudOdin = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_odin", 100);
     auto pubLaserCloudEffect = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 100);
     auto pubLaserCloudMap = node->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 100);
     auto pubOdomAftMapped = node->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 100);
@@ -1251,15 +1284,30 @@ int main(int argc, char** argv)
             const char *odin_skip = "none";
 
             if (!multi_lidar_en)
+            {
                 odin_skip = "multi_off";
+                odin_body_last->clear();
+            }
             else if (!Measures.lidar2_fresh)
+            {
                 odin_skip = "unpaired";
+                odin_body_last->clear();
+            }
             else if (!Measures.lidar2 || Measures.lidar2->empty())
+            {
                 odin_skip = "empty_l2";
+                odin_body_last->clear();
+            }
             else if (Measures.imu2.size() < 2)
+            {
                 odin_skip = "imu2_short";
+                odin_body_last->clear();
+            }
             else if (feats_undistort->empty())
+            {
                 odin_skip = "mid_empty";
+                odin_body_last->clear();
+            }
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
@@ -1275,7 +1323,9 @@ int main(int argc, char** argv)
                     T.block<3,3>(0,0)=LiDAR2_R_wrt_LiDAR1;
                     T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
                     pcl::transformPointCloud(odin_cloud, odin_cloud, T);
+                    // Tag Odin for Intensity displays; dedicated topic uses FlatColor.
                     for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
+                    *odin_body_last = odin_cloud;
                     feats_undistort->points.insert(feats_undistort->points.end(),
                                                    odin_cloud.points.begin(), odin_cloud.points.end());
                     feats_undistort->width = feats_undistort->size();
@@ -1284,7 +1334,10 @@ int main(int argc, char** argv)
                     odin_skip = "ok";
                 }
                 else
+                {
                     odin_skip = "deskew_fail";
+                    odin_body_last->clear();
+                }
             }
 
             state_point = kf.get_x();
@@ -1355,6 +1408,7 @@ int main(int argc, char** argv)
                     pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
                     publish_frame_world(pubLaserCloudFull);
                     publish_frame_body(pubLaserCloudFull_body);
+                    publish_frame_odin_world(pubLaserCloudOdin);
                 }
                 init_map = true;
                 std::cout << "finish init_map" << std::endl;
@@ -1481,6 +1535,7 @@ int main(int argc, char** argv)
                                                  publish_frame_world(pubLaserCloudFull);
 
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            if (scan_pub_en) publish_frame_odin_world(pubLaserCloudOdin);
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
             }
