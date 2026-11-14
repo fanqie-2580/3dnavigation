@@ -1,0 +1,65 @@
+/**:
+  ros__parameters:
+    common:
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      time_sync_en: false
+      multi_lidar_en: true
+      lid_topic2: "/odin1/cloud_raw"
+      imu_topic2: "/odin1/imu"
+      lidar2_stamp_bias_sec: 0.065
+      lidar2_max_sync_dt: 0.08
+      lidar2_soft_wait_sec: 0.03
+    preprocess:
+      lidar_type: 1
+      scan_line: 6
+      scan_rate: 10
+      blind: 0.5
+      point_filter_num: 2
+      min_range: 0.5
+      max_range: 25.0
+      feature_extract_enable: false
+      lidar_type2: 6
+      point_filter_num2: 2
+      blind2: 0.3
+      min_range2: 0.3
+      max_range2: 25.0
+      min_confidence2: 30.0
+    mapping:
+      down_sample_size: 0.20
+      max_iteration: 4
+      voxel_size: 0.5
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.01
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 30.0
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
+      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0007179, 0.9999997, 0.0001657, 0.22495105, 0.0, 0.97437006]
+      extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      lidar2_cov_scale: 4.0
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      acc_cov: 0.2
+      gyr_cov: 0.05
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+    publish:
+      pub_voxel_map: false
+      publish_global_cloud_map: true
+      publish_max_voxel_layer: 1
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+    pcd_save:
+      pcd_save_en: false
+      save_path: "/home/ll/pv_lio_dual_ws/maps"
+      interval: -1
