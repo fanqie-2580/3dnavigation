@@ -137,6 +137,9 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
+// Mid-only / Odin-only body snapshots for RViz (Odin = what enters the map).
+PointCloudXYZI::Ptr mid_only_body(new PointCloudXYZI());
+PointCloudXYZI::Ptr odin_body_last(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 std::vector<M3D> var_down_body;
@@ -649,7 +652,11 @@ void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>:
 
 void publish_frame_body(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull_body)
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+    // Prefer Mid-only snapshot so white body cloud is not visually mixed with Odin.
+    PointCloudXYZI::Ptr laserCloudFullRes =
+        (mid_only_body && !mid_only_body->empty())
+            ? mid_only_body
+            : (dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
     for (int i = 0; i < size; i++)
@@ -1169,6 +1176,8 @@ int main(int argc, char** argv)
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
     auto pubLaserCloudFull_body = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 100);
+    // Current-frame deskewed Odin (cyan realtime overlay; Global map color unchanged).
+    auto pubLaserCloudOdin = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_odin", 100);
     auto pubLaserCloudEffect = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 100);
     auto pubLaserCloudMap = node->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 100);
     auto pubOdomAftMapped = node->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 100);
@@ -1249,6 +1258,12 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
             const char *odin_skip = "none";
+            // Snapshot Mid-only before Odin fuse (white in RViz).
+            if (feats_undistort && !feats_undistort->empty())
+                *mid_only_body = *feats_undistort;
+            else
+                mid_only_body->clear();
+            odin_body_last->clear();
 
             if (!multi_lidar_en)
                 odin_skip = "multi_off";
@@ -1276,6 +1291,7 @@ int main(int argc, char** argv)
                     T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
                     pcl::transformPointCloud(odin_cloud, odin_cloud, T);
                     for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
+                    *odin_body_last = odin_cloud;  // same points that enter the map
                     feats_undistort->points.insert(feats_undistort->points.end(),
                                                    odin_cloud.points.begin(), odin_cloud.points.end());
                     feats_undistort->width = feats_undistort->size();
@@ -1481,6 +1497,32 @@ int main(int argc, char** argv)
                                                  publish_frame_world(pubLaserCloudFull);
 
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            // Realtime Odin current frame (cyan overlay). Global map coloring unchanged.
+            if (scan_pub_en)
+            {
+                const int n_odin = (odin_body_last ? static_cast<int>(odin_body_last->points.size()) : 0);
+                PointCloudXYZI::Ptr world_odin(new PointCloudXYZI(std::max(n_odin, 0), 1));
+                int wrote = 0;
+                for (int i = 0; i < n_odin; i++)
+                {
+                    RGBpointBodyToWorld(&odin_body_last->points[i], &world_odin->points[wrote]);
+                    wrote++;
+                }
+                world_odin->width = wrote;
+                world_odin->height = 1;
+                world_odin->points.resize(wrote);
+                static int odin_pub_log = 0;
+                if ((++odin_pub_log % 20) == 0)
+                    std::cout << "[pv-odin-viz] n=" << wrote << std::endl;
+                sensor_msgs::msg::PointCloud2 odin_msg;
+                pcl::toROSMsg(*world_odin, odin_msg);
+                odin_msg.width = wrote;
+                odin_msg.height = 1;
+                odin_msg.row_step = odin_msg.width * odin_msg.point_step;
+                odin_msg.header.stamp = sec_to_stamp(lidar_end_time);
+                odin_msg.header.frame_id = "camera_init";
+                pubLaserCloudOdin->publish(odin_msg);
+            }
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
             }
