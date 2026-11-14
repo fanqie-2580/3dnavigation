@@ -117,6 +117,12 @@ constexpr float kOdinBodyZMin = -2.0f;
 constexpr float kOdinBodyZMax = 3.5f;
 // Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
 constexpr double kOdinStaticGyro = 0.05;
+// Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
+V3D last_global_map_pos = Zero3d;
+bool last_global_map_pose_ok = false;
+int map_ins_ok = 0, map_skip_hold = 0, map_skip_jump = 0, map_skip_bad = 0;
+constexpr double kMapJumpUpd = 0.05;   // m, single EKF update
+constexpr double kMapJumpFrame = 0.12; // m, vs last inserted pose
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -183,7 +189,7 @@ std::vector<double> layer_point_size;
 bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
-double global_map_leaf_size = 0.2;  // was 0.4 (too sparse); 0.1 overflowed PCL indices
+double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -1098,7 +1104,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.pub_voxel_map", false);
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
-    node->declare_parameter<double>("publish.global_map_leaf_size", 0.2);
+    node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
@@ -1160,8 +1166,8 @@ int main(int argc, char** argv)
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
     downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
-    // Keep leaf >= ~0.15–0.2 to avoid PCL VoxelGrid integer overflow on large maps.
-    // 0.4 was safe but made /Global_cloud_map look too sparse.
+    // leaf 0.1 for denser Global (official-like). If PCL VoxelGrid overflows on
+    // huge extents, timer falls back to the unfiltered copy.
     downSizeFilterGlobal.setLeafSize(global_map_leaf_size, global_map_leaf_size, global_map_leaf_size);
     std::cout << "global_map_leaf_size: " << global_map_leaf_size << std::endl;
     memset(point_selected_surf, true, sizeof(point_selected_surf));
@@ -1287,6 +1293,8 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
             const char *odin_skip = "none";
+            bool fuse_is_hold = false;
+            bool frame_quasi_static = false;
             const double now_wall = omp_get_wtime();
             auto append_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) {
                 feats_undistort->points.insert(feats_undistort->points.end(),
@@ -1304,6 +1312,7 @@ int main(int argc, char** argv)
                 {
                     PointCloudXYZI hold = *last_odin_fused;
                     append_odin_body(hold, tag);
+                    fuse_is_hold = true;
                     return true;
                 }
                 return false;
@@ -1383,7 +1392,8 @@ int main(int argc, char** argv)
                 const char *tag = "ok";
                 // Stationary: skip Odin deskew (az noise). Moving: gyro-only
                 // UndistortOdinNative still aligns scan to Mid-end for turns.
-                if (imu2_quasi_static())
+                frame_quasi_static = imu2_quasi_static();
+                if (frame_quasi_static)
                 {
                     tag = "ok_nodeskew";
                 }
@@ -1434,13 +1444,28 @@ int main(int argc, char** argv)
                             false : true;
 
             if (flg_EKF_inited && !init_map) {
+                // Bootstrap Global with Mid-only: full fused first frame at a
+                // still-settling pose left a permanent colored ghost sheet.
+                PointCloudXYZI::Ptr boot_body(new PointCloudXYZI);
+                boot_body->points.reserve(feats_undistort->size());
+                for (const auto &pt : feats_undistort->points)
+                {
+                    if (pt.intensity >= 150.0f) continue;
+                    boot_body->points.push_back(pt);
+                }
+                if (boot_body->empty())
+                    *boot_body = *feats_undistort;
+                boot_body->width = boot_body->points.size();
+                boot_body->height = 1;
                 PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-                transformLidar(state_point, feats_undistort, world_lidar);
+                transformLidar(state_point, boot_body, world_lidar);
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                     *global_cloud_map += *world_lidar;
                 }
+                last_global_map_pos = state_point.pos;
+                last_global_map_pose_ok = true;
 
                 std::vector<pointWithCov> pv_list;
 
@@ -1544,25 +1569,57 @@ int main(int argc, char** argv)
             transformLidar(state_point, feats_down_body, world_lidar);
             // Display map: denser undistorted cloud, but drop body-range outliers
             // (Mid preprocess historically lacked max_range → floating scatter).
+            // Gate: hold frames + sudden pose jumps wrote permanent ~1m ghosts.
             {
-                PointCloudXYZI::Ptr body_src =
-                    dense_pub_en ? feats_undistort : feats_down_body;
-                PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                body_f->points.reserve(body_src->size());
-                constexpr float kMapMaxRange = 25.0f;
-                const float r2max = kMapMaxRange * kMapMaxRange;
-                for (const auto &pt : body_src->points)
+                const double d_upd = (state_point.pos - state_before_update.pos).norm();
+                const double d_frame = last_global_map_pose_ok
+                    ? (state_point.pos - last_global_map_pos).norm() : 0.0;
+                const bool jump = (d_upd > kMapJumpUpd) ||
+                                 (last_global_map_pose_ok && d_frame > kMapJumpFrame);
+                // When moving, allow larger frame step; only treat as jump if
+                // quasi-static or the EKF update itself leaped.
+                const bool jump_gate = (d_upd > kMapJumpUpd) ||
+                                       (jump && frame_quasi_static);
+                const char *skip_why = nullptr;
+                if (state_bad) { skip_why = "bad"; ++map_skip_bad; }
+                else if (fuse_is_hold) { skip_why = "hold"; ++map_skip_hold; }
+                else if (jump_gate) { skip_why = "jump"; ++map_skip_jump; }
+
+                if (skip_why == nullptr)
                 {
-                    const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-                    if (r2 > r2max) continue;
-                    body_f->points.push_back(pt);
+                    PointCloudXYZI::Ptr body_src =
+                        dense_pub_en ? feats_undistort : feats_down_body;
+                    PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
+                    body_f->points.reserve(body_src->size());
+                    constexpr float kMapMaxRange = 25.0f;
+                    const float r2max = kMapMaxRange * kMapMaxRange;
+                    for (const auto &pt : body_src->points)
+                    {
+                        const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                        if (r2 > r2max) continue;
+                        body_f->points.push_back(pt);
+                    }
+                    body_f->width = body_f->points.size();
+                    body_f->height = 1;
+                    PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
+                    transformLidar(state_point, body_f, world_dense);
+                    std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                    *global_cloud_map += *world_dense;
+                    last_global_map_pos = state_point.pos;
+                    last_global_map_pose_ok = true;
+                    ++map_ins_ok;
                 }
-                body_f->width = body_f->points.size();
-                body_f->height = 1;
-                PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
-                transformLidar(state_point, body_f, world_dense);
-                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *world_dense;
+                else if (((map_skip_hold + map_skip_jump + map_skip_bad) % 10) == 1)
+                {
+                    std::cout << "[pv-map] skip_global why=" << skip_why
+                              << " tag=" << odin_skip
+                              << " d_upd=" << d_upd
+                              << " d_frame=" << d_frame
+                              << " ins_ok=" << map_ins_ok
+                              << " skip_hold=" << map_skip_hold
+                              << " skip_jump=" << map_skip_jump
+                              << std::endl;
+                }
             }
 
             Eigen::Vector3d ext_t = state_point.offset_T_L_I;
