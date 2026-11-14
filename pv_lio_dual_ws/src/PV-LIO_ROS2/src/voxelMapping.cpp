@@ -1082,9 +1082,15 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_R_L2_wrt_odin_imu", extrinR_oi);
     node->get_parameter("mapping.lidar2_cov_scale", lidar2_cov_scale);
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);
-    if(extrinR_l2.size()==9) LiDAR2_R_wrt_LiDAR1<<MAT_FROM_ARRAY(extrinR_l2);
+    // Yaml lists R row-major. Eigen comma-init is column-major; MAT_FROM_ARRAY
+    // transposed Ry(±13°) → Odin tilted ~13° vs Mid. Load RowMajor explicitly.
+    if(extrinR_l2.size()==9)
+      LiDAR2_R_wrt_LiDAR1 = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(extrinR_l2.data());
     if(extrinT_oi.size()==3) Lidar2_T_wrt_IMU2<<VEC_FROM_ARRAY(extrinT_oi);
-    if(extrinR_oi.size()==9) Lidar2_R_wrt_IMU2<<MAT_FROM_ARRAY(extrinR_oi);
+    if(extrinR_oi.size()==9)
+      Lidar2_R_wrt_IMU2 = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(extrinR_oi.data());
+    std::cout << "LiDAR2_R_wrt_LiDAR1 (row-major yaml):\n" << LiDAR2_R_wrt_LiDAR1 << std::endl;
+    std::cout << "LiDAR2_T_wrt_LiDAR1: " << LiDAR2_T_wrt_LiDAR1.transpose() << std::endl;
 
     // noise model params
     node->declare_parameter<double>("noise_model.ranging_cov", 0.02);
@@ -1574,16 +1580,16 @@ int main(int argc, char** argv)
                 const double d_upd = (state_point.pos - state_before_update.pos).norm();
                 const double d_frame = last_global_map_pose_ok
                     ? (state_point.pos - last_global_map_pos).norm() : 0.0;
-                const bool jump = (d_upd > kMapJumpUpd) ||
-                                 (last_global_map_pose_ok && d_frame > kMapJumpFrame);
-                // When moving, allow larger frame step; only treat as jump if
-                // quasi-static or the EKF update itself leaped.
-                const bool jump_gate = (d_upd > kMapJumpUpd) ||
-                                       (jump && frame_quasi_static);
+                // Only gate on a large single EKF step while still. Do NOT use
+                // sticky d_frame>threshold alone — after init a ~0.15m settle
+                // permanently blocked all later inserts (ins_ok stuck at 0).
+                const bool jump_gate =
+                    frame_quasi_static && (d_upd > kMapJumpUpd);
                 const char *skip_why = nullptr;
                 if (state_bad) { skip_why = "bad"; ++map_skip_bad; }
                 else if (fuse_is_hold) { skip_why = "hold"; ++map_skip_hold; }
                 else if (jump_gate) { skip_why = "jump"; ++map_skip_jump; }
+                (void)d_frame; (void)kMapJumpFrame;
 
                 if (skip_why == nullptr)
                 {

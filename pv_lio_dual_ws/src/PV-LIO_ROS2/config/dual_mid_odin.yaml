@@ -43,6 +43,8 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # Odin vs Mid optical: Ry(-13°) + lever. Yaml lists R row-major;
+      # voxelMapping loads via Eigen RowMajor Map (not Eigen <<).
       extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
       extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0007179, 0.9999997, 0.0001657, 0.22495105, 0.0, 0.97437006]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
