@@ -1497,13 +1497,16 @@ int main(int argc, char** argv)
                                                  publish_frame_world(pubLaserCloudFull);
 
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
-            // Realtime Odin current frame (cyan overlay). Global map coloring unchanged.
+            // Realtime Odin current frame (cyan). Global map color unchanged.
+            // Decimate for viz only — full ~40k PointCloud2 was intermittently dropped.
             if (scan_pub_en)
             {
                 const int n_odin = (odin_body_last ? static_cast<int>(odin_body_last->points.size()) : 0);
-                PointCloudXYZI::Ptr world_odin(new PointCloudXYZI(std::max(n_odin, 0), 1));
+                constexpr int kOdinVizStride = 4;
+                const int n_out = (n_odin + kOdinVizStride - 1) / kOdinVizStride;
+                PointCloudXYZI::Ptr world_odin(new PointCloudXYZI(std::max(n_out, 0), 1));
                 int wrote = 0;
-                for (int i = 0; i < n_odin; i++)
+                for (int i = 0; i < n_odin; i += kOdinVizStride)
                 {
                     RGBpointBodyToWorld(&odin_body_last->points[i], &world_odin->points[wrote]);
                     wrote++;
@@ -1513,11 +1516,12 @@ int main(int argc, char** argv)
                 world_odin->points.resize(wrote);
                 static int odin_pub_log = 0;
                 if ((++odin_pub_log % 20) == 0)
-                    std::cout << "[pv-odin-viz] n=" << wrote << std::endl;
+                    std::cout << "[pv-odin-viz] n=" << wrote << "/" << n_odin << std::endl;
                 sensor_msgs::msg::PointCloud2 odin_msg;
                 pcl::toROSMsg(*world_odin, odin_msg);
-                odin_msg.width = wrote;
+                odin_msg.width = static_cast<uint32_t>(wrote);
                 odin_msg.height = 1;
+                odin_msg.is_dense = false;
                 odin_msg.row_step = odin_msg.width * odin_msg.point_step;
                 odin_msg.header.stamp = sec_to_stamp(lidar_end_time);
                 odin_msg.header.frame_id = "camera_init";
