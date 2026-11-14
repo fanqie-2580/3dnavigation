@@ -105,9 +105,18 @@ double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residua
 double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
 double bundle_end_dt = 0.0;                // mid_end - (odin_end + bias)
-// One-frame hold of last good Odin to bridge unpaired gaps (stops body flicker).
+// Hold last dense Odin to bridge unpaired / sparse gaps (stops body flicker).
 PointCloudXYZI::Ptr last_odin_fused(new PointCloudXYZI());
 double last_odin_fused_wall = -1.0;
+size_t last_odin_good_n = 0;
+// Measured sparse spikes: n_odin dropped to ~40 while normal ~20k → +0.3–0.4m cz jump.
+constexpr size_t kOdinMinPts = 4000;
+constexpr double kOdinMinFrac = 0.35;
+// Body-frame Z gate after T_L2 (m): cut ceiling/floor depth flicker on fused cz.
+constexpr float kOdinBodyZMin = -2.0f;
+constexpr float kOdinBodyZMax = 3.5f;
+// Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
+constexpr double kOdinStaticGyro = 0.05;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -1287,6 +1296,63 @@ int main(int argc, char** argv)
                 odin_used_now = odin_cloud.size();
                 odin_skip = tag;
             };
+            auto hold_odin = [&](const char *tag) -> bool {
+                // soft_wait makes wall-gap from last ok often ~0.25–0.35s.
+                if (last_odin_fused && !last_odin_fused->empty() &&
+                    last_odin_fused_wall > 0.0 &&
+                    (now_wall - last_odin_fused_wall) <= 0.40)
+                {
+                    PointCloudXYZI hold = *last_odin_fused;
+                    append_odin_body(hold, tag);
+                    return true;
+                }
+                return false;
+            };
+            auto odin_dense_enough = [&](size_t n) -> bool {
+                if (n < kOdinMinPts) return false;
+                if (last_odin_good_n > 0 &&
+                    n < static_cast<size_t>(kOdinMinFrac * static_cast<double>(last_odin_good_n)))
+                    return false;
+                return true;
+            };
+            auto imu2_quasi_static = [&]() -> bool {
+                if (Measures.imu2.size() < 2) return true;
+                double sum = 0.0;
+                int n = 0;
+                for (const auto &im : Measures.imu2)
+                {
+                    const double wx = im->angular_velocity.x;
+                    const double wy = im->angular_velocity.y;
+                    const double wz = im->angular_velocity.z;
+                    sum += std::sqrt(wx * wx + wy * wy + wz * wz);
+                    ++n;
+                }
+                return n > 0 && (sum / n) < kOdinStaticGyro;
+            };
+            auto commit_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) -> bool {
+                Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+                T.block<3,3>(0,0) = LiDAR2_R_wrt_LiDAR1;
+                T.block<3,1>(0,3) = LiDAR2_T_wrt_LiDAR1;
+                pcl::transformPointCloud(odin_cloud, odin_cloud, T);
+                PointCloudXYZI gated;
+                gated.points.reserve(odin_cloud.points.size());
+                for (const auto &pt : odin_cloud.points)
+                {
+                    if (pt.z < kOdinBodyZMin || pt.z > kOdinBodyZMax) continue;
+                    PointType q = pt;
+                    q.intensity = 200.0f;
+                    gated.points.push_back(q);
+                }
+                gated.width = gated.points.size();
+                gated.height = 1;
+                if (!odin_dense_enough(gated.size()))
+                    return false;
+                *last_odin_fused = gated;
+                last_odin_fused_wall = now_wall;
+                last_odin_good_n = gated.size();
+                append_odin_body(gated, tag);
+                return true;
+            };
 
             if (!multi_lidar_en)
                 odin_skip = "multi_off";
@@ -1295,51 +1361,50 @@ int main(int argc, char** argv)
             else if (!Measures.lidar2_fresh || !Measures.lidar2 || Measures.lidar2->empty()
                      || Measures.imu2.size() < 2)
             {
-                // Bridge a missed pair with last good Odin. Window must exceed
-                // soft_wait (~0.18s) + Mid period: wait itself makes wall-gap
-                // from last ok often ~0.25–0.35s, so 0.12s never fired.
-                if (last_odin_fused && !last_odin_fused->empty() &&
-                    last_odin_fused_wall > 0.0 &&
-                    (now_wall - last_odin_fused_wall) <= 0.40)
+                if (!hold_odin("hold_1"))
                 {
-                    PointCloudXYZI hold = *last_odin_fused;
-                    append_odin_body(hold, "hold_1");
+                    if (!Measures.lidar2_fresh)
+                        odin_skip = "unpaired";
+                    else if (!Measures.lidar2 || Measures.lidar2->empty())
+                        odin_skip = "empty_l2";
+                    else
+                        odin_skip = "imu2_short";
                 }
-                else if (!Measures.lidar2_fresh)
-                    odin_skip = "unpaired";
-                else if (!Measures.lidar2 || Measures.lidar2->empty())
-                    odin_skip = "empty_l2";
-                else
-                    odin_skip = "imu2_short";
+            }
+            else if (!odin_dense_enough(Measures.lidar2->size()))
+            {
+                if (!hold_odin("hold_sparse"))
+                    odin_skip = "sparse_l2";
             }
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Deskew Odin to Mid-end on Odin clock so both clouds share the
-                // same end pose before T_L2 and world insert (fixes turn smear).
-                const double mid_end_on_odin =
-                    Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                if (p_imu->UndistortOdinNative(odin_cloud, Measures,
-                                               V3D::Zero(), V3D::Zero(),
-                                               mid_end_on_odin))
+                bool deskew_ok = true;
+                const char *tag = "ok";
+                // Stationary: skip Odin deskew (az noise). Moving: gyro-only
+                // UndistortOdinNative still aligns scan to Mid-end for turns.
+                if (imu2_quasi_static())
                 {
-                    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-                    T.block<3,3>(0,0)=LiDAR2_R_wrt_LiDAR1;
-                    T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
-                    pcl::transformPointCloud(odin_cloud, odin_cloud, T);
-                    for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
-                    *last_odin_fused = odin_cloud;
-                    last_odin_fused_wall = now_wall;
-                    append_odin_body(odin_cloud, "ok");
-                }
-                else if (last_odin_fused && !last_odin_fused->empty() &&
-                         last_odin_fused_wall > 0.0 &&
-                         (now_wall - last_odin_fused_wall) <= 0.40)
-                {
-                    PointCloudXYZI hold = *last_odin_fused;
-                    append_odin_body(hold, "hold_deskew");
+                    tag = "ok_nodeskew";
                 }
                 else
+                {
+                    const double mid_end_on_odin =
+                        Measures.lidar_end_time - lidar2_stamp_bias_sec;
+                    deskew_ok = p_imu->UndistortOdinNative(odin_cloud, Measures,
+                                                           V3D::Zero(), V3D::Zero(),
+                                                           mid_end_on_odin);
+                    tag = "ok";
+                }
+                if (deskew_ok)
+                {
+                    if (!commit_odin_body(odin_cloud, tag))
+                    {
+                        if (!hold_odin("hold_sparse_z"))
+                            odin_skip = "sparse_z";
+                    }
+                }
+                else if (!hold_odin("hold_deskew"))
                     odin_skip = "deskew_fail";
             }
 

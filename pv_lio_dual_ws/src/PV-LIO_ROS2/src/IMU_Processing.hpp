@@ -275,22 +275,10 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
   while (v_imu.size() > 2 &&
          rclcpp::Time(v_imu[1]->header.stamp).seconds() < beg - 1e-4)
     v_imu.pop_front();
-  // CRITICAL: do NOT use Mid mean_acc here. Livox Mid IMU is ~1g-norm, Odin
-  // /odin1/imu is ~9.8 m/s^2. Scaling Odin accel by G/|mean_acc_mid| (~10x)
-  // smears the scan (body Odin vs raw after T_L2: tens of cm).
-  V3D mean_acc2 = Zero3d;
-  int n_acc2 = 0;
-  for (const auto &im : meas.imu2)
-  {
-    mean_acc2 += V3D(im->linear_acceleration.x, im->linear_acceleration.y,
-                     im->linear_acceleration.z);
-    ++n_acc2;
-  }
-  if (n_acc2 > 0)
-    mean_acc2 /= static_cast<double>(n_acc2);
-  else
-    mean_acc2 = V3D(0, 0, G_m_s2);
-  const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc2.norm());
+  // Gyro-only deskew: measured /odin1/imu az sd≈1.5 (Mid ≈0.01) made accel
+  // integration pump stationary body-cloud Z by tens of cm. Keep Mid-end time
+  // align via rotation only (turn smear fix); ignore Odin accel/ba.
+  (void)ba;
   const M3D R_LI = Odin_Lidar_R_wrt_IMU;
   const V3D T_LI = Odin_Lidar_T_wrt_IMU;
   const M3D R_IL = R_LI.transpose();
@@ -311,10 +299,8 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     w << .5*(head->angular_velocity.x+tail->angular_velocity.x),
          .5*(head->angular_velocity.y+tail->angular_velocity.y),
          .5*(head->angular_velocity.z+tail->angular_velocity.z);
-    a << .5*(head->linear_acceleration.x+tail->linear_acceleration.x),
-         .5*(head->linear_acceleration.y+tail->linear_acceleration.y),
-         .5*(head->linear_acceleration.z+tail->linear_acceleration.z);
-    w -= bg; a = a * acc_scale - ba;
+    a = Zero3d;
+    w -= bg;
     bool hit_end = false;
     if (t_tail > end) { t_tail = end; hit_end = true; }
     const double dt = t_tail - std::max(t_head, last_t);
