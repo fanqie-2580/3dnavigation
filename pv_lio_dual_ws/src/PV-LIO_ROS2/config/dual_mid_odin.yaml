@@ -7,9 +7,10 @@
       multi_lidar_en: true
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
-      lidar2_stamp_bias_sec: 0.065
-      lidar2_max_sync_dt: 0.08
-      lidar2_soft_wait_sec: 0.03
+      lidar2_stamp_bias_sec: 0.0
+      lidar2_max_sync_dt: 0.15
+      lidar2_soft_wait_sec: 0.10
+      lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
       scan_line: 6
@@ -55,6 +56,7 @@
       pub_voxel_map: false
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
+      global_map_leaf_size: 0.2
       path_en: true
       scan_publish_en: true
       dense_publish_en: true

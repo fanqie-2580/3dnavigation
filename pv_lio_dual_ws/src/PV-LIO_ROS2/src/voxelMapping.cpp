@@ -96,13 +96,15 @@ string root_dir = ROOT_DIR;
 string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
-double lidar2_stamp_bias_sec = 0.065;
-double lidar2_max_sync_dt = 0.08;
-double lidar2_soft_wait_sec = 0.03;
+double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
+double lidar2_max_sync_dt = 0.15;          // ~1 Mid period; Mid/Odin phase drifts
+double lidar2_soft_wait_sec = 0.10;        // wait up to one Mid frame for late Odin
+double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
-double bundle_center_dt = 0.0;             // last Mid↔Odin center dt (signed)
-double bundle_pair_score = -1.0;           // |center_dt| when paired; <0 = Mid-only
+double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
+double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
+double bundle_end_dt = 0.0;                // mid_end - (odin_end + bias)
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -169,6 +171,7 @@ std::vector<double> layer_point_size;
 bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
+double global_map_leaf_size = 0.2;  // was 0.4 (too sparse); 0.1 overflowed PCL indices
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -295,11 +298,22 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     }
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre2->process(msg, ptr);
-    if (!ptr->empty())
-        std::sort(ptr->points.begin(), ptr->points.end(), time_list);
+    // Empty after confidence/range filter must not enter the pair buffer —
+    // it would waste sync slots and force Mid-only (Odin flicker).
+    if (ptr->empty())
+    {
+        mtx_buffer.unlock();
+        return;
+    }
+    std::sort(ptr->points.begin(), ptr->points.end(), time_list);
     lidar_buffer2.push_back(ptr);
     time_buffer2.push_back(stamp);
     last_timestamp_lidar2 = stamp;
+    while (lidar_buffer2.size() > 50)
+    {
+        lidar_buffer2.pop_front();
+        time_buffer2.pop_front();
+    }
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -414,7 +428,7 @@ bool sync_packages(MeasureGroup &meas)
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
 
-    auto fill_odin = [&](size_t i, double score, double signed_center_dt) {
+    auto fill_odin = [&](size_t i, double score, double signed_dt, double end_dt) {
         auto cloud = lidar_buffer2[i];
         meas.lidar2 = cloud;
         meas.lidar_beg_time2 = time_buffer2[i];
@@ -427,7 +441,13 @@ bool sync_packages(MeasureGroup &meas)
         odin_selected = true;
         odin_selected_i = i;
         bundle_pair_score = score;
-        bundle_center_dt = signed_center_dt;
+        bundle_center_dt = signed_dt;
+        bundle_end_dt = end_dt;
+        // Do NOT adapt bias from end_dt. end residual mixes clock offset with
+        // Mid/Odin span difference (~6ms) and phase; EMA on end_dt walked bias
+        // from 0→100ms+ in real runs and reintroduced the smear skew.
+        // Clock offset was measured ~0 on this machine; keep configured bias.
+        (void)lidar2_bias_ema;
     };
     auto fill_mid_only = [&]() {
         meas.lidar2.reset(new PointCloudXYZI());
@@ -437,19 +457,22 @@ bool sync_packages(MeasureGroup &meas)
         odin_selected_i = 0;
         bundle_pair_score = -1.0;
         bundle_center_dt = 0.0;
+        bundle_end_dt = 0.0;
         meas.lidar_beg_time2 = meas.lidar_beg_time;
         lidar_end_time2 = lidar_end_time;
         meas.lidar_end_time2 = lidar_end_time2;
     };
+    // Pair by END time (same quantity deskew targets), not center+median.
+    // Root empty-frame cause: center metric + 30ms soft-wait dropped Odin when
+    // phase drifted or Odin was slightly "too new", committing Mid-only → flicker.
     auto try_attach_odin = [&](bool &found, size_t &best_i, double &best_score,
-                               double &signed_dt) {
+                               double &signed_dt, double &end_dt) {
         found = false;
         best_i = 0;
         best_score = 1e9;
         signed_dt = 0.0;
+        end_dt = 0.0;
         if (!multi_lidar_en) return;
-        const double mid_span = std::max(0.0, lidar_end_time - meas.lidar_beg_time);
-        const double mid_center = meas.lidar_beg_time + 0.5 * mid_span;
         while (time_buffer2.size() > 1 &&
                time_buffer2.front() + lidar2_stamp_bias_sec <
                    meas.lidar_beg_time - lidar2_max_sync_dt)
@@ -460,14 +483,25 @@ bool sync_packages(MeasureGroup &meas)
         for (size_t i = 0; i < time_buffer2.size(); ++i)
         {
             if (!lidar_buffer2[i] || lidar_buffer2[i]->empty()) continue;
-            const double med = cloud_offset_median_sec(lidar_buffer2[i]);
-            const double center = time_buffer2[i] + lidar2_stamp_bias_sec + med;
-            const double score = std::fabs(center - mid_center);
+            double span2 = 0.0;
+            for (const auto &pt : lidar_buffer2[i]->points)
+                span2 = std::max(span2, double(pt.curvature) / 1000.0);
+            if (span2 < 1e-4)
+                span2 = cloud_offset_median_sec(lidar_buffer2[i]) * 2.0;
+            const double odin_end_on_mid =
+                time_buffer2[i] + lidar2_stamp_bias_sec + span2;
+            const double score = std::fabs(odin_end_on_mid - lidar_end_time);
             if (score < best_score && score <= lidar2_max_sync_dt)
             {
                 best_score = score;
                 best_i = i;
-                signed_dt = mid_center - center;
+                end_dt = lidar_end_time - odin_end_on_mid;
+                const double med = cloud_offset_median_sec(lidar_buffer2[i]);
+                const double mid_span =
+                    std::max(0.0, lidar_end_time - meas.lidar_beg_time);
+                const double mid_center = meas.lidar_beg_time + 0.5 * mid_span;
+                signed_dt = mid_center -
+                            (time_buffer2[i] + lidar2_stamp_bias_sec + med);
                 found = true;
             }
         }
@@ -493,36 +527,35 @@ bool sync_packages(MeasureGroup &meas)
 
         bool found = false;
         size_t best_i = 0;
-        double best_score = 1e9, signed_dt = 0.0;
-        try_attach_odin(found, best_i, best_score, signed_dt);
+        double best_score = 1e9, signed_dt = 0.0, end_dt = 0.0;
+        try_attach_odin(found, best_i, best_score, signed_dt, end_dt);
         if (found)
-            fill_odin(best_i, best_score, signed_dt);
-        // else provisional Mid-only; soft-wait may still attach
+            fill_odin(best_i, best_score, signed_dt, end_dt);
         bundle_mid_push_wall = wall_sec;
         lidar_pushed = true;
     }
 
-    // Soft-wait: Mid held briefly so a late Odin frame can still pair.
+    // Soft-wait: ALWAYS hold Mid until Odin pairs or timeout.
+    // Previous logic skipped waiting when buffer had a too-new Odin → Mid-only
+    // flicker even though a pairable Odin was about to arrive / already present
+    // just outside the old 55–80ms window.
     if (multi_lidar_en && !meas.lidar2_fresh)
     {
         bool found = false;
         size_t best_i = 0;
-        double best_score = 1e9, signed_dt = 0.0;
-        try_attach_odin(found, best_i, best_score, signed_dt);
+        double best_score = 1e9, signed_dt = 0.0, end_dt = 0.0;
+        try_attach_odin(found, best_i, best_score, signed_dt, end_dt);
         if (found)
         {
-            fill_odin(best_i, best_score, signed_dt);
+            fill_odin(best_i, best_score, signed_dt, end_dt);
         }
         else
         {
-            bool worth_waiting = lidar2_soft_wait_sec > 0.0 && time_buffer2.empty();
-            if (lidar2_soft_wait_sec > 0.0 && !time_buffer2.empty())
-            {
-                const double latest = time_buffer2.back() + lidar2_stamp_bias_sec;
-                if (latest < meas.lidar_beg_time + lidar2_max_sync_dt)
-                    worth_waiting = true;
-            }
-            if (worth_waiting && (wall_sec - bundle_mid_push_wall) < lidar2_soft_wait_sec)
+            // Always soft-wait the full window. Aborting on Mid backlog (old
+            // size>2 check) forced Mid-only while a pairable Odin was still
+            // in flight — measured as clustered skip=unpaired bursts.
+            if (lidar2_soft_wait_sec > 0.0 &&
+                (wall_sec - bundle_mid_push_wall) < lidar2_soft_wait_sec)
                 return false; // keep Mid unconsumed
             fill_mid_only();
         }
@@ -947,15 +980,17 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("common.multi_lidar_en", false);
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
-    node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.065);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.08);
-    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.03);
+    node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.15);
+    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.10);
+    node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
     node->get_parameter("common.lid_topic2", lid_topic2);
     node->get_parameter("common.imu_topic2", imu_topic2);
     node->get_parameter("common.lidar2_stamp_bias_sec", lidar2_stamp_bias_sec);
     node->get_parameter("common.lidar2_max_sync_dt", lidar2_max_sync_dt);
     node->get_parameter("common.lidar2_soft_wait_sec", lidar2_soft_wait_sec);
+    node->get_parameter("common.lidar2_bias_ema", lidar2_bias_ema);
 
     // mapping algorithm params
     node->declare_parameter<double>("mapping.det_range", 300.0);
@@ -1020,9 +1055,13 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.pub_voxel_map", false);
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
+    node->declare_parameter<double>("publish.global_map_leaf_size", 0.2);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
+    node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
+    if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
+    if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
 
     node->declare_parameter<double>("preprocess.blind", 0.01);
     node->declare_parameter<int>("preprocess.lidar_type", AVIA);
@@ -1078,7 +1117,10 @@ int main(int argc, char** argv)
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
     downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
-    downSizeFilterGlobal.setLeafSize(0.1, 0.1, 0.1);            //0.4
+    // Keep leaf >= ~0.15–0.2 to avoid PCL VoxelGrid integer overflow on large maps.
+    // 0.4 was safe but made /Global_cloud_map look too sparse.
+    downSizeFilterGlobal.setLeafSize(global_map_leaf_size, global_map_leaf_size, global_map_leaf_size);
+    std::cout << "global_map_leaf_size: " << global_map_leaf_size << std::endl;
     memset(point_selected_surf, true, sizeof(point_selected_surf));
     memset(res_last, -1000.0f, sizeof(res_last));
 
@@ -1154,14 +1196,18 @@ int main(int argc, char** argv)
             }
             downSizeFilterGlobal.setInputCloud(global_cloud_map_t);
             downSizeFilterGlobal.filter(*filter_global_cloud_map_t);
+            // If VoxelGrid fails/empties (extent overflow), restore unfiltered
+            // copy — never publish/keep an emptied map.
+            if (filter_global_cloud_map_t->empty() && !global_cloud_map_t->empty())
+                *filter_global_cloud_map_t = *global_cloud_map_t;
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map += *filter_global_cloud_map_t;
             }
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
             pcl::toROSMsg(*filter_global_cloud_map_t, laserCloudmsg);
-            // Points are in camera_init (EKF) coords. stamp=now() made RViz
-            // re-transform historical map clouds with the latest TF → turn smear.
+            // Points are camera_init coords. stamp=now()+frame world made RViz
+            // re-apply latest TF to historical map → motion smear illusion.
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
             laserCloudmsg.header.frame_id = "camera_init";
             pubGlobalCloudMap->publish(laserCloudmsg);
@@ -1197,10 +1243,19 @@ int main(int argc, char** argv)
 
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
+            const char *odin_skip = "none";
 
-            if (multi_lidar_en && Measures.lidar2_fresh && Measures.lidar2 &&
-                !Measures.lidar2->empty() && Measures.imu2.size() >= 2 &&
-                !feats_undistort->empty())
+            if (!multi_lidar_en)
+                odin_skip = "multi_off";
+            else if (!Measures.lidar2_fresh)
+                odin_skip = "unpaired";
+            else if (!Measures.lidar2 || Measures.lidar2->empty())
+                odin_skip = "empty_l2";
+            else if (Measures.imu2.size() < 2)
+                odin_skip = "imu2_short";
+            else if (feats_undistort->empty())
+                odin_skip = "mid_empty";
+            else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 // Deskew Odin to Mid-end on Odin clock so both clouds share the
@@ -1221,13 +1276,16 @@ int main(int argc, char** argv)
                     feats_undistort->width = feats_undistort->size();
                     feats_undistort->height = 1;
                     odin_used_now = odin_cloud.size();
+                    odin_skip = "ok";
                 }
+                else
+                    odin_skip = "deskew_fail";
             }
 
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             static int dual_frame_log = 0;
-            if ((++dual_frame_log % 20) == 0)
+            if ((++dual_frame_log % 5) == 0 || odin_used_now == 0)
                 std::cout << "[pv-dual] mid=" << Measures.lidar->size()
                           << " odin_in=" << (Measures.lidar2 ? Measures.lidar2->size() : 0)
                           << " odin_used=" << odin_used_now
@@ -1235,6 +1293,9 @@ int main(int argc, char** argv)
                           << " fused=" << feats_undistort->size()
                           << " pair_dt_ms="
                           << (bundle_pair_score < 0.0 ? -1.0 : bundle_pair_score * 1000.0)
+                          << " end_dt_ms=" << bundle_end_dt * 1000.0
+                          << " bias_ms=" << lidar2_stamp_bias_sec * 1000.0
+                          << " skip=" << odin_skip
                           << std::endl;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
@@ -1355,9 +1416,15 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
+            // Display map: accumulate denser undistorted cloud (not only 0.2m
+            // surf downsample). Periodic VoxelGrid still caps growth.
             {
+                PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
+                transformLidar(state_point,
+                               dense_pub_en ? feats_undistort : feats_down_body,
+                               world_dense);
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *world_lidar;
+                *global_cloud_map += *world_dense;
             }
 
             Eigen::Vector3d ext_t = state_point.offset_T_L_I;

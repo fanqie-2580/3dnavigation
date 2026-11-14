@@ -258,13 +258,16 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     return false;
   const double scan_end = beg + span;
   // Reference pose time: Mid-end on Odin clock when fusing, else this scan end.
-  // Root cause of turn smear was deskew-to-Odin-end then world-transform with
-  // Mid-end pose → residual Δt × yaw paints old Odin geometry at the wrong heading.
+  // Root cause of turn smear: deskew-to-Odin-end then world-transform with
+  // Mid-end pose → residual Δt × yaw paints old Odin geometry at wrong heading.
   double end = scan_end;
   if (target_end_time > 0.0)
   {
-    if (std::fabs(target_end_time - scan_end) <= 0.15)
-      end = target_end_time;
+    // Always chase Mid-end when within a scan period; previously a 0.15s gate
+    // plus "end<=beg → fall back to scan_end" silently skipped Mid-end align
+    // whenever stamp bias pushed the target before Odin beg.
+    if (target_end_time >= beg - 0.02 && target_end_time <= scan_end + 0.20)
+      end = std::max(beg + 1e-4, target_end_time);
   }
   if (end <= beg + 1e-4)
     end = scan_end;
