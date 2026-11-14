@@ -1416,13 +1416,25 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
-            // Display map: accumulate denser undistorted cloud (not only 0.2m
-            // surf downsample). Periodic VoxelGrid still caps growth.
+            // Display map: denser undistorted cloud, but drop body-range outliers
+            // (Mid preprocess historically lacked max_range → floating scatter).
             {
+                PointCloudXYZI::Ptr body_src =
+                    dense_pub_en ? feats_undistort : feats_down_body;
+                PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
+                body_f->points.reserve(body_src->size());
+                constexpr float kMapMaxRange = 25.0f;
+                const float r2max = kMapMaxRange * kMapMaxRange;
+                for (const auto &pt : body_src->points)
+                {
+                    const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                    if (r2 > r2max) continue;
+                    body_f->points.push_back(pt);
+                }
+                body_f->width = body_f->points.size();
+                body_f->height = 1;
                 PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
-                transformLidar(state_point,
-                               dense_pub_en ? feats_undistort : feats_down_body,
-                               world_dense);
+                transformLidar(state_point, body_f, world_dense);
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map += *world_dense;
             }

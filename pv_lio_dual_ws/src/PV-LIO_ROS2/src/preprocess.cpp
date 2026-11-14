@@ -159,9 +159,14 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
           pl_full[i].intensity = msg->points[i].reflectivity;
           pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points, curvature unit: ms
 
-          //与上一个添加进去的点比较
+          // Near + far gate. Mid path previously only checked blind; far Mid
+          // noise (~40–100 m) was inserted into Global_cloud_map and showed as
+          // floating rainbow scatter beside the real scene in RViz.
+          const double r2 = pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y
+                            + pl_full[i].z * pl_full[i].z;
           if (((abs(pl_full[i].x) > 1e-7) || (abs(pl_full[i].y) > 1e-7) || (abs(pl_full[i].z) > 1e-7))
-              && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
+              && (r2 > (blind * blind))
+              && (max_range <= 0.0 || r2 <= max_range * max_range))
           {
             pl_surf.push_back(pl_full[i]);
           }
