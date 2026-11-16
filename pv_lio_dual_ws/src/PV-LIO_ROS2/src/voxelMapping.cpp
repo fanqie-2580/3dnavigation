@@ -428,6 +428,37 @@ bool sync_packages(MeasureGroup &meas)
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
 
+    // Dual fusion is heavy: Mid can lag tens of seconds while Odin's buffer
+    // holds ~10s → perpetual skip=unpaired and Odin vanishes from body/map.
+    // Drop stale Mid (+matching IMU) so pairing stays near realtime.
+    {
+        const double max_mid_lag_sec = 0.50;
+        int dropped = 0;
+        while (lidar_buffer.size() > 1 &&
+               (last_timestamp_lidar - time_buffer.front()) > max_mid_lag_sec)
+        {
+            const double drop_end = time_buffer.front() + 0.15;
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            while (!imu_buffer.empty() &&
+                   rclcpp::Time(imu_buffer.front()->header.stamp).seconds() < drop_end)
+                imu_buffer.pop_front();
+            lidar_pushed = false;
+            ++dropped;
+        }
+        if (dropped > 0)
+        {
+            static int lag_drop_log = 0;
+            if ((++lag_drop_log % 20) == 1)
+                std::cout << "[pv-dual] drop_stale_mid n=" << dropped
+                          << " mid_buf=" << lidar_buffer.size()
+                          << " odin_buf=" << lidar_buffer2.size()
+                          << " lag_ms="
+                          << (last_timestamp_lidar - time_buffer.front()) * 1000.0
+                          << std::endl;
+        }
+    }
+
     auto fill_odin = [&](size_t i, double score, double signed_dt, double end_dt) {
         auto cloud = lidar_buffer2[i];
         meas.lidar2 = cloud;

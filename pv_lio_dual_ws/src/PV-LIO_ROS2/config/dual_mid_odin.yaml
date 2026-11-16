@@ -10,7 +10,8 @@
       # Restored to aa15460 (user: 现在好像没有拖影了). bias=0; sync 0.15/0.10.
       lidar2_stamp_bias_sec: 0.0
       lidar2_max_sync_dt: 0.15
-      lidar2_soft_wait_sec: 0.10
+      # Slightly longer soft-wait so late Odin still pairs after lag catch-up.
+      lidar2_soft_wait_sec: 0.18
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
@@ -43,8 +44,8 @@
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
-      # aa15460 Ry(-13°); roll 往左 Rx(+1.5°) as Rx@R (row-major).
-      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0066062, 0.9996570, -0.0253404, 0.2248552, 0.0261769, 0.9740405]
+      # aa15460 Ry(-13°); roll 往左 total Rx(+2.5°) as Rx@R (row-major).
+      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0105295, 0.9990479, -0.0423359, 0.2247057, 0.0436193, 0.9734499]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       lidar2_cov_scale: 4.0
