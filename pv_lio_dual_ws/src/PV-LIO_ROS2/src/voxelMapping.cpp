@@ -1295,10 +1295,39 @@ int main(int argc, char** argv)
             global_pending_t.reset(new PointCloudXYZI());
             if (global_merged_t->empty()) return;
 
-            downSizeFilterGlobal.setInputCloud(global_merged_t);
-            downSizeFilterGlobal.filter(*global_filtered_t);
+            // Voxel Mid and Odin separately. Joint VoxelGrid averages intensity
+            // in a leaf → Odin's marker (200) becomes ~50–150 and "disappears"
+            // from /Global_cloud_map when counting intensity>=199.
+            PointCloudXYZI::Ptr mid_pts(new PointCloudXYZI);
+            PointCloudXYZI::Ptr odin_pts(new PointCloudXYZI);
+            mid_pts->reserve(global_merged_t->size());
+            odin_pts->reserve(global_merged_t->size() / 4);
+            for (const auto &pt : global_merged_t->points)
+            {
+                if (pt.intensity >= 199.5f)
+                    odin_pts->push_back(pt);
+                else
+                    mid_pts->push_back(pt);
+            }
+            global_filtered_t->clear();
+            if (!mid_pts->empty())
+            {
+                PointCloudXYZI::Ptr mid_f(new PointCloudXYZI);
+                downSizeFilterGlobal.setInputCloud(mid_pts);
+                downSizeFilterGlobal.filter(*mid_f);
+                *global_filtered_t += mid_f->empty() ? *mid_pts : *mid_f;
+            }
+            if (!odin_pts->empty())
+            {
+                PointCloudXYZI::Ptr odin_f(new PointCloudXYZI);
+                downSizeFilterGlobal.setInputCloud(odin_pts);
+                downSizeFilterGlobal.filter(*odin_f);
+                *global_filtered_t += odin_f->empty() ? *odin_pts : *odin_f;
+            }
             if (global_filtered_t->empty())
                 global_filtered_t.swap(global_merged_t);
+            global_filtered_t->width = global_filtered_t->size();
+            global_filtered_t->height = 1;
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map = *global_filtered_t;
@@ -1446,14 +1475,38 @@ int main(int argc, char** argv)
 
             if (flg_EKF_inited && !init_map) {
                 PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-                // Init map: Mid-only (same cleanliness rule as Global pending).
+                // Init map: Mid + near-Mid Odin (same rule as Global pending).
                 PointCloudXYZI::Ptr mid_init(new PointCloudXYZI);
+                PointCloudXYZI::Ptr odin_init(new PointCloudXYZI);
                 for (const auto &pt : feats_undistort->points)
-                    if (pt.intensity < 199.5f)
+                {
+                    if (pt.intensity >= 199.5f)
+                        odin_init->push_back(pt);
+                    else
                         mid_init->push_back(pt);
-                if (mid_init->empty())
-                    *mid_init = *feats_undistort;
-                transformLidar(state_point, mid_init, world_lidar);
+                }
+                PointCloudXYZI::Ptr map_init(new PointCloudXYZI(*mid_init));
+                if (!odin_init->empty() && !mid_init->empty() &&
+                    global_odin_nn_m > 1e-3)
+                {
+                    pcl::KdTreeFLANN<PointType> kdt;
+                    kdt.setInputCloud(mid_init);
+                    std::vector<int> idx(1);
+                    std::vector<float> dist2(1);
+                    const float nn2 = static_cast<float>(
+                        global_odin_nn_m * global_odin_nn_m);
+                    for (const auto &pt : odin_init->points)
+                    {
+                        if (kdt.nearestKSearch(pt, 1, idx, dist2) > 0 &&
+                            dist2[0] <= nn2)
+                            map_init->push_back(pt);
+                    }
+                }
+                if (map_init->empty())
+                    *map_init = *feats_undistort;
+                map_init->width = map_init->size();
+                map_init->height = 1;
+                transformLidar(state_point, map_init, world_lidar);
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
@@ -1468,9 +1521,9 @@ int main(int argc, char** argv)
                     pointWithCov pv;
                     pv.point << world_lidar->points[i].x, world_lidar->points[i].y,
                             world_lidar->points[i].z;
-                    V3D point_this(mid_init->points[i].x,
-                                   mid_init->points[i].y,
-                                   mid_init->points[i].z);
+                    V3D point_this(map_init->points[i].x,
+                                   map_init->points[i].y,
+                                   map_init->points[i].z);
                     if (point_this[2] == 0) {
                         point_this[2] = 0.001;
                     }
@@ -1566,23 +1619,61 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
-            // Global display: Mid-only (no per-frame KD on ~20k Odin — that
-            // lagged the loop → drop_stale_mid → smeared map). IEKF still
-            // tightly couples Mid+Odin when phase_ok.
+            // Global display: Mid always; Odin if near a Mid point (consensus).
+            // Cap Odin KD queries to avoid the old ~20k/frame lag → drop_stale.
             {
                 PointCloudXYZI::Ptr src =
                     dense_pub_en ? feats_undistort : feats_down_body;
                 PointCloudXYZI::Ptr mid_body(new PointCloudXYZI);
+                PointCloudXYZI::Ptr odin_body(new PointCloudXYZI);
                 mid_body->reserve(src->size());
+                odin_body->reserve(src->size() / 2);
                 for (const auto &pt : src->points)
-                    if (pt.intensity < 199.5f)
+                {
+                    if (pt.intensity >= 199.5f)
+                        odin_body->push_back(pt);
+                    else
                         mid_body->push_back(pt);
-                if (mid_body->empty())
-                    *mid_body = *src;
-                mid_body->width = mid_body->size();
-                mid_body->height = 1;
+                }
+                // Display-only Odin (phase_wide/reuse) can still densify Global.
+                if (odin_pub_only && !odin_pub_only->empty())
+                    odin_body->points.insert(odin_body->points.end(),
+                                             odin_pub_only->points.begin(),
+                                             odin_pub_only->points.end());
+                PointCloudXYZI::Ptr map_body(new PointCloudXYZI(*mid_body));
+                if (!odin_body->empty() && !mid_body->empty() &&
+                    global_odin_nn_m > 1e-3)
+                {
+                    constexpr size_t kMaxOdinNn = 4000;
+                    if (odin_body->size() > kMaxOdinNn)
+                    {
+                        PointCloudXYZI::Ptr od_sub(new PointCloudXYZI);
+                        od_sub->reserve(kMaxOdinNn);
+                        const size_t step =
+                            (odin_body->size() + kMaxOdinNn - 1) / kMaxOdinNn;
+                        for (size_t i = 0; i < odin_body->size(); i += step)
+                            od_sub->push_back(odin_body->points[i]);
+                        odin_body.swap(od_sub);
+                    }
+                    pcl::KdTreeFLANN<PointType> kdt;
+                    kdt.setInputCloud(mid_body);
+                    std::vector<int> idx(1);
+                    std::vector<float> dist2(1);
+                    const float nn2 = static_cast<float>(
+                        global_odin_nn_m * global_odin_nn_m);
+                    for (const auto &pt : odin_body->points)
+                    {
+                        if (kdt.nearestKSearch(pt, 1, idx, dist2) > 0 &&
+                            dist2[0] <= nn2)
+                            map_body->push_back(pt);
+                    }
+                }
+                else if (mid_body->empty() && !src->empty())
+                    *map_body = *src;
+                map_body->width = map_body->size();
+                map_body->height = 1;
                 PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
-                transformLidar(state_point, mid_body, world_dense);
+                transformLidar(state_point, map_body, world_dense);
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map_pending += *world_dense;
             }
