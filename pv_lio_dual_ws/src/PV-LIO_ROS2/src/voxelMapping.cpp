@@ -1396,17 +1396,19 @@ int main(int argc, char** argv)
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 bool deskew_ok = true;
                 const char *tag = "ok";
-                // Stationary: skip Odin deskew (az noise). Moving: gyro-only
-                // UndistortOdinNative still aligns scan to Mid-end for turns.
+                // Stationary: skip Odin deskew (az noise) ONLY if Mid-end is
+                // close. |end_dt|>30ms + nodeskew left ground double layers.
                 frame_quasi_static = imu2_quasi_static();
-                if (frame_quasi_static)
+                const double mid_end_on_odin =
+                    Measures.lidar_end_time - lidar2_stamp_bias_sec;
+                const bool nodeskew_ok =
+                    frame_quasi_static && (std::abs(bundle_end_dt) <= 0.03);
+                if (nodeskew_ok)
                 {
                     tag = "ok_nodeskew";
                 }
                 else
                 {
-                    const double mid_end_on_odin =
-                        Measures.lidar_end_time - lidar2_stamp_bias_sec;
                     deskew_ok = p_imu->UndistortOdinNative(odin_cloud, Measures,
                                                            V3D::Zero(), V3D::Zero(),
                                                            mid_end_on_odin);

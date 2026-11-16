@@ -43,10 +43,10 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Odin vs Mid optical: Ry(-13°) + lever. Yaml lists R row-major;
-      # voxelMapping loads via Eigen RowMajor Map (not Eigen <<).
-      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
-      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0007179, 0.9999997, 0.0001657, 0.22495105, 0.0, 0.97437006]
+      # Ground calib (map_20261116_213213): Odin ground ~+12cm vs Mid; fit
+      # Δz≈+19cm -1.4cm/m*r → Tz↓3cm, Ry -13°→-13.8°. Yaml R row-major.
+      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1287]
+      extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       lidar2_cov_scale: 4.0
