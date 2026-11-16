@@ -99,7 +99,7 @@ string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
-double lidar2_max_sync_dt = 0.20;          // phase drift measured up to ~0.13s
+double lidar2_max_sync_dt = 0.05;          // Mid10Hz vs Odin5Hz: >50ms end skew smears
 double lidar2_soft_wait_sec = 0.18;        // >1 Odin period so late frames can arrive
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
@@ -642,7 +642,9 @@ bool sync_packages(MeasureGroup &meas)
                                  (time_buffer2[i] + lidar2_stamp_bias_sec + med);
                 }
             }
-            if (best_any <= std::max(lidar2_max_sync_dt * 1.5, 0.30))
+            // Do not widen far beyond max_sync_dt — that reintroduced 100ms+
+            // Mid↔Odin end skew and 扇形拖影 under Mid10/Odin5 phase beat.
+            if (best_any <= std::max(lidar2_max_sync_dt * 1.25, 0.06))
                 fill_odin(best_any_i, best_any, signed_any, end_any);
             else
                 fill_mid_only();
@@ -1069,7 +1071,7 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.20);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.05);
     node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.18);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
@@ -1376,10 +1378,12 @@ int main(int argc, char** argv)
                 return true;
             };
             auto imu2_quasi_static = [&]() -> bool {
-                if (Measures.imu2.size() < 2) return true;
+                // Use Mid IMU: Odin gyro noise made "static" unreliable.
+                const auto &imus = !Measures.imu.empty() ? Measures.imu : Measures.imu2;
+                if (imus.size() < 2) return true;
                 double sum = 0.0;
                 int n = 0;
-                for (const auto &im : Measures.imu2)
+                for (const auto &im : imus)
                 {
                     const double wx = im->angular_velocity.x;
                     const double wy = im->angular_velocity.y;
@@ -1439,34 +1443,29 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                bool deskew_ok = true;
-                const char *tag = "ok";
-                // Stationary: skip Odin deskew (az noise). Moving: gyro-only
-                // UndistortOdinNative still aligns scan to Mid-end for turns.
+                // Jump-gate still uses a static check; prefer Mid IMU (clean).
                 frame_quasi_static = imu2_quasi_static();
-                if (frame_quasi_static)
                 {
-                    tag = "ok_nodeskew";
-                }
-                else
-                {
+                    // Mid@10Hz vs Odin@~5Hz: even "static" frames often have
+                    // 50–130ms end_dt. Skipping deskew (ok_nodeskew) left Odin
+                    // at the wrong Mid-end pose → 扇形拖影. Gyro-only deskew
+                    // already ignores Odin accel noise; always align to Mid-end.
                     const double mid_end_on_odin =
                         Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                    deskew_ok = p_imu->UndistortOdinNative(odin_cloud, Measures,
-                                                           V3D::Zero(), V3D::Zero(),
-                                                           mid_end_on_odin);
-                    tag = "ok";
-                }
-                if (deskew_ok)
-                {
-                    if (!commit_odin_body(odin_cloud, tag))
+                    const bool deskew_ok = p_imu->UndistortOdinNative(
+                        odin_cloud, Measures, V3D::Zero(), V3D::Zero(),
+                        mid_end_on_odin);
+                    if (deskew_ok)
                     {
-                        if (!hold_odin("hold_sparse_z"))
-                            odin_skip = "sparse_z";
+                        if (!commit_odin_body(odin_cloud, "ok"))
+                        {
+                            if (!hold_odin("hold_sparse_z"))
+                                odin_skip = "sparse_z";
+                        }
                     }
+                    else if (!hold_odin("hold_deskew"))
+                        odin_skip = "deskew_fail";
                 }
-                else if (!hold_odin("hold_deskew"))
-                    odin_skip = "deskew_fail";
             }
 
             state_point = kf.get_x();
