@@ -113,6 +113,7 @@ bool bundle_odin_reused = false;
 PointCloudXYZI::Ptr odin_hold_cloud(new PointCloudXYZI());
 double odin_hold_beg = -1.0;
 double odin_hold_end = -1.0;
+double last_iekf_odin_beg = -1.0;  // fuse each Odin scan at most once
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -1362,26 +1363,25 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Root cause of long-run drift ("漂"): fusing Odin into IEKF when
-                // |end_dt| is large. Deskew-to-Odin-end then update with Mid-end
-                // pose injects Δt×ω residual every frame and slowly warps the
-                // Mid map (Global is Mid-only but poses were already pulled).
-                // Soft cov scale is not enough — skip IEKF when misaligned.
-                // Hysteresis avoids the old hard Mid↔dual toggle jagged path.
-                static bool odin_iekf_armed = true;
+                // Remaining "漂一点" root causes after soft cov / loose hysteresis:
+                // 1) Hysteresis kept IEKF armed and still fused |end_dt| up to
+                //    fuse_exit (~80ms). Mid-end chase over that window injects
+                //    Δt×ω residual (Z path span ~1m in minutes).
+                // 2) Mid10/Odin5 beat flips Mid-only↔dual every good phase,
+                //    re-using the same Odin scan on a later Mid-end.
+                // Fix: hard |end_dt| gate every frame + fuse each Odin beg once.
                 const double edt = std::abs(bundle_end_dt);
-                const double fuse_exit = std::max(0.05, lidar2_fuse_max_end_dt);
-                const double fuse_enter = std::min(0.05, fuse_exit * 0.6);
-                if (odin_iekf_armed) {
-                    if (edt > fuse_exit) odin_iekf_armed = false;
-                } else {
-                    if (edt <= fuse_enter) odin_iekf_armed = true;
-                }
+                const double fuse_max = std::max(0.02, lidar2_fuse_max_end_dt);
+                const bool same_odin_again =
+                    (last_iekf_odin_beg > 0.0) &&
+                    std::fabs(Measures.lidar_beg_time2 - last_iekf_odin_beg) < 1e-3;
                 const bool iekf_ok =
-                    !bundle_odin_reused && odin_iekf_armed;
+                    !bundle_odin_reused &&
+                    !same_odin_again &&
+                    (edt <= fuse_max);
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                // IEKF frames must chase Mid-end; display-only may use native end.
+                // IEKF frames must chase Mid-end; display-only uses native end.
                 const double chase_end = iekf_ok ? mid_end_on_odin : -1.0;
                 if (p_imu->UndistortOdinNative(odin_cloud, Measures,
                                                V3D::Zero(), V3D::Zero(),
@@ -1401,12 +1401,18 @@ int main(int argc, char** argv)
                             odin_cloud.points.begin(), odin_cloud.points.end());
                         feats_undistort->width = feats_undistort->size();
                         feats_undistort->height = 1;
+                        last_iekf_odin_beg = Measures.lidar_beg_time2;
                         odin_skip = "ok";
                     }
                     else
                     {
                         *odin_pub_only = odin_cloud;
-                        odin_skip = bundle_odin_reused ? "reuse" : "phase_wide";
+                        if (bundle_odin_reused)
+                            odin_skip = "reuse";
+                        else if (same_odin_again)
+                            odin_skip = "dup_odin";
+                        else
+                            odin_skip = "phase_wide";
                     }
                 }
                 else

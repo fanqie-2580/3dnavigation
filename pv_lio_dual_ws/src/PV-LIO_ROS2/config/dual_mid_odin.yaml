@@ -14,9 +14,8 @@
       lidar2_max_sync_dt: 0.15
       lidar2_soft_wait_sec: 0.15
       lidar2_reuse_max_age: 0.22
-      # IEKF fuse exit threshold (hysteresis enter≈0.6×). Larger → more Odin pull
-      # but deskew-to-wrong-end past ~80ms warps Mid poses over long runs.
-      lidar2_fuse_max_end_dt: 0.08
+      # Hard IEKF |end_dt| gate (no hysteresis). >40ms Mid-end chase warps pose.
+      lidar2_fuse_max_end_dt: 0.04
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
@@ -54,8 +53,8 @@
       extrinsic_R_L2_wrt_L1: [0.9702957, 0.0000000, -0.2419219, 0.0000000, 1.0000000, 0.0000000, 0.2419219, 0.0000000, 0.9702957]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Base Odin cov; runtime also scales up with |end_dt| (no hard gate).
-      lidar2_cov_scale: 40.0
+      # Soften Odin even on gated IEKF frames (extrinsic residual ~10cm).
+      lidar2_cov_scale: 80.0
     noise_model:
       ranging_cov: 0.04
       angle_cov: 0.1

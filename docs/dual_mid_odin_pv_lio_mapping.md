@@ -182,10 +182,10 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 紧耦合 + 干净 Global（当前）：
 
 1. Odin deskew：**aa15460 `UndistortOdinNative`** + `T_L2`。
-2. **IEKF 仅在时间对齐时融合 Odin**（`|end_dt|` 滞回：进入≤~48ms，退出>`lidar2_fuse_max_end_dt`=80ms）。错相位帧只显示（`phase_wide`），避免 deskew-to-Odin-end + Mid 位姿更新造成长时漂。
-3. 对齐帧 chase Mid-end 去畸变；错相位 / reuse 只进 body 显示。
-4. `lidar2_cov_scale=40` + `|end_dt|` 连续放大。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
-5. **Global 只写 Mid**。看图干净度先只开 Global；Body 彩色层是 Odin。
+2. **IEKF 硬门控**：仅 `|end_dt|≤40ms` 且**每个 Odin 扫描最多融合一次**（`dup_odin`/`phase_wide`/`reuse` 只显示）。去掉滞回——armed 时仍把 50–80ms 帧融进 IEKF 是“还漂一点”的主因。
+3. 对齐帧 chase Mid-end；其它帧 deskew 到 Odin end 仅用于 body 显示。
+4. `lidar2_cov_scale=80`。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
+5. **Global 只写 Mid**。看图干净度先只开 Global；Body 彩色叠影≈外参残差。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 
