@@ -67,9 +67,10 @@
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
       global_map_leaf_size: 0.2
-      # Keep Odin in Global only if within this distance of a Mid point.
-      # 0.15 covers ~10–12cm residual; Global VoxelGrid splits Mid/Odin channels.
+      # Odin→Global: keep if NN Mid <= nn (overlap) OR NN Mid >= free (Mid-blind FOV).
+      # Reject mid-band ghosts. VoxelGrid still splits Mid/Odin channels.
       global_odin_nn_m: 0.15
+      global_odin_free_m: 0.45
       path_en: true
       scan_publish_en: true
       dense_publish_en: true

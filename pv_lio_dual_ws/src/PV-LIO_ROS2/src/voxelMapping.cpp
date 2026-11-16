@@ -104,7 +104,8 @@ double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
 double lidar2_reuse_max_age = 0.22;        // re-deskew last Odin across Mid-only gaps
 double lidar2_fuse_max_end_dt = 0.10;      // |end_dt| above → skip Odin in IEKF
-double global_odin_nn_m = 0.0;             // 0 = Global Mid-only
+double global_odin_nn_m = 0.0;             // overlap keep if NN Mid <= this
+double global_odin_free_m = 0.45;          // keep Odin if no Mid within this (FOV-only)
 double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
 double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
@@ -1145,13 +1146,17 @@ int main(int argc, char** argv)
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.25);
     node->declare_parameter<double>("publish.global_odin_nn_m", 0.08);
+    node->declare_parameter<double>("publish.global_odin_free_m", 0.45);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
     node->get_parameter("publish.global_odin_nn_m", global_odin_nn_m);
+    node->get_parameter("publish.global_odin_free_m", global_odin_free_m);
     if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
+    if (global_odin_free_m < global_odin_nn_m)
+        global_odin_free_m = global_odin_nn_m;
 
     node->declare_parameter<double>("preprocess.blind", 0.01);
     node->declare_parameter<int>("preprocess.lidar_type", AVIA);
@@ -1486,8 +1491,12 @@ int main(int argc, char** argv)
                         mid_init->push_back(pt);
                 }
                 PointCloudXYZI::Ptr map_init(new PointCloudXYZI(*mid_init));
-                if (!odin_init->empty() && !mid_init->empty() &&
-                    global_odin_nn_m > 1e-3)
+                if (!odin_init->empty() && mid_init->empty())
+                {
+                    *map_init += *odin_init;
+                }
+                else if (!odin_init->empty() && !mid_init->empty() &&
+                         global_odin_nn_m > 1e-3)
                 {
                     pcl::KdTreeFLANN<PointType> kdt;
                     kdt.setInputCloud(mid_init);
@@ -1495,10 +1504,16 @@ int main(int argc, char** argv)
                     std::vector<float> dist2(1);
                     const float nn2 = static_cast<float>(
                         global_odin_nn_m * global_odin_nn_m);
+                    const float free2 = static_cast<float>(
+                        global_odin_free_m * global_odin_free_m);
                     for (const auto &pt : odin_init->points)
                     {
-                        if (kdt.nearestKSearch(pt, 1, idx, dist2) > 0 &&
-                            dist2[0] <= nn2)
+                        if (kdt.nearestKSearch(pt, 1, idx, dist2) <= 0)
+                        {
+                            map_init->push_back(pt);
+                            continue;
+                        }
+                        if (dist2[0] <= nn2 || dist2[0] >= free2)
                             map_init->push_back(pt);
                     }
                 }
@@ -1619,8 +1634,9 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
-            // Global display: Mid always; Odin if near a Mid point (consensus).
-            // Cap Odin KD queries to avoid the old ~20k/frame lag → drop_stale.
+            // Global: Mid always. Odin kept if (1) near Mid (overlap densify) OR
+            // (2) far from all Mid (Odin-only FOV Mid cannot see). Reject the
+            // mid-band ghost zone between nn and free radii.
             {
                 PointCloudXYZI::Ptr src =
                     dense_pub_en ? feats_undistort : feats_down_body;
@@ -1641,8 +1657,12 @@ int main(int argc, char** argv)
                                              odin_pub_only->points.begin(),
                                              odin_pub_only->points.end());
                 PointCloudXYZI::Ptr map_body(new PointCloudXYZI(*mid_body));
-                if (!odin_body->empty() && !mid_body->empty() &&
-                    global_odin_nn_m > 1e-3)
+                if (!odin_body->empty() && mid_body->empty())
+                {
+                    *map_body += *odin_body;
+                }
+                else if (!odin_body->empty() && !mid_body->empty() &&
+                         global_odin_nn_m > 1e-3)
                 {
                     constexpr size_t kMaxOdinNn = 4000;
                     if (odin_body->size() > kMaxOdinNn)
@@ -1661,10 +1681,17 @@ int main(int argc, char** argv)
                     std::vector<float> dist2(1);
                     const float nn2 = static_cast<float>(
                         global_odin_nn_m * global_odin_nn_m);
+                    const float free2 = static_cast<float>(
+                        global_odin_free_m * global_odin_free_m);
                     for (const auto &pt : odin_body->points)
                     {
-                        if (kdt.nearestKSearch(pt, 1, idx, dist2) > 0 &&
-                            dist2[0] <= nn2)
+                        if (kdt.nearestKSearch(pt, 1, idx, dist2) <= 0)
+                        {
+                            map_body->push_back(pt);  // no Mid at all nearby
+                            continue;
+                        }
+                        // overlap agree OR Mid-blind Odin-only region
+                        if (dist2[0] <= nn2 || dist2[0] >= free2)
                             map_body->push_back(pt);
                     }
                 }
