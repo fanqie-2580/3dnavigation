@@ -39,6 +39,8 @@
 #include <fstream>
 #include <csignal>
 #include <unistd.h>
+#include <unordered_set>
+#include <cstdint>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
@@ -190,6 +192,9 @@ bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
 double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
+// Dual Global insert: keep Odin in the map, but Mid wins overlapping body voxels
+// so residual T_L2 (~cm) does not double walls; Odin only fills Mid-empty cells.
+bool global_map_mid_prefer = true;
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -1070,8 +1075,8 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_est_en", extrinsic_est_en);
     node->get_parameter("mapping.extrinsic_T", extrinT);
     node->get_parameter("mapping.extrinsic_R", extrinR);
-    node->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L2_wrt_L1", {0.1324518,-0.0103959,0.1587});
-    node->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L2_wrt_L1", {0.9743698,0.0007368,-0.2249510,-0.0007179,0.9999997,0.0001657,0.22495105,0.0,0.97437006});
+    node->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L2_wrt_L1", {0.1324518,-0.0148876,0.0885952});
+    node->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L2_wrt_L1", {0.9743698,0.0007368,-0.2249510,-0.0036231,0.9999162,-0.0124184,0.2249230,0.0129150,0.9742910});
     node->declare_parameter<std::vector<double>>("mapping.extrinsic_T_L2_wrt_odin_imu", {-0.02663,0.03447,0.02174});
     node->declare_parameter<std::vector<double>>("mapping.extrinsic_R_L2_wrt_odin_imu", {1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0});
     node->declare_parameter<double>("mapping.lidar2_cov_scale", 4.0);
@@ -1111,10 +1116,13 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
+    node->declare_parameter<bool>("publish.global_map_mid_prefer", true);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
+    node->get_parameter("publish.global_map_mid_prefer", global_map_mid_prefer);
+    std::cout << "global_map_mid_prefer: " << (global_map_mid_prefer ? 1 : 0) << std::endl;
     if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
 
@@ -1593,17 +1601,59 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
+                    // Mid-prefer Global: insert all Mid; Odin only where this-frame
+                    // Mid left the body voxel empty → keep Odin FOV, cut dual blur.
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     body_f->points.reserve(body_src->size());
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
+                    const float inv_leaf = 1.0f / static_cast<float>(
+                        (global_map_leaf_size > 1e-3) ? global_map_leaf_size : 0.1);
+                    auto voxel_key = [inv_leaf](const PointType &pt) -> uint64_t {
+                        const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_leaf));
+                        const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_leaf));
+                        const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_leaf));
+                        return (static_cast<uint64_t>(ix & 0x1fffff) << 42) |
+                               (static_cast<uint64_t>(iy & 0x1fffff) << 21) |
+                               (static_cast<uint64_t>(iz & 0x1fffff));
+                    };
+                    std::unordered_set<uint64_t> mid_voxels;
+                    if (global_map_mid_prefer)
+                        mid_voxels.reserve(body_src->size() / 2 + 8);
                     for (const auto &pt : body_src->points)
                     {
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
-                        body_f->points.push_back(pt);
+                        const bool is_odin = (pt.intensity >= 150.0f);
+                        if (!is_odin)
+                        {
+                            if (global_map_mid_prefer)
+                                mid_voxels.insert(voxel_key(pt));
+                            body_f->points.push_back(pt);
+                        }
+                    }
+                    if (global_map_mid_prefer)
+                    {
+                        for (const auto &pt : body_src->points)
+                        {
+                            if (pt.intensity < 150.0f) continue;
+                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                            if (r2 > r2max) continue;
+                            if (mid_voxels.count(voxel_key(pt))) continue;
+                            body_f->points.push_back(pt);
+                        }
+                    }
+                    else
+                    {
+                        for (const auto &pt : body_src->points)
+                        {
+                            if (pt.intensity < 150.0f) continue;
+                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                            if (r2 > r2max) continue;
+                            body_f->points.push_back(pt);
+                        }
                     }
                     body_f->width = body_f->points.size();
                     body_f->height = 1;
