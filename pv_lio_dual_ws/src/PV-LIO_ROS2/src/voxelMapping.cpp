@@ -97,7 +97,7 @@ string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
-double lidar2_max_sync_dt = 0.05;          // reject Mid↔Odin end skew that smears
+double lidar2_max_sync_dt = 0.15;          // ~1 Mid period; Mid/Odin phase drifts
 double lidar2_soft_wait_sec = 0.10;        // wait up to one Mid frame for late Odin
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
@@ -427,37 +427,6 @@ bool sync_packages(MeasureGroup &meas)
     static bool odin_selected = false;
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
-
-    // Dual fusion is heavy: Mid can lag tens of seconds while Odin's buffer
-    // holds ~10s → perpetual skip=unpaired and Odin vanishes from body/map.
-    // Drop stale Mid (+matching IMU) so pairing stays near realtime.
-    {
-        const double max_mid_lag_sec = 0.50;
-        int dropped = 0;
-        while (lidar_buffer.size() > 1 &&
-               (last_timestamp_lidar - time_buffer.front()) > max_mid_lag_sec)
-        {
-            const double drop_end = time_buffer.front() + 0.15;
-            lidar_buffer.pop_front();
-            time_buffer.pop_front();
-            while (!imu_buffer.empty() &&
-                   rclcpp::Time(imu_buffer.front()->header.stamp).seconds() < drop_end)
-                imu_buffer.pop_front();
-            lidar_pushed = false;
-            ++dropped;
-        }
-        if (dropped > 0)
-        {
-            static int lag_drop_log = 0;
-            if ((++lag_drop_log % 20) == 1)
-                std::cout << "[pv-dual] drop_stale_mid n=" << dropped
-                          << " mid_buf=" << lidar_buffer.size()
-                          << " odin_buf=" << lidar_buffer2.size()
-                          << " lag_ms="
-                          << (last_timestamp_lidar - time_buffer.front()) * 1000.0
-                          << std::endl;
-        }
-    }
 
     auto fill_odin = [&](size_t i, double score, double signed_dt, double end_dt) {
         auto cloud = lidar_buffer2[i];
@@ -1012,7 +981,7 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.05);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.15);
     node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.10);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
@@ -1291,9 +1260,6 @@ int main(int argc, char** argv)
                 odin_skip = "imu2_short";
             else if (feats_undistort->empty())
                 odin_skip = "mid_empty";
-            else if (std::fabs(bundle_end_dt) > lidar2_max_sync_dt)
-                // Belt: sync should already reject these; never paint skewed Odin.
-                odin_skip = "end_skew";
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;

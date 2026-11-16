@@ -7,11 +7,9 @@
       multi_lidar_en: true
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
-      # Mid≈10Hz vs Odin≈5Hz: |end_dt| sawtooths to 100–140ms. Fusing those
-      # frames (even with gyro deskew) paints intermittent fan smear. Cap pair
-      # window at 50ms; soft-wait stays aa15460 0.10 so late good Odin can land.
+      # Restored to aa15460 (user: 现在好像没有拖影了). bias=0; sync 0.15/0.10.
       lidar2_stamp_bias_sec: 0.0
-      lidar2_max_sync_dt: 0.05
+      lidar2_max_sync_dt: 0.15
       lidar2_soft_wait_sec: 0.10
       lidar2_bias_ema: 0.0
     preprocess:
@@ -19,13 +17,12 @@
       scan_line: 6
       scan_rate: 10
       blind: 0.5
-      # Denser map: keep every Mid/Odin point (was 2 → too sparse indoors).
-      point_filter_num: 1
+      point_filter_num: 2
       min_range: 0.5
       max_range: 25.0
       feature_extract_enable: false
       lidar_type2: 6
-      point_filter_num2: 1
+      point_filter_num2: 2
       blind2: 0.3
       min_range2: 0.3
       max_range2: 25.0
@@ -45,8 +42,7 @@
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
-      # aa15460 Ry(-13°); roll 往左 total Rx(+2.5°) as Rx@R (row-major).
-      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0105295, 0.9990479, -0.0423359, 0.2247057, 0.0436193, 0.9734499]
+      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0007179, 0.9999997, 0.0001657, 0.22495105, 0.0, 0.97437006]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       lidar2_cov_scale: 4.0
@@ -61,8 +57,7 @@
       pub_voxel_map: false
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
-      # Denser Global (aa15460 used 0.2; 0.1 ≈ later indoor densify).
-      global_map_leaf_size: 0.1
+      global_map_leaf_size: 0.2
       path_en: true
       scan_publish_en: true
       dense_publish_en: true
