@@ -97,7 +97,7 @@ string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
-double lidar2_max_sync_dt = 0.05;          // reject Mid↔Odin end skew that smears
+double lidar2_max_sync_dt = 0.15;          // aa15460: Mid/Odin phase needs ~1 Mid period
 double lidar2_soft_wait_sec = 0.10;        // wait up to one Mid frame for late Odin
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
@@ -1017,7 +1017,7 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.05);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.15);
     node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.10);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
@@ -1305,8 +1305,6 @@ int main(int argc, char** argv)
                 odin_skip = "imu2_short";
             else if (feats_undistort->empty())
                 odin_skip = "mid_empty";
-            else if (std::fabs(bundle_end_dt) > lidar2_max_sync_dt)
-                odin_skip = "end_skew";
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;

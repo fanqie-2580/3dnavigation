@@ -7,10 +7,10 @@
       multi_lidar_en: true
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
-      # Mid10/Odin5 end_dt sawtooths to 100–140ms; fusing those frames smears
-      # even with gravity-comp deskew. Cap pair window at 50ms (Mid-only else).
+      # aa15460 sync: 0.15/0.10. A 50ms gate caused Mid-only/Odin flicker that
+      # looked like worse smear; keep wide pair + native deskew instead.
       lidar2_stamp_bias_sec: 0.0
-      lidar2_max_sync_dt: 0.05
+      lidar2_max_sync_dt: 0.15
       lidar2_soft_wait_sec: 0.10
       lidar2_bias_ema: 0.0
     preprocess:
