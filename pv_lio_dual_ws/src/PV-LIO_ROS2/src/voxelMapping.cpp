@@ -99,7 +99,7 @@ string  lid_topic, imu_topic, lid_topic2, imu_topic2;
 bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
-double lidar2_max_sync_dt = 0.05;          // Mid10Hz vs Odin5Hz: >50ms end skew smears
+double lidar2_max_sync_dt = 0.20;          // restore 2b847cd: soft-wait catches Odin phase
 double lidar2_soft_wait_sec = 0.18;        // >1 Odin period so late frames can arrive
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
@@ -192,10 +192,9 @@ bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
 double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
-// Dual Global insert: Mid always kept. Odin kept only if no Mid within
-// global_map_odin_suppress_m (body frame) — kills ~cm T_L2 double-walls
-// (拖影) while still showing Odin-only FOV Mid never hits.
-bool global_map_mid_prefer = true;
+// Restore 2b847cd Global insert (no mid_prefer/suppress). Today's prefer/suppress
+// + always-deskew regressions reintroduced 拖影 vs that known-good build.
+bool global_map_mid_prefer = false;
 double global_map_odin_suppress_m = 0.15;
 
 bool has_save_opt = false;
@@ -642,9 +641,7 @@ bool sync_packages(MeasureGroup &meas)
                                  (time_buffer2[i] + lidar2_stamp_bias_sec + med);
                 }
             }
-            // Do not widen far beyond max_sync_dt — that reintroduced 100ms+
-            // Mid↔Odin end skew and 扇形拖影 under Mid10/Odin5 phase beat.
-            if (best_any <= std::max(lidar2_max_sync_dt * 1.25, 0.06))
+            if (best_any <= std::max(lidar2_max_sync_dt * 1.5, 0.30))
                 fill_odin(best_any_i, best_any, signed_any, end_any);
             else
                 fill_mid_only();
@@ -1071,7 +1068,7 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.lid_topic2", "/odin1/cloud_raw");
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
-    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.05);
+    node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.20);
     node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.18);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
@@ -1152,7 +1149,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
-    node->declare_parameter<bool>("publish.global_map_mid_prefer", true);
+    node->declare_parameter<bool>("publish.global_map_mid_prefer", false);
     node->declare_parameter<double>("publish.global_map_odin_suppress_m", 0.15);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
@@ -1358,10 +1355,10 @@ int main(int argc, char** argv)
                 odin_skip = tag;
             };
             auto hold_odin = [&](const char *tag) -> bool {
-                // Bridge brief unpaired gaps; hold frames are gated out of Global.
+                // soft_wait makes wall-gap from last ok often ~0.25–0.35s.
                 if (last_odin_fused && !last_odin_fused->empty() &&
                     last_odin_fused_wall > 0.0 &&
-                    (now_wall - last_odin_fused_wall) <= 1.0)
+                    (now_wall - last_odin_fused_wall) <= 0.40)
                 {
                     PointCloudXYZI hold = *last_odin_fused;
                     append_odin_body(hold, tag);
@@ -1378,12 +1375,10 @@ int main(int argc, char** argv)
                 return true;
             };
             auto imu2_quasi_static = [&]() -> bool {
-                // Use Mid IMU: Odin gyro noise made "static" unreliable.
-                const auto &imus = !Measures.imu.empty() ? Measures.imu : Measures.imu2;
-                if (imus.size() < 2) return true;
+                if (Measures.imu2.size() < 2) return true;
                 double sum = 0.0;
                 int n = 0;
-                for (const auto &im : imus)
+                for (const auto &im : Measures.imu2)
                 {
                     const double wx = im->angular_velocity.x;
                     const double wy = im->angular_velocity.y;
@@ -1443,29 +1438,34 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Jump-gate still uses a static check; prefer Mid IMU (clean).
+                bool deskew_ok = true;
+                const char *tag = "ok";
+                // Restore 2b847cd: stationary skip Odin deskew (Odin gyro noise
+                // smears when always-deskew); moving → gyro-only to Mid-end.
                 frame_quasi_static = imu2_quasi_static();
+                if (frame_quasi_static)
                 {
-                    // Mid@10Hz vs Odin@~5Hz: even "static" frames often have
-                    // 50–130ms end_dt. Skipping deskew (ok_nodeskew) left Odin
-                    // at the wrong Mid-end pose → 扇形拖影. Gyro-only deskew
-                    // already ignores Odin accel noise; always align to Mid-end.
+                    tag = "ok_nodeskew";
+                }
+                else
+                {
                     const double mid_end_on_odin =
                         Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                    const bool deskew_ok = p_imu->UndistortOdinNative(
-                        odin_cloud, Measures, V3D::Zero(), V3D::Zero(),
-                        mid_end_on_odin);
-                    if (deskew_ok)
-                    {
-                        if (!commit_odin_body(odin_cloud, "ok"))
-                        {
-                            if (!hold_odin("hold_sparse_z"))
-                                odin_skip = "sparse_z";
-                        }
-                    }
-                    else if (!hold_odin("hold_deskew"))
-                        odin_skip = "deskew_fail";
+                    deskew_ok = p_imu->UndistortOdinNative(odin_cloud, Measures,
+                                                           V3D::Zero(), V3D::Zero(),
+                                                           mid_end_on_odin);
+                    tag = "ok";
                 }
+                if (deskew_ok)
+                {
+                    if (!commit_odin_body(odin_cloud, tag))
+                    {
+                        if (!hold_odin("hold_sparse_z"))
+                            odin_skip = "sparse_z";
+                    }
+                }
+                else if (!hold_odin("hold_deskew"))
+                    odin_skip = "deskew_fail";
             }
 
             state_point = kf.get_x();
@@ -1637,68 +1637,21 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
-                    // Mid always; Odin only outside Mid suppress radius (default
-                    // 0.15m). Same-leaf mid_prefer failed when T_L2 residual
-                    // (~8–12cm) put Mid/Odin in adjacent 0.1m voxels → 拖影.
+                    // Same as 2b847cd: insert full fused body (Mid+Odin), range gate only.
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     body_f->points.reserve(body_src->size());
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
-                    const float suppress =
-                        static_cast<float>(std::max(0.05, global_map_odin_suppress_m));
-                    const float inv_sup = 1.0f / suppress;
-                    auto voxel_key = [inv_sup](const PointType &pt) -> uint64_t {
-                        const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_sup));
-                        const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_sup));
-                        const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_sup));
-                        return (static_cast<uint64_t>(ix & 0x1fffff) << 42) |
-                               (static_cast<uint64_t>(iy & 0x1fffff) << 21) |
-                               (static_cast<uint64_t>(iz & 0x1fffff));
-                    };
-                    std::unordered_set<uint64_t> mid_voxels;
-                    if (global_map_mid_prefer)
-                        mid_voxels.reserve(body_src->size() / 2 + 8);
                     for (const auto &pt : body_src->points)
                     {
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
-                        if (pt.intensity >= 150.0f) continue;
-                        if (global_map_mid_prefer)
-                            mid_voxels.insert(voxel_key(pt));
                         body_f->points.push_back(pt);
                     }
-                    const bool pair_tight =
-                        !multi_lidar_en || bundle_pair_score < 0.0 ||
-                        bundle_pair_score <= 0.08;
-                    for (const auto &pt : body_src->points)
-                    {
-                        if (pt.intensity < 150.0f) continue;
-                        const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-                        if (r2 > r2max) continue;
-                        if (!pair_tight) continue; // loose Mid↔Odin time → smear
-                        if (global_map_mid_prefer)
-                        {
-                            // 3³ neighborhood ≈ suppress radius in all directions
-                            const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_sup));
-                            const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_sup));
-                            const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_sup));
-                            bool near_mid = false;
-                            for (int dx = -1; dx <= 1 && !near_mid; ++dx)
-                                for (int dy = -1; dy <= 1 && !near_mid; ++dy)
-                                    for (int dz = -1; dz <= 1 && !near_mid; ++dz)
-                                    {
-                                        const uint64_t k =
-                                            (static_cast<uint64_t>((ix + dx) & 0x1fffff) << 42) |
-                                            (static_cast<uint64_t>((iy + dy) & 0x1fffff) << 21) |
-                                            (static_cast<uint64_t>((iz + dz) & 0x1fffff));
-                                        if (mid_voxels.count(k)) near_mid = true;
-                                    }
-                            if (near_mid) continue;
-                        }
-                        body_f->points.push_back(pt);
-                    }
+                    (void)global_map_mid_prefer;
+                    (void)global_map_odin_suppress_m;
                     body_f->width = body_f->points.size();
                     body_f->height = 1;
                     PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);

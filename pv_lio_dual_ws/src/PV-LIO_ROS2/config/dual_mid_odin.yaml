@@ -8,10 +8,9 @@
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
       lidar2_stamp_bias_sec: 0.0
-      # Mid≈10Hz, Odin≈5Hz: end_dt sawtooth often hit 80–135ms under the old
-      # 0.20s window. Fusing those frames (esp. with ok_nodeskew) painted Odin
-      # at the wrong Mid-end pose → 扇形拖影. Keep only near end-time pairs.
-      lidar2_max_sync_dt: 0.05
+      # Stationary “jitter” was Mid↔Odin composition flicker: ~30% unpaired when
+      # end-time phase drifted past 100ms. Widen window so soft-wait can catch Odin.
+      lidar2_max_sync_dt: 0.20
       lidar2_soft_wait_sec: 0.18
       lidar2_bias_ema: 0.0
     preprocess:
@@ -44,12 +43,10 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Odin vs Mid optical: keep Ry(-13°) (IMU-proven), add only same-XY-cell
-      # roll Rx(+2.74°) and Tz -=0.11 m. Do not flip pitch sign.
-      # Yaml R is row-major; voxelMapping loads via Eigen RowMajor Map.
-      # Roll: right-tilt fix Rx(-2.0°) total on Ry(-13°) baseline, Tz≈0.088.
-      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0148876, 0.0885952]
-      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0036231, 0.9999162, -0.0124184, 0.2249230, 0.0129150, 0.9742910]
+      # Odin vs Mid optical: Ry(-13°) + lever. Yaml lists R row-major;
+      # voxelMapping loads via Eigen RowMajor Map (not Eigen <<).
+      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
+      extrinsic_R_L2_wrt_L1: [0.9743698, 0.0007368, -0.2249510, -0.0007179, 0.9999997, 0.0001657, 0.22495105, 0.0, 0.97437006]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       lidar2_cov_scale: 4.0
@@ -66,10 +63,6 @@
       publish_max_voxel_layer: 1
       # Official has no Global leaf; 0.2 looked sparse. 0.1 ≈ dense indoor scans.pcd.
       global_map_leaf_size: 0.1
-      # Mid always; Odin only if no Mid within suppress_m (cuts dual 拖影 from
-      # ~cm T_L2 residual). Odin-only FOV Mid misses still enters Global.
-      global_map_mid_prefer: true
-      global_map_odin_suppress_m: 0.15
       path_en: true
       scan_publish_en: true
       dense_publish_en: true
