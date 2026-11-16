@@ -48,12 +48,12 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Live body NN sweep (static): Ry=-14.5 Rx=+0.25, Tz↓; p50 ~10cm (was ~13cm).
-      extrinsic_T_L2_wrt_L1: [0.14, -0.04, 0.11]
-      extrinsic_R_L2_wrt_L1: [0.9681476, 0.0000000, -0.2503800, -0.0010925, 0.9999905, -0.0042243, 0.2503776, 0.0043633, 0.9681384]
+      # Body NN: Ry=-14° Rx=0, Tz=0.09; residual floor ~8–9cm on near walls.
+      extrinsic_T_L2_wrt_L1: [0.14, -0.02, 0.09]
+      extrinsic_R_L2_wrt_L1: [0.9702957, 0.0000000, -0.2419219, 0.0000000, 1.0000000, 0.0000000, 0.2419219, 0.0000000, 0.9702957]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Soften Odin in IEKF while residual remains (still fused every good pair).
+      # Base Odin cov; runtime also scales up with |end_dt| (no hard gate).
       lidar2_cov_scale: 40.0
     noise_model:
       ranging_cov: 0.04

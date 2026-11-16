@@ -1491,10 +1491,16 @@ int main(int argc, char** argv)
             feats_down_size = feats_down_body->points.size();
 
             var_down_body.clear();
+            // Continuous soft weight: larger Mid/Odin |end_dt| → higher Odin cov.
+            // Avoids hard phase_wide on/off while limiting pull when phase is wide.
+            const double end_dt_abs = std::abs(bundle_end_dt);
+            const double odin_dt_cov =
+                lidar2_cov_scale *
+                (1.0 + 20.0 * std::max(0.0, end_dt_abs - 0.05));
             for (auto & pt:feats_down_body->points) {
                 V3D point_this(pt.x, pt.y, pt.z);
                 M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                if (pt.intensity >= 200.0f) cov_lidar *= lidar2_cov_scale;
+                if (pt.intensity >= 200.0f) cov_lidar *= odin_dt_cov;
                 var_down_body.push_back(cov_lidar);
             }
 
