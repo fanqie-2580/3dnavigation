@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Mid360 + Odin1 双雷达 PV-LIO 建图一键关闭
 # 用法: bash /home/ll/3dnavigation/scripts/stop_dual_mid_odin_pv_lio.sh
-set -u
+# Avoid `set -u`: callers may source ROS env with unset helper vars.
+set +u
 
 echo "[dual-pv] stopping mapping / RViz / drivers ..."
 pkill -f 'pv_lio_node|mapping_dual_mid_odin' 2>/dev/null || true

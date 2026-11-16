@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Mid360 + Odin1 双雷达 PV-LIO 建图一键启动
 # 用法: bash /home/ll/3dnavigation/scripts/start_dual_mid_odin_pv_lio.sh
-set -euo pipefail
+# NOTE: do NOT use `set -u` — ROS setup.bash references unset vars
+# (e.g. AMENT_TRACE_SETUP_FILES) and will abort under nounset.
+set -eo pipefail
 
 LOG_DIR=/tmp/pv_lio_dual_run
 mkdir -p "$LOG_DIR"
@@ -16,17 +18,21 @@ bash /home/ll/3dnavigation/scripts/stop_dual_mid_odin_pv_lio.sh >/dev/null 2>&1 
 sleep 1
 
 echo "[dual-pv] start Mid360 driver"
+set +e
 # shellcheck disable=SC1091
 source /opt/ros/humble/setup.bash
 # shellcheck disable=SC1091
 source /home/ll/ws_livox/install/setup.bash
+set -e
 nohup ros2 launch livox_ros_driver2 msg_MID360_launch.py \
   >"$LOG_DIR/livox.log" 2>&1 &
 sleep 4
 
 echo "[dual-pv] start Odin1 driver"
+set +e
 # shellcheck disable=SC1091
 source /home/ll/ws_odin_pvlio/install/setup.bash
+set -e
 CFG=/home/ll/ws_odin_pvlio/install/odin_ros_driver/share/odin_ros_driver/config/control_command.yaml
 nohup ros2 run odin_ros_driver host_sdk_sample --ros-args \
   -r __node:=host_sdk_sample -p config_file:="$CFG" \
@@ -42,7 +48,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
             source /home/ll/pv_lio_dual_ws/install/setup.bash; \
             exec ros2 launch pv_lio mapping_dual_mid_odin.launch.py rviz:=false' \
   >"$LOG_DIR/mapping.log" 2>&1 &
-sleep 2
+sleep 4
 
 echo "[dual-pv] start RViz"
 env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin" \

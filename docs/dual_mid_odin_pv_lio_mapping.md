@@ -34,6 +34,8 @@ bash /home/ll/3dnavigation/scripts/stop_dual_mid_odin_pv_lio.sh
 
 日志：`/tmp/pv_lio_dual_run/{livox,odin,mapping,rviz}.log`
 
+说明：启动脚本**不要**在终端里先 `set -u` 再手动 `source /opt/ros/humble/setup.bash`；脚本内部已避开 nounset（否则会报 `AMENT_TRACE_SETUP_FILES: unbound variable`）。
+
 ---
 
 ## 0. 环境约定
