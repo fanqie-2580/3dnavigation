@@ -192,9 +192,11 @@ bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
 double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
-// Dual Global insert: keep Odin in the map, but Mid wins overlapping body voxels
-// so residual T_L2 (~cm) does not double walls; Odin only fills Mid-empty cells.
-bool global_map_mid_prefer = false;
+// Dual Global insert: Mid always kept. Odin kept only if no Mid within
+// global_map_odin_suppress_m (body frame) — kills ~cm T_L2 double-walls
+// (拖影) while still showing Odin-only FOV Mid never hits.
+bool global_map_mid_prefer = true;
+double global_map_odin_suppress_m = 0.15;
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -1148,13 +1150,16 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
-    node->declare_parameter<bool>("publish.global_map_mid_prefer", false);
+    node->declare_parameter<bool>("publish.global_map_mid_prefer", true);
+    node->declare_parameter<double>("publish.global_map_odin_suppress_m", 0.15);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
     node->get_parameter("publish.global_map_mid_prefer", global_map_mid_prefer);
-    std::cout << "global_map_mid_prefer: " << (global_map_mid_prefer ? 1 : 0) << std::endl;
+    node->get_parameter("publish.global_map_odin_suppress_m", global_map_odin_suppress_m);
+    std::cout << "global_map_mid_prefer: " << (global_map_mid_prefer ? 1 : 0)
+              << " odin_suppress_m: " << global_map_odin_suppress_m << std::endl;
     if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
 
@@ -1633,20 +1638,22 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
-                    // Mid-prefer Global: insert all Mid; Odin only where this-frame
-                    // Mid left the body voxel empty → keep Odin FOV, cut dual blur.
+                    // Mid always; Odin only outside Mid suppress radius (default
+                    // 0.15m). Same-leaf mid_prefer failed when T_L2 residual
+                    // (~8–12cm) put Mid/Odin in adjacent 0.1m voxels → 拖影.
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     body_f->points.reserve(body_src->size());
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
-                    const float inv_leaf = 1.0f / static_cast<float>(
-                        (global_map_leaf_size > 1e-3) ? global_map_leaf_size : 0.1);
-                    auto voxel_key = [inv_leaf](const PointType &pt) -> uint64_t {
-                        const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_leaf));
-                        const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_leaf));
-                        const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_leaf));
+                    const float suppress =
+                        static_cast<float>(std::max(0.05, global_map_odin_suppress_m));
+                    const float inv_sup = 1.0f / suppress;
+                    auto voxel_key = [inv_sup](const PointType &pt) -> uint64_t {
+                        const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_sup));
+                        const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_sup));
+                        const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_sup));
                         return (static_cast<uint64_t>(ix & 0x1fffff) << 42) |
                                (static_cast<uint64_t>(iy & 0x1fffff) << 21) |
                                (static_cast<uint64_t>(iz & 0x1fffff));
@@ -1658,34 +1665,40 @@ int main(int argc, char** argv)
                     {
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
-                        const bool is_odin = (pt.intensity >= 150.0f);
-                        if (!is_odin)
-                        {
-                            if (global_map_mid_prefer)
-                                mid_voxels.insert(voxel_key(pt));
-                            body_f->points.push_back(pt);
-                        }
+                        if (pt.intensity >= 150.0f) continue;
+                        if (global_map_mid_prefer)
+                            mid_voxels.insert(voxel_key(pt));
+                        body_f->points.push_back(pt);
                     }
-                    if (global_map_mid_prefer)
+                    const bool pair_tight =
+                        !multi_lidar_en || bundle_pair_score < 0.0 ||
+                        bundle_pair_score <= 0.08;
+                    for (const auto &pt : body_src->points)
                     {
-                        for (const auto &pt : body_src->points)
+                        if (pt.intensity < 150.0f) continue;
+                        const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                        if (r2 > r2max) continue;
+                        if (!pair_tight) continue; // loose Mid↔Odin time → smear
+                        if (global_map_mid_prefer)
                         {
-                            if (pt.intensity < 150.0f) continue;
-                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-                            if (r2 > r2max) continue;
-                            if (mid_voxels.count(voxel_key(pt))) continue;
-                            body_f->points.push_back(pt);
+                            // 3³ neighborhood ≈ suppress radius in all directions
+                            const int64_t ix = static_cast<int64_t>(std::floor(pt.x * inv_sup));
+                            const int64_t iy = static_cast<int64_t>(std::floor(pt.y * inv_sup));
+                            const int64_t iz = static_cast<int64_t>(std::floor(pt.z * inv_sup));
+                            bool near_mid = false;
+                            for (int dx = -1; dx <= 1 && !near_mid; ++dx)
+                                for (int dy = -1; dy <= 1 && !near_mid; ++dy)
+                                    for (int dz = -1; dz <= 1 && !near_mid; ++dz)
+                                    {
+                                        const uint64_t k =
+                                            (static_cast<uint64_t>((ix + dx) & 0x1fffff) << 42) |
+                                            (static_cast<uint64_t>((iy + dy) & 0x1fffff) << 21) |
+                                            (static_cast<uint64_t>((iz + dz) & 0x1fffff));
+                                        if (mid_voxels.count(k)) near_mid = true;
+                                    }
+                            if (near_mid) continue;
                         }
-                    }
-                    else
-                    {
-                        for (const auto &pt : body_src->points)
-                        {
-                            if (pt.intensity < 150.0f) continue;
-                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-                            if (r2 > r2max) continue;
-                            body_f->points.push_back(pt);
-                        }
+                        body_f->points.push_back(pt);
                     }
                     body_f->width = body_f->points.size();
                     body_f->height = 1;
