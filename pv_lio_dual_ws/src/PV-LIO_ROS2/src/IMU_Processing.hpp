@@ -291,6 +291,12 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
   else
     mean_acc2 = V3D(0, 0, G_m_s2);
   const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc2.norm());
+  // Root Z bounce: previous code integrated specific force WITH gravity
+  // (vel/pos start at 0, no g removal). Over a scan + Mid-end chase that
+  // pumps |Δz| by tens of cm; Mid↔Odin end_dt sawtooth → visible 上下抖动.
+  // Gyro-only kills Z bounce but drops real translation → motion smear.
+  // Fix: keep linear accel, subtract g in body (R relative to scan beg).
+  const V3D g0 = mean_acc2 * acc_scale; // gravity in beg-frame (R=I)
   const M3D R_LI = Odin_Lidar_R_wrt_IMU;
   const V3D T_LI = Odin_Lidar_T_wrt_IMU;
   const M3D R_IL = R_LI.transpose();
@@ -314,13 +320,15 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     a << .5*(head->linear_acceleration.x+tail->linear_acceleration.x),
          .5*(head->linear_acceleration.y+tail->linear_acceleration.y),
          .5*(head->linear_acceleration.z+tail->linear_acceleration.z);
-    w -= bg; a = a * acc_scale - ba;
+    w -= bg;
+    // Specific force → linear accel in body; g_body = R^T * g0 (beg-frame).
+    V3D a_body = a * acc_scale - ba - R.transpose() * g0;
     bool hit_end = false;
     if (t_tail > end) { t_tail = end; hit_end = true; }
     const double dt = t_tail - std::max(t_head, last_t);
     if (dt <= 1e-9) { if (hit_end) break; continue; }
     R = R * Exp(w, dt);
-    const V3D aw = R * a;
+    const V3D aw = R * a_body;
     pos += vel * dt + .5 * aw * dt * dt;
     vel += aw * dt; angvel = w; acc_s = aw; last_t = t_tail;
     poses.push_back(set_pose6d(last_t - beg, acc_s, angvel, vel, pos, R));
