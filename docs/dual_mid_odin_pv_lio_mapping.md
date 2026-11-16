@@ -175,20 +175,20 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 日志里正常配对示例：
 
 ```text
-[pv-dual] ... odin_used=20xxx ... skip=ok         # IEKF + Body/Global
-[pv-dual] ... odin_used=20xxx ... skip=disp_only  # 仅 Body/Global（chase Mid-end）
-[pv-dual] ... odin_used=0 ... skip=phase_wide     # |end_dt|>80ms，本帧不画 Odin
+[pv-dual] ... odin_used=20xxx ... skip=ok           # 运动：gyro-only deskew + Mid-end
+[pv-dual] ... odin_used=20xxx ... skip=ok_nodeskew  # 静止：跳过 deskew（防 Z 抖）
+[pv-dual] ... odin_used=20xxx ... skip=hold_*       # 空档复用上一帧好 Odin（≤0.4s）
 ```
 
-紧耦合 + 干净 Global（当前）：
+紧耦合 baseline（回退到 **`2ee511b` + `2b847cd` RowMajor 外参**，用户确认几乎不漂）：
 
-1. Odin deskew：**aa15460 `UndistortOdinNative`** + `T_L2`。
-2. **IEKF 硬门控**：仅 `|end_dt|≤40ms` 且每 Odin 扫描最多一次。
-3. **Body/Global 显示门控**：仅 `|end_dt|≤80ms` 且 **chase Mid-end** 才画 Odin；更宽相位（`phase_wide`/`reuse_wide`）本帧不画 Odin，避免 deskew-to-Odin-end + Mid 位姿造成 Odin 拖影。
-4. `lidar2_cov_scale=80`。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
-5. **IEKF voxel 地图只写 Mid**（Odin 可进当帧残差，但不入库，避免 10cm+ 外参残差污染匹配面）。**Global** 显示：重叠 ≤`nn`0.08m 或 Mid 盲区 ≥`free`0.45m；分通道 VoxelGrid。
+1. Odin deskew：**静止不去畸变；运动 gyro-only**，目标时刻 **chase Mid-end**（禁止 accel 积分）。
+2. **真紧耦合**：配对成功即进 `feats_undistort` → IEKF + voxel_map；`lidar2_cov_scale=4`。
+3. 同步窗宽：`max_sync_dt=0.20` / `soft_wait=0.18`；空档 `hold` 上一帧（Global 跳过 hold）。
+4. 外参 **Ry≈-13° / T≈[0.132,-0.010,0.159]**，yaml **RowMajor** 加载（勿用 Eigen `<<`）。
+5. Global：融合 dense 点直接累加（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
 
-`skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
+`skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；重启建图节点。
 
 ---
 
