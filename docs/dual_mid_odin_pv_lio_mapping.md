@@ -186,9 +186,10 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 2. **真紧耦合**：配对成功即进 `feats_undistort` → IEKF + voxel_map；`lidar2_cov_scale=4`。
 3. 同步窗宽：`max_sync_dt=0.20` / `soft_wait=0.18`；空档 `hold` 上一帧（Global 跳过 hold）。
 4. 外参 **Ry≈-13° / T≈[0.132,-0.010,0.159]**，yaml **RowMajor** 加载（勿用 Eigen `<<`）。
-5. Global：融合 dense 点直接累加（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
+5. Global：融合 dense 点进 pending，1Hz **只体素化新增**再并入永久图（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
+6. Mid 积压：`drop_stale_mid`（lag>0.5s）丢旧 Mid，避免 Odin buffer 被掏空后长期 `unpaired`。
 
-`skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；重启建图节点。
+`skip=unpaired` 且 `odin_in=0` 持续出现时，先看是否还在掉帧；仍异常则重启建图节点。
 
 ---
 
