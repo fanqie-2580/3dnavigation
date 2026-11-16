@@ -98,13 +98,18 @@ bool multi_lidar_en = false;
 bool lidar2_en = false;
 double lidar2_stamp_bias_sec = 0.0;  // measured mid-odin header offset ~0; 0.065 caused ~60ms end skew
 double lidar2_max_sync_dt = 0.15;          // aa15460: Mid/Odin phase needs ~1 Mid period
-double lidar2_soft_wait_sec = 0.10;        // wait up to one Mid frame for late Odin
+double lidar2_soft_wait_sec = 0.15;        // wait ~1.5 Mid frames; Odin often ~5–6Hz
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
+double lidar2_reuse_max_age = 0.22;        // re-deskew last Odin across Mid-only gaps
 double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
 double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
 double bundle_end_dt = 0.0;                // mid_end - (odin_end + bias)
+bool bundle_odin_reused = false;
+PointCloudXYZI::Ptr odin_hold_cloud(new PointCloudXYZI());
+double odin_hold_beg = -1.0;
+double odin_hold_end = -1.0;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -479,11 +484,30 @@ bool sync_packages(MeasureGroup &meas)
         bundle_pair_score = score;
         bundle_center_dt = signed_dt;
         bundle_end_dt = end_dt;
+        bundle_odin_reused = false;
+        // Keep a copy for Mid-only gaps: Odin driver often runs ~5–6Hz while
+        // Mid is 10Hz → without reuse body cloud loses Odin every other frame.
+        *odin_hold_cloud = *cloud;
+        odin_hold_beg = meas.lidar_beg_time2;
+        odin_hold_end = lidar_end_time2;
         // Do NOT adapt bias from end_dt. end residual mixes clock offset with
         // Mid/Odin span difference (~6ms) and phase; EMA on end_dt walked bias
         // from 0→100ms+ in real runs and reintroduced the smear skew.
         // Clock offset was measured ~0 on this machine; keep configured bias.
         (void)lidar2_bias_ema;
+    };
+    auto fill_odin_reuse = [&]() {
+        meas.lidar2.reset(new PointCloudXYZI(*odin_hold_cloud));
+        meas.lidar_beg_time2 = odin_hold_beg;
+        lidar_end_time2 = odin_hold_end;
+        meas.lidar_end_time2 = lidar_end_time2;
+        meas.lidar2_fresh = true;
+        odin_selected = false;  // already consumed; do not pop buffer again
+        odin_selected_i = 0;
+        bundle_pair_score = std::fabs(lidar_end_time - odin_hold_end);
+        bundle_center_dt = 0.0;
+        bundle_end_dt = lidar_end_time - odin_hold_end;
+        bundle_odin_reused = true;
     };
     auto fill_mid_only = [&]() {
         meas.lidar2.reset(new PointCloudXYZI());
@@ -494,6 +518,7 @@ bool sync_packages(MeasureGroup &meas)
         bundle_pair_score = -1.0;
         bundle_center_dt = 0.0;
         bundle_end_dt = 0.0;
+        bundle_odin_reused = false;
         meas.lidar_beg_time2 = meas.lidar_beg_time;
         lidar_end_time2 = lidar_end_time;
         meas.lidar_end_time2 = lidar_end_time2;
@@ -593,7 +618,15 @@ bool sync_packages(MeasureGroup &meas)
             if (lidar2_soft_wait_sec > 0.0 &&
                 (wall_sec - bundle_mid_push_wall) < lidar2_soft_wait_sec)
                 return false; // keep Mid unconsumed
-            fill_mid_only();
+            // Odin ~5–6Hz vs Mid 10Hz: after wait, re-deskew last good Odin to
+            // this Mid-end instead of Mid-only (body Odin layer flicker).
+            if (odin_hold_cloud && !odin_hold_cloud->empty() &&
+                odin_hold_end > 0.0 &&
+                (lidar_end_time - odin_hold_end) >= 0.0 &&
+                (lidar_end_time - odin_hold_end) <= lidar2_reuse_max_age)
+                fill_odin_reuse();
+            else
+                fill_mid_only();
         }
     }
 
@@ -1018,8 +1051,9 @@ int main(int argc, char** argv)
     node->declare_parameter<std::string>("common.imu_topic2", "/odin1/imu");
     node->declare_parameter<double>("common.lidar2_stamp_bias_sec", 0.0);
     node->declare_parameter<double>("common.lidar2_max_sync_dt", 0.15);
-    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.10);
+    node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.15);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
+    node->declare_parameter<double>("common.lidar2_reuse_max_age", 0.22);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
     node->get_parameter("common.lid_topic2", lid_topic2);
     node->get_parameter("common.imu_topic2", imu_topic2);
@@ -1027,6 +1061,7 @@ int main(int argc, char** argv)
     node->get_parameter("common.lidar2_max_sync_dt", lidar2_max_sync_dt);
     node->get_parameter("common.lidar2_soft_wait_sec", lidar2_soft_wait_sec);
     node->get_parameter("common.lidar2_bias_ema", lidar2_bias_ema);
+    node->get_parameter("common.lidar2_reuse_max_age", lidar2_reuse_max_age);
 
     // mapping algorithm params
     node->declare_parameter<double>("mapping.det_range", 300.0);
@@ -1328,7 +1363,7 @@ int main(int argc, char** argv)
                     feats_undistort->width = feats_undistort->size();
                     feats_undistort->height = 1;
                     odin_used_now = odin_cloud.size();
-                    odin_skip = "ok";
+                    odin_skip = bundle_odin_reused ? "reuse" : "ok";
                 }
                 else
                     odin_skip = "deskew_fail";

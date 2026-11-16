@@ -175,8 +175,16 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 日志里正常配对示例：
 
 ```text
-[pv-dual] ... odin_used=41xxx ... skip=ok
+[pv-dual] ... odin_used=20xxx ... skip=ok
+[pv-dual] ... odin_used=20xxx ... skip=reuse   # Mid 空档复用上一帧 Odin 并 deskew 到本 Mid-end
 ```
+
+`/cloud_registered_body` 抖动根因（已修）：
+
+1. Odin 驱动常约 **5–6Hz**、Mid **10Hz** → 约 1/4 帧 Mid-only，Odin 层闪烁；
+2. `UndistortOdinNative` 未按 Mid 方式去掉重力 → 帧内虚构位移，Mid-end chase 时 Z 抖。
+
+对策：`lidar2_soft_wait_sec=0.15` + `lidar2_reuse_max_age=0.22`（复用上一帧 Odin 重 deskew），以及 Odin deskew 使用 `aw = R*(f-ba) + g_world`（保留线加速度，避免纯陀螺拖影）。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 
@@ -292,7 +300,7 @@ colcon build --symlink-install --packages-select pv_lio --allow-overriding pv_li
 - Odin：`/odin1/cloud_raw` + `/odin1/imu`
 - `extrinsic_T_L2_wrt_L1` / `extrinsic_R_L2_wrt_L1`：Odin 相对 Mid
 - `global_map_leaf_size`：累积地图体素
-- `lidar2_max_sync_dt` / `lidar2_soft_wait_sec`：双雷达时间配对
+- `lidar2_max_sync_dt` / `lidar2_soft_wait_sec` / `lidar2_reuse_max_age`：双雷达时间配对与 Odin 复用
 
 方向约定（本机视觉标定）：
 

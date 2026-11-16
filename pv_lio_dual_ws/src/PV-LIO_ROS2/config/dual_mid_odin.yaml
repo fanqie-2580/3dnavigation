@@ -7,11 +7,13 @@
       multi_lidar_en: true
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
-      # aa15460 sync: 0.15/0.10. A 50ms gate caused Mid-only/Odin flicker that
-      # looked like worse smear; keep wide pair + native deskew instead.
+      # Mid~10Hz, Odin often ~5–6Hz irregular. soft_wait 0.15 + reuse last Odin
+      # (≤0.22s, re-deskew to Mid-end) stops body-cloud Odin layer flicker.
+      # Do NOT use a tight 50ms gate (that Mid-only flicker looked like smear).
       lidar2_stamp_bias_sec: 0.0
       lidar2_max_sync_dt: 0.15
-      lidar2_soft_wait_sec: 0.10
+      lidar2_soft_wait_sec: 0.15
+      lidar2_reuse_max_age: 0.22
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1

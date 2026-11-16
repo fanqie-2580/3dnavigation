@@ -249,7 +249,9 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
 {
   if (cloud.points.empty() || meas.imu2.size() < 2)
     return false;
-  constexpr double kMaxDt = 0.20;
+  // Allow Mid-end chase / Odin-reuse up to ~1 Odin period past scan_end.
+  constexpr double kMaxDt = 0.30;
+  constexpr double kChasePastScan = 0.25;
   const double beg = meas.lidar_beg_time2;
   double span = 0.0;
   for (const auto &pt : cloud.points)
@@ -266,7 +268,8 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     // Always chase Mid-end when within a scan period; previously a 0.15s gate
     // plus "end<=beg → fall back to scan_end" silently skipped Mid-end align
     // whenever stamp bias pushed the target before Odin beg.
-    if (target_end_time >= beg - 0.02 && target_end_time <= scan_end + 0.20)
+    if (target_end_time >= beg - 0.02 &&
+        target_end_time <= scan_end + kChasePastScan)
       end = std::max(beg + 1e-4, target_end_time);
   }
   if (end <= beg + 1e-4)
@@ -291,9 +294,15 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
   else
     mean_acc2 = V3D(0, 0, G_m_s2);
   const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc2.norm());
-  // Restore aa15460 deskew (user: motion almost no smear). Gravity-subtract
-  // and 50ms Mid-only gating both worsened perceived smear (composition
-  // flicker + altered Mid-end chase). Keep Odin-native accel scale.
+  // Odin IMU at rest reads ~+9.8 on Z (specific force). Integrating raw
+  // accel without removing gravity invents ~0.5 g t^2 along Z inside one
+  // scan; Mid-end chase then makes that warp frame-varying → body Z jitter.
+  // Match Mid UndistortPcl: aw = R*(f-ba) + g_world, with world = IMU@beg.
+  // (IMU-frame constant subtract is wrong once R≠I and previously looked like
+  // smear when paired with a tight sync gate.)
+  const V3D g_world = (mean_acc2.norm() > 1.0)
+                          ? (-mean_acc2.normalized() * G_m_s2)
+                          : V3D(0, 0, -G_m_s2);
   const M3D R_LI = Odin_Lidar_R_wrt_IMU;
   const V3D T_LI = Odin_Lidar_T_wrt_IMU;
   const M3D R_IL = R_LI.transpose();
@@ -317,13 +326,14 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     a << .5*(head->linear_acceleration.x+tail->linear_acceleration.x),
          .5*(head->linear_acceleration.y+tail->linear_acceleration.y),
          .5*(head->linear_acceleration.z+tail->linear_acceleration.z);
-    w -= bg; a = a * acc_scale - ba;
+    w -= bg;
+    a = a * acc_scale - ba;
     bool hit_end = false;
     if (t_tail > end) { t_tail = end; hit_end = true; }
     const double dt = t_tail - std::max(t_head, last_t);
     if (dt <= 1e-9) { if (hit_end) break; continue; }
     R = R * Exp(w, dt);
-    const V3D aw = R * a;
+    const V3D aw = R * a + g_world;
     pos += vel * dt + .5 * aw * dt * dt;
     vel += aw * dt; angvel = w; acc_s = aw; last_t = t_tail;
     poses.push_back(set_pose6d(last_t - beg, acc_s, angvel, vel, pos, R));
