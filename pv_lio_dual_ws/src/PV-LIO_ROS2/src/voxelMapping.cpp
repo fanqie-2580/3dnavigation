@@ -49,6 +49,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -102,6 +103,8 @@ double lidar2_soft_wait_sec = 0.15;        // wait ~1.5 Mid frames; Odin often ~
 double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
 double lidar2_reuse_max_age = 0.22;        // re-deskew last Odin across Mid-only gaps
+double lidar2_fuse_max_end_dt = 0.08;      // |end_dt| above this → skip Odin in IEKF/map
+double global_odin_nn_m = 0.08;            // Global: keep Odin only if near Mid
 double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
 double bundle_pair_score = -1.0;           // |residual| when paired; <0 = Mid-only
 double bundle_mid_push_wall = -1.0;
@@ -1060,6 +1063,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("common.lidar2_soft_wait_sec", 0.15);
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->declare_parameter<double>("common.lidar2_reuse_max_age", 0.22);
+    node->declare_parameter<double>("common.lidar2_fuse_max_end_dt", 0.08);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
     node->get_parameter("common.lid_topic2", lid_topic2);
     node->get_parameter("common.imu_topic2", imu_topic2);
@@ -1068,6 +1072,7 @@ int main(int argc, char** argv)
     node->get_parameter("common.lidar2_soft_wait_sec", lidar2_soft_wait_sec);
     node->get_parameter("common.lidar2_bias_ema", lidar2_bias_ema);
     node->get_parameter("common.lidar2_reuse_max_age", lidar2_reuse_max_age);
+    node->get_parameter("common.lidar2_fuse_max_end_dt", lidar2_fuse_max_end_dt);
 
     // mapping algorithm params
     node->declare_parameter<double>("mapping.det_range", 300.0);
@@ -1137,11 +1142,13 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.pub_voxel_map", false);
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
-    node->declare_parameter<double>("publish.global_map_leaf_size", 0.2);
+    node->declare_parameter<double>("publish.global_map_leaf_size", 0.25);
+    node->declare_parameter<double>("publish.global_odin_nn_m", 0.08);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
+    node->get_parameter("publish.global_odin_nn_m", global_odin_nn_m);
     if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
 
@@ -1356,8 +1363,11 @@ int main(int argc, char** argv)
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 // Tight couple: T_L2 + deskew on Mid IMUpose (same as Mid).
-                // Separate Odin-IMU deskew left ~12cm residual and vertical
-                // Global smear under IEKF fusion.
+                // Large |end_dt| means Mid/Odin phase is bad — Mid-IMU time clamp
+                // warps Odin and dirties IEKF/Global; skip fuse, keep display.
+                const bool phase_ok =
+                    !bundle_odin_reused &&
+                    std::fabs(bundle_end_dt) <= lidar2_fuse_max_end_dt;
                 if (p_imu->UndistortOdinWithMidImu(
                         odin_cloud, Measures, kf, LiDAR2_R_wrt_LiDAR1,
                         LiDAR2_T_wrt_LiDAR1, lidar2_stamp_bias_sec))
@@ -1368,6 +1378,11 @@ int main(int argc, char** argv)
                     {
                         *odin_pub_only = odin_cloud;
                         odin_skip = "reuse";
+                    }
+                    else if (!phase_ok)
+                    {
+                        *odin_pub_only = odin_cloud;
+                        odin_skip = "phase_wide";
                     }
                     else
                     {
@@ -1410,7 +1425,14 @@ int main(int argc, char** argv)
 
             if (flg_EKF_inited && !init_map) {
                 PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-                transformLidar(state_point, feats_undistort, world_lidar);
+                // Init map: Mid-only (same cleanliness rule as Global pending).
+                PointCloudXYZI::Ptr mid_init(new PointCloudXYZI);
+                for (const auto &pt : feats_undistort->points)
+                    if (pt.intensity < 199.5f)
+                        mid_init->push_back(pt);
+                if (mid_init->empty())
+                    *mid_init = *feats_undistort;
+                transformLidar(state_point, mid_init, world_lidar);
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
@@ -1425,9 +1447,9 @@ int main(int argc, char** argv)
                     pointWithCov pv;
                     pv.point << world_lidar->points[i].x, world_lidar->points[i].y,
                             world_lidar->points[i].z;
-                    V3D point_this(feats_undistort->points[i].x,
-                                   feats_undistort->points[i].y,
-                                   feats_undistort->points[i].z);
+                    V3D point_this(mid_init->points[i].x,
+                                   mid_init->points[i].y,
+                                   mid_init->points[i].z);
                     if (point_this[2] == 0) {
                         point_this[2] = 0.001;
                     }
@@ -1517,13 +1539,43 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
-            // Display map: queue dense undistorted cloud; 1Hz timer voxelizes
-            // only this pending chunk (not the whole history).
+            // Display map: Mid always; Odin only if near a Mid point (kills
+            // ~10cm Mid↔Odin ghost walls that made Global look dirty).
             {
+                PointCloudXYZI::Ptr src =
+                    dense_pub_en ? feats_undistort : feats_down_body;
+                PointCloudXYZI::Ptr mid_body(new PointCloudXYZI);
+                PointCloudXYZI::Ptr odin_body(new PointCloudXYZI);
+                mid_body->reserve(src->size());
+                odin_body->reserve(src->size() / 2);
+                for (const auto &pt : src->points)
+                {
+                    if (pt.intensity >= 199.5f)
+                        odin_body->push_back(pt);
+                    else
+                        mid_body->push_back(pt);
+                }
+                PointCloudXYZI::Ptr map_body(new PointCloudXYZI(*mid_body));
+                if (!odin_body->empty() && !mid_body->empty() &&
+                    global_odin_nn_m > 1e-3)
+                {
+                    pcl::KdTreeFLANN<PointType> kdt;
+                    kdt.setInputCloud(mid_body);
+                    std::vector<int> idx(1);
+                    std::vector<float> dist2(1);
+                    const float nn2 = static_cast<float>(global_odin_nn_m *
+                                                         global_odin_nn_m);
+                    for (const auto &pt : odin_body->points)
+                    {
+                        if (kdt.nearestKSearch(pt, 1, idx, dist2) > 0 &&
+                            dist2[0] <= nn2)
+                            map_body->push_back(pt);
+                    }
+                }
+                map_body->width = map_body->size();
+                map_body->height = 1;
                 PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
-                transformLidar(state_point,
-                               dense_pub_en ? feats_undistort : feats_down_body,
-                               world_dense);
+                transformLidar(state_point, map_body, world_dense);
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map_pending += *world_dense;
             }
