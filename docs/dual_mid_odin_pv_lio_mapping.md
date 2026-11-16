@@ -182,10 +182,10 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 紧耦合 + 干净 Global（当前）：
 
 1. Odin deskew：**aa15460 `UndistortOdinNative`** + `T_L2`。
-2. 新鲜配对 **始终进 IEKF**（禁止 `phase_wide` 门控——Mid-only/双雷达切换会让轨迹锯齿“漂”）。复用只显示。
-3. 仅当 `|end_dt|≤50ms` 才 chase Mid-end 去畸变；相位拉开时 deskew 到 Odin 自身 end，避免重影。
-4. `lidar2_cov_scale=40`，并按 `|end_dt|` 连续加大 Odin 协方差（不清零、不硬切）。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
-5. **Global 只写 Mid**；body 仍可看双雷达（白点含 Odin，近距残差约 8–9 cm）。看图干净度时建议先只开 Global。
+2. **IEKF 仅在时间对齐时融合 Odin**（`|end_dt|` 滞回：进入≤~48ms，退出>`lidar2_fuse_max_end_dt`=80ms）。错相位帧只显示（`phase_wide`），避免 deskew-to-Odin-end + Mid 位姿更新造成长时漂。
+3. 对齐帧 chase Mid-end 去畸变；错相位 / reuse 只进 body 显示。
+4. `lidar2_cov_scale=40` + `|end_dt|` 连续放大。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
+5. **Global 只写 Mid**。看图干净度先只开 Global；Body 彩色层是 Odin。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 

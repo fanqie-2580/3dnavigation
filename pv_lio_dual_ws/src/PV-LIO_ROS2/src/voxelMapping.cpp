@@ -1362,15 +1362,27 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // aa15460 Native deskew + T_L2. Do NOT phase-gate IEKF: toggling
-                // Mid-only ↔ dual (phase_wide) made the path jagged / "漂".
-                // Reuse stays display-only. Soften Odin via lidar2_cov_scale.
-                // Only chase Mid-end when |end_dt| is small; chasing across
-                // 100–200ms Mid/Odin phase paints ghosts and inflates NN.
+                // Root cause of long-run drift ("漂"): fusing Odin into IEKF when
+                // |end_dt| is large. Deskew-to-Odin-end then update with Mid-end
+                // pose injects Δt×ω residual every frame and slowly warps the
+                // Mid map (Global is Mid-only but poses were already pulled).
+                // Soft cov scale is not enough — skip IEKF when misaligned.
+                // Hysteresis avoids the old hard Mid↔dual toggle jagged path.
+                static bool odin_iekf_armed = true;
+                const double edt = std::abs(bundle_end_dt);
+                const double fuse_exit = std::max(0.05, lidar2_fuse_max_end_dt);
+                const double fuse_enter = std::min(0.05, fuse_exit * 0.6);
+                if (odin_iekf_armed) {
+                    if (edt > fuse_exit) odin_iekf_armed = false;
+                } else {
+                    if (edt <= fuse_enter) odin_iekf_armed = true;
+                }
+                const bool iekf_ok =
+                    !bundle_odin_reused && odin_iekf_armed;
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                const double chase_end =
-                    (std::abs(bundle_end_dt) <= 0.05) ? mid_end_on_odin : -1.0;
+                // IEKF frames must chase Mid-end; display-only may use native end.
+                const double chase_end = iekf_ok ? mid_end_on_odin : -1.0;
                 if (p_imu->UndistortOdinNative(odin_cloud, Measures,
                                                V3D::Zero(), V3D::Zero(),
                                                chase_end))
@@ -1382,12 +1394,7 @@ int main(int argc, char** argv)
                     for (auto &pt : odin_cloud.points)
                         pt.intensity = 200.0f;
                     odin_used_now = odin_cloud.size();
-                    if (bundle_odin_reused)
-                    {
-                        *odin_pub_only = odin_cloud;
-                        odin_skip = "reuse";
-                    }
-                    else
+                    if (iekf_ok)
                     {
                         feats_undistort->points.insert(
                             feats_undistort->points.end(),
@@ -1395,6 +1402,11 @@ int main(int argc, char** argv)
                         feats_undistort->width = feats_undistort->size();
                         feats_undistort->height = 1;
                         odin_skip = "ok";
+                    }
+                    else
+                    {
+                        *odin_pub_only = odin_cloud;
+                        odin_skip = bundle_odin_reused ? "reuse" : "phase_wide";
                     }
                 }
                 else
