@@ -179,7 +179,12 @@ std::string pcd_save_path;
 
 std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map;
 std::mutex global_cloud_map_mtx;
+// global_cloud_map: permanent downsampled display map (published).
+// global_cloud_map_pending: raw new world points since last 1Hz tick.
+// Previous bug: timer re-VoxelGrid'ed the ENTIRE history every second on the
+// single-threaded executor → Mid lag → Odin buffer (~10s) emptied → unpaired.
 PointCloudXYZI::Ptr global_cloud_map(new PointCloudXYZI());
+PointCloudXYZI::Ptr global_cloud_map_pending(new PointCloudXYZI());
 pcl::VoxelGrid<PointType> downSizeFilterGlobal;
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -427,6 +432,37 @@ bool sync_packages(MeasureGroup &meas)
     static bool odin_selected = false;
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
+
+    // Dense Global + dual deskew can lag Mid tens of seconds while Odin's
+    // buffer holds ~50 frames (~10s) → perpetual skip=unpaired and Odin
+    // vanishes from body/map. Drop stale Mid (+matching IMU) to stay realtime.
+    {
+        const double max_mid_lag_sec = 0.50;
+        int dropped = 0;
+        while (lidar_buffer.size() > 1 &&
+               (last_timestamp_lidar - time_buffer.front()) > max_mid_lag_sec)
+        {
+            const double drop_end = time_buffer.front() + 0.15;
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            while (!imu_buffer.empty() &&
+                   rclcpp::Time(imu_buffer.front()->header.stamp).seconds() < drop_end)
+                imu_buffer.pop_front();
+            lidar_pushed = false;
+            ++dropped;
+        }
+        if (dropped > 0)
+        {
+            static int lag_drop_log = 0;
+            if ((++lag_drop_log % 20) == 1)
+                std::cout << "[pv-dual] drop_stale_mid n=" << dropped
+                          << " mid_buf=" << lidar_buffer.size()
+                          << " odin_buf=" << lidar_buffer2.size()
+                          << " lag_ms="
+                          << (last_timestamp_lidar - time_buffer.front()) * 1000.0
+                          << std::endl;
+        }
+    }
 
     auto fill_odin = [&](size_t i, double score, double signed_dt, double end_dt) {
         auto cloud = lidar_buffer2[i];
@@ -1187,30 +1223,39 @@ int main(int argc, char** argv)
 
     auto tf_br = std::make_shared<tf2_ros::TransformBroadcaster>(node);
 
-    PointCloudXYZI::Ptr global_cloud_map_t(new PointCloudXYZI());
-    PointCloudXYZI::Ptr filter_global_cloud_map_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_pending_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_chunk_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_pub_t(new PointCloudXYZI());
 
-    // Timer to publish global map
+    // Timer: voxelize ONLY new points, append to permanent map, publish full map.
     auto timer = node->create_wall_timer(1s,
         [&]()
         {
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map_t = *global_cloud_map;
-                global_cloud_map.reset(new PointCloudXYZI());
+                if (global_cloud_map_pending->empty() && global_cloud_map->empty())
+                    return;
+                global_pending_t.swap(global_cloud_map_pending);
+                global_cloud_map_pending.reset(new PointCloudXYZI());
+                *global_pub_t = *global_cloud_map;
             }
-            downSizeFilterGlobal.setInputCloud(global_cloud_map_t);
-            downSizeFilterGlobal.filter(*filter_global_cloud_map_t);
-            // If VoxelGrid fails/empties (extent overflow), restore unfiltered
-            // copy — never publish/keep an emptied map.
-            if (filter_global_cloud_map_t->empty() && !global_cloud_map_t->empty())
-                *filter_global_cloud_map_t = *global_cloud_map_t;
+            if (!global_pending_t->empty())
             {
-                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *filter_global_cloud_map_t;
+                downSizeFilterGlobal.setInputCloud(global_pending_t);
+                downSizeFilterGlobal.filter(*global_chunk_t);
+                if (global_chunk_t->empty())
+                    *global_chunk_t = *global_pending_t;
+                *global_pub_t += *global_chunk_t;
+                {
+                    std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                    *global_cloud_map += *global_chunk_t;
+                }
             }
+            global_pending_t.reset(new PointCloudXYZI());
+            global_chunk_t.reset(new PointCloudXYZI());
+            if (global_pub_t->empty()) return;
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
-            pcl::toROSMsg(*filter_global_cloud_map_t, laserCloudmsg);
+            pcl::toROSMsg(*global_pub_t, laserCloudmsg);
             // Points are camera_init coords. stamp=now()+frame world made RViz
             // re-apply latest TF to historical map → motion smear illusion.
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
@@ -1318,7 +1363,7 @@ int main(int argc, char** argv)
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                    *global_cloud_map += *world_lidar;
+                    *global_cloud_map_pending += *world_lidar;
                 }
 
                 std::vector<pointWithCov> pv_list;
@@ -1421,15 +1466,15 @@ int main(int argc, char** argv)
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
-            // Display map: accumulate denser undistorted cloud (not only 0.2m
-            // surf downsample). Periodic VoxelGrid still caps growth.
+            // Display map: queue dense undistorted cloud; 1Hz timer voxelizes
+            // only this pending chunk (not the whole history).
             {
                 PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
                 transformLidar(state_point,
                                dense_pub_en ? feats_undistort : feats_down_body,
                                world_dense);
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *world_dense;
+                *global_cloud_map_pending += *world_dense;
             }
 
             Eigen::Vector3d ext_t = state_point.offset_T_L_I;
