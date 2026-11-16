@@ -7,11 +7,12 @@
       multi_lidar_en: true
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
-      # Restored to aa15460 (user: 现在好像没有拖影了). bias=0; sync 0.15/0.10.
+      # Mid≈10Hz vs Odin≈5Hz: |end_dt| sawtooths to 100–140ms. Fusing those
+      # frames (even with gyro deskew) paints intermittent fan smear. Cap pair
+      # window at 50ms; soft-wait stays aa15460 0.10 so late good Odin can land.
       lidar2_stamp_bias_sec: 0.0
-      lidar2_max_sync_dt: 0.15
-      # Slightly longer soft-wait so late Odin still pairs after lag catch-up.
-      lidar2_soft_wait_sec: 0.18
+      lidar2_max_sync_dt: 0.05
+      lidar2_soft_wait_sec: 0.10
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
