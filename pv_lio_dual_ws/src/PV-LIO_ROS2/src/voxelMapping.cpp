@@ -1440,10 +1440,15 @@ int main(int argc, char** argv)
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 bool deskew_ok = true;
                 const char *tag = "ok";
-                // Restore 2b847cd: stationary skip Odin deskew (Odin gyro noise
-                // smears when always-deskew); moving → gyro-only to Mid-end.
+                // Root "有时拖影": Mid≈10Hz vs Odin≈5Hz makes |end_dt| sawtooth
+                // to 80–140ms. ok_nodeskew (skip deskew) on those frames paints
+                // raw Odin with Mid-end pose → intermittent fan smear (~15% logs).
+                // Keep stationary nodeskew only when ends are also aligned.
                 frame_quasi_static = imu2_quasi_static();
-                if (frame_quasi_static)
+                constexpr double kNodeskewMaxEndDt = 0.04; // 40ms
+                const bool end_aligned =
+                    std::fabs(bundle_end_dt) <= kNodeskewMaxEndDt;
+                if (frame_quasi_static && end_aligned)
                 {
                     tag = "ok_nodeskew";
                 }
@@ -1454,7 +1459,7 @@ int main(int argc, char** argv)
                     deskew_ok = p_imu->UndistortOdinNative(odin_cloud, Measures,
                                                            V3D::Zero(), V3D::Zero(),
                                                            mid_end_on_odin);
-                    tag = "ok";
+                    tag = end_aligned ? "ok" : "ok_align";
                 }
                 if (deskew_ok)
                 {
@@ -1637,17 +1642,23 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
-                    // Same as 2b847cd: insert full fused body (Mid+Odin), range gate only.
+                    // Mid always; drop Odin from Global when Mid↔Odin end skew
+                    // is still large after fuse — those frames are the intermittent
+                    // smear source and would leave permanent double walls.
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     body_f->points.reserve(body_src->size());
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
+                    const bool map_odin =
+                        !multi_lidar_en || bundle_pair_score < 0.0 ||
+                        std::fabs(bundle_end_dt) <= 0.05;
                     for (const auto &pt : body_src->points)
                     {
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
+                        if (!map_odin && pt.intensity >= 150.0f) continue;
                         body_f->points.push_back(pt);
                     }
                     (void)global_map_mid_prefer;
