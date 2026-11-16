@@ -22,6 +22,20 @@ mkdir -p /tmp/pv_lio_dual_run
 
 ---
 
+## 一键开关（推荐）
+
+```bash
+# 开启（会先 stop 再起 Mid + Odin + mapping + RViz）
+bash /home/ll/3dnavigation/scripts/start_dual_mid_odin_pv_lio.sh
+
+# 关闭
+bash /home/ll/3dnavigation/scripts/stop_dual_mid_odin_pv_lio.sh
+```
+
+日志：`/tmp/pv_lio_dual_run/{livox,odin,mapping,rviz}.log`
+
+---
+
 ## 0. 环境约定
 
 ```bash
