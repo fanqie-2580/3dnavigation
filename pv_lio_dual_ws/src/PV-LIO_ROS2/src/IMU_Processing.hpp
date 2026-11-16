@@ -294,15 +294,25 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
   else
     mean_acc2 = V3D(0, 0, G_m_s2);
   const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc2.norm());
-  // Odin IMU at rest reads ~+9.8 on Z (specific force). Integrating raw
-  // accel without removing gravity invents ~0.5 g t^2 along Z inside one
-  // scan; Mid-end chase then makes that warp frame-varying → body Z jitter.
-  // Match Mid UndistortPcl: aw = R*(f-ba) + g_world, with world = IMU@beg.
-  // (IMU-frame constant subtract is wrong once R≠I and previously looked like
-  // smear when paired with a tight sync gate.)
-  const V3D g_world = (mean_acc2.norm() > 1.0)
-                          ? (-mean_acc2.normalized() * G_m_s2)
-                          : V3D(0, 0, -G_m_s2);
+  // Gravity in Mid UndistortPcl form (aw = R*f + g_world) stabilizes body Z
+  // when still, but mean_acc over a moving window contaminates g_world and
+  // caused visible pose/map drift. Use aa15460 accel while moving; only add
+  // g_world when this Odin IMU window is nearly still (|w| small).
+  double mean_w = 0.0;
+  int n_w = 0;
+  for (const auto &im : meas.imu2)
+  {
+    mean_w += std::sqrt(im->angular_velocity.x * im->angular_velocity.x +
+                        im->angular_velocity.y * im->angular_velocity.y +
+                        im->angular_velocity.z * im->angular_velocity.z);
+    ++n_w;
+  }
+  if (n_w > 0)
+    mean_w /= static_cast<double>(n_w);
+  const bool stillish = mean_w < 0.08; // rad/s
+  V3D g_world = Zero3d;
+  if (stillish && mean_acc2.norm() > 1.0)
+    g_world = -mean_acc2.normalized() * G_m_s2;
   const M3D R_LI = Odin_Lidar_R_wrt_IMU;
   const V3D T_LI = Odin_Lidar_T_wrt_IMU;
   const M3D R_IL = R_LI.transpose();

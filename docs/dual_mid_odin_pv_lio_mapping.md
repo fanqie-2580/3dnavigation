@@ -184,7 +184,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 1. Odin 驱动常约 **5–6Hz**、Mid **10Hz** → 约 1/4 帧 Mid-only，Odin 层闪烁；
 2. `UndistortOdinNative` 未按 Mid 方式去掉重力 → 帧内虚构位移，Mid-end chase 时 Z 抖。
 
-对策：`lidar2_soft_wait_sec=0.15` + `lidar2_reuse_max_age=0.22`（复用上一帧 Odin 重 deskew），以及 Odin deskew 使用 `aw = R*(f-ba) + g_world`（保留线加速度，避免纯陀螺拖影）。
+对策：`lidar2_soft_wait_sec=0.15` + `lidar2_reuse_max_age=0.22`；复用 Odin **只进 body/world 显示、不进 IEKF/地图**（否则会漂）。Odin deskew 运动时用 aa15460 线加速度；接近静止（`|ω|<0.08`）才加 `g_world`，避免运动中重力估计污染导致漂移/拖影。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 

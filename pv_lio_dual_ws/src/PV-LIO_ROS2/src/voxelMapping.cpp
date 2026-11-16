@@ -687,11 +687,14 @@ bool sync_packages(MeasureGroup &meas)
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 
-void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull)
+void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull,
+                         const PointCloudXYZI::Ptr &cloud_override = PointCloudXYZI::Ptr())
 {
     if(scan_pub_en)
     {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+        PointCloudXYZI::Ptr laserCloudFullRes =
+            cloud_override ? cloud_override
+                           : (dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
         PointCloudXYZI laserCloudWorld;
         for (int i = 0; i < size; i++)
@@ -716,9 +719,12 @@ void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>:
 
 }
 
-void publish_frame_body(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull_body)
+void publish_frame_body(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull_body,
+                        const PointCloudXYZI::Ptr &cloud_override = PointCloudXYZI::Ptr())
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+    PointCloudXYZI::Ptr laserCloudFullRes =
+        cloud_override ? cloud_override
+                       : (dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
     for (int i = 0; i < size; i++)
@@ -1331,6 +1337,9 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
             const char *odin_skip = "none";
+            // Reused Odin is display-only: feeding the same scan into IEKF/map
+            // at several Mid-ends pulled pose and looked like drift.
+            PointCloudXYZI::Ptr odin_pub_only(new PointCloudXYZI());
 
             if (!multi_lidar_en)
                 odin_skip = "multi_off";
@@ -1358,12 +1367,20 @@ int main(int argc, char** argv)
                     T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
                     pcl::transformPointCloud(odin_cloud, odin_cloud, T);
                     for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
-                    feats_undistort->points.insert(feats_undistort->points.end(),
-                                                   odin_cloud.points.begin(), odin_cloud.points.end());
-                    feats_undistort->width = feats_undistort->size();
-                    feats_undistort->height = 1;
                     odin_used_now = odin_cloud.size();
-                    odin_skip = bundle_odin_reused ? "reuse" : "ok";
+                    if (bundle_odin_reused)
+                    {
+                        *odin_pub_only = odin_cloud;
+                        odin_skip = "reuse";
+                    }
+                    else
+                    {
+                        feats_undistort->points.insert(feats_undistort->points.end(),
+                                                       odin_cloud.points.begin(), odin_cloud.points.end());
+                        feats_undistort->width = feats_undistort->size();
+                        feats_undistort->height = 1;
+                        odin_skip = "ok";
+                    }
                 }
                 else
                     odin_skip = "deskew_fail";
@@ -1547,10 +1564,24 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
-            if (scan_pub_en)
-                                                 publish_frame_world(pubLaserCloudFull);
+            // Merge display-only reused Odin for body/world topics (not IEKF).
+            PointCloudXYZI::Ptr pub_cloud;
+            if (!odin_pub_only->empty())
+            {
+                pub_cloud.reset(new PointCloudXYZI(
+                    dense_pub_en ? *feats_undistort : *feats_down_body));
+                pub_cloud->points.insert(pub_cloud->points.end(),
+                                        odin_pub_only->points.begin(),
+                                        odin_pub_only->points.end());
+                pub_cloud->width = pub_cloud->size();
+                pub_cloud->height = 1;
+            }
 
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            if (scan_pub_en)
+                publish_frame_world(pubLaserCloudFull, pub_cloud);
+
+            if (scan_pub_en && scan_body_pub_en)
+                publish_frame_body(pubLaserCloudFull_body, pub_cloud);
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
             }
