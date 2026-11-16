@@ -181,10 +181,10 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 
 紧耦合 + 干净 Global（当前）：
 
-1. **|end_dt|≤80ms** 的新鲜 Odin 进 **IEKF**（紧耦合）；相位过大 → `skip=phase_wide`，只显示。
-2. **Global**：Mid 全进；Odin 仅当与同帧 Mid 的 NN≤`global_odin_nn_m`(0.08m) 才写入（去掉双层脏墙）。
-3. Odin deskew：`UndistortOdinWithMidImu`（`T_L2` + Mid IMUpose）。
-4. `global_map_leaf_size=0.25`；复用 Odin 仍只显示。
+1. Odin deskew 回 **aa15460 `UndistortOdinNative`**（追 Mid-end）+ `T_L2`。
+2. **|end_dt|≤100ms** 新鲜 Odin 进 **IEKF**；过宽 → 只显示。复用 Odin 只显示。
+3. **Global 只写 Mid**（去掉逐帧 KD，避免卡顿 `drop_stale_mid` 把图画糊）。body 仍可看双雷达。
+4. `Tz=0.1587`，`global_map_leaf_size=0.2`。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 
