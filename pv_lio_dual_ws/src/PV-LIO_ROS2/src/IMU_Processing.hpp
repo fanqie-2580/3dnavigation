@@ -294,25 +294,9 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
   else
     mean_acc2 = V3D(0, 0, G_m_s2);
   const double acc_scale = G_m_s2 / std::max(1e-3, mean_acc2.norm());
-  // Gravity in Mid UndistortPcl form (aw = R*f + g_world) stabilizes body Z
-  // when still, but mean_acc over a moving window contaminates g_world and
-  // caused visible pose/map drift. Use aa15460 accel while moving; only add
-  // g_world when this Odin IMU window is nearly still (|w| small).
-  double mean_w = 0.0;
-  int n_w = 0;
-  for (const auto &im : meas.imu2)
-  {
-    mean_w += std::sqrt(im->angular_velocity.x * im->angular_velocity.x +
-                        im->angular_velocity.y * im->angular_velocity.y +
-                        im->angular_velocity.z * im->angular_velocity.z);
-    ++n_w;
-  }
-  if (n_w > 0)
-    mean_w /= static_cast<double>(n_w);
-  const bool stillish = mean_w < 0.08; // rad/s
-  V3D g_world = Zero3d;
-  if (stillish && mean_acc2.norm() > 1.0)
-    g_world = -mean_acc2.normalized() * G_m_s2;
+  // aa15460 tight-couple deskew: integrate Odin-native accel (scaled), no
+  // gravity term. Gravity-subtract / stillish gating warped Mid↔Odin relative
+  // geometry and made IEKF drift under dual fusion.
   const M3D R_LI = Odin_Lidar_R_wrt_IMU;
   const V3D T_LI = Odin_Lidar_T_wrt_IMU;
   const M3D R_IL = R_LI.transpose();
@@ -343,7 +327,7 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
     const double dt = t_tail - std::max(t_head, last_t);
     if (dt <= 1e-9) { if (hit_end) break; continue; }
     R = R * Exp(w, dt);
-    const V3D aw = R * a + g_world;
+    const V3D aw = R * a;
     pos += vel * dt + .5 * aw * dt * dt;
     vel += aw * dt; angvel = w; acc_s = aw; last_t = t_tail;
     poses.push_back(set_pose6d(last_t - beg, acc_s, angvel, vel, pos, R));

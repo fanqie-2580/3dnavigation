@@ -1337,8 +1337,9 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
             const char *odin_skip = "none";
-            // Reused Odin is display-only: feeding the same scan into IEKF/map
-            // at several Mid-ends pulled pose and looked like drift.
+            // Tight couple: fresh Odin enters IEKF + Global with Mid.
+            // Reused Odin (rate gap fill) is display-only — same scan in IEKF
+            // at multiple Mid-ends caused pose drift.
             PointCloudXYZI::Ptr odin_pub_only(new PointCloudXYZI());
 
             if (!multi_lidar_en)
@@ -1354,8 +1355,8 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Deskew Odin to Mid-end on Odin clock so both clouds share the
-                // same end pose before T_L2 and world insert (fixes turn smear).
+                // Deskew Odin to Mid-end on Odin clock so both share end pose
+                // before T_L2 (tight couple + no turn smear).
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
                 if (p_imu->UndistortOdinNative(odin_cloud, Measures,
@@ -1376,7 +1377,8 @@ int main(int argc, char** argv)
                     else
                     {
                         feats_undistort->points.insert(feats_undistort->points.end(),
-                                                       odin_cloud.points.begin(), odin_cloud.points.end());
+                                                       odin_cloud.points.begin(),
+                                                       odin_cloud.points.end());
                         feats_undistort->width = feats_undistort->size();
                         feats_undistort->height = 1;
                         odin_skip = "ok";
