@@ -14,8 +14,8 @@
       lidar2_max_sync_dt: 0.15
       lidar2_soft_wait_sec: 0.15
       lidar2_reuse_max_age: 0.22
-      # |end_dt|>100ms: skip Odin in IEKF (still on body).
-      lidar2_fuse_max_end_dt: 0.10
+      # Kept for logs/compat; IEKF no longer phase-gates (toggling caused drift).
+      lidar2_fuse_max_end_dt: 0.15
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
@@ -48,13 +48,13 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Restore CAD/ground Tz (0.1587); 0.09 was over-corrected under bad deskew.
-      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.1587]
-      # Ry(-15°)=原-13°向上抬共2°(符号已按视觉改正); roll 向右 Rx(+0.5°); R=Rx@Ry.
-      extrinsic_R_L2_wrt_L1: [0.9659258, 0.0000000, -0.2588190, -0.0022586, 0.9999619, -0.0084292, 0.2588092, 0.0087265, 0.9658890]
+      # Live body NN sweep (static): Ry=-14.5 Rx=+0.25, Tz↓; p50 ~10cm (was ~13cm).
+      extrinsic_T_L2_wrt_L1: [0.14, -0.04, 0.11]
+      extrinsic_R_L2_wrt_L1: [0.9681476, 0.0000000, -0.2503800, -0.0010925, 0.9999905, -0.0042243, 0.2503776, 0.0043633, 0.9681384]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      lidar2_cov_scale: 4.0
+      # Soften Odin in IEKF while residual remains (still fused every good pair).
+      lidar2_cov_scale: 40.0
     noise_model:
       ranging_cov: 0.04
       angle_cov: 0.1

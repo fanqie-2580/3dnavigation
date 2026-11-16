@@ -1362,17 +1362,18 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // aa15460 deskew (Odin IMU → Mid-end) + T_L2. Mid-IMU deskew +
-                // per-frame KD Global filter caused lag (drop_stale_mid) and a
-                // smeared map; restore Native deskew for tight couple.
+                // aa15460 Native deskew + T_L2. Do NOT phase-gate IEKF: toggling
+                // Mid-only ↔ dual (phase_wide) made the path jagged / "漂".
+                // Reuse stays display-only. Soften Odin via lidar2_cov_scale.
+                // Only chase Mid-end when |end_dt| is small; chasing across
+                // 100–200ms Mid/Odin phase paints ghosts and inflates NN.
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                const bool phase_ok =
-                    !bundle_odin_reused &&
-                    std::fabs(bundle_end_dt) <= lidar2_fuse_max_end_dt;
+                const double chase_end =
+                    (std::abs(bundle_end_dt) <= 0.05) ? mid_end_on_odin : -1.0;
                 if (p_imu->UndistortOdinNative(odin_cloud, Measures,
                                                V3D::Zero(), V3D::Zero(),
-                                               mid_end_on_odin))
+                                               chase_end))
                 {
                     Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
                     T.block<3, 3>(0, 0) = LiDAR2_R_wrt_LiDAR1;
@@ -1385,11 +1386,6 @@ int main(int argc, char** argv)
                     {
                         *odin_pub_only = odin_cloud;
                         odin_skip = "reuse";
-                    }
-                    else if (!phase_ok)
-                    {
-                        *odin_pub_only = odin_cloud;
-                        odin_skip = "phase_wide";
                     }
                     else
                     {

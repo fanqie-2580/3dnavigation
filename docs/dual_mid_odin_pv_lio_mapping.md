@@ -181,10 +181,11 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 
 紧耦合 + 干净 Global（当前）：
 
-1. Odin deskew 回 **aa15460 `UndistortOdinNative`**（追 Mid-end）+ `T_L2`。
-2. **|end_dt|≤100ms** 新鲜 Odin 进 **IEKF**；过宽 → 只显示。复用 Odin 只显示。
-3. **Global 只写 Mid**（去掉逐帧 KD，避免卡顿 `drop_stale_mid` 把图画糊）。body 仍可看双雷达。
-4. `Tz=0.1587`，`global_map_leaf_size=0.2`。
+1. Odin deskew：**aa15460 `UndistortOdinNative`** + `T_L2`。
+2. 新鲜配对 **始终进 IEKF**（禁止 `phase_wide` 门控——Mid-only/双雷达切换会让轨迹锯齿“漂”）。复用只显示。
+3. 仅当 `|end_dt|≤50ms` 才 chase Mid-end 去畸变；相位拉开时 deskew 到 Odin 自身 end，避免重影。
+4. `lidar2_cov_scale=40` 软化 Odin 拉扯；外参 live 标定 **Ry=-14.5° / Rx=+0.25° / T≈[0.14,-0.04,0.11]**。
+5. **Global 只写 Mid**；body 仍可看双雷达（白点含 Odin，相对 Global 可能略偏，不等于位姿漂）。看图干净度时建议先只开 Global。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 
@@ -306,4 +307,4 @@ colcon build --symlink-install --packages-select pv_lio --allow-overriding pv_li
 
 - 翻滚 **向右** → `Rx(+)`
 - 翻滚 **往左** → `Rx(-)`
-- 俯仰 **向上抬** → `Ry` 更负（如 -13° → -14°）
+- 俯仰 **向上抬** → `Ry` 更负（如 -14° → -15°）
