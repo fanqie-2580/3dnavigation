@@ -194,7 +194,7 @@ int publish_max_voxel_layer = 0;
 double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
 // Dual Global insert: keep Odin in the map, but Mid wins overlapping body voxels
 // so residual T_L2 (~cm) does not double walls; Odin only fills Mid-empty cells.
-bool global_map_mid_prefer = true;
+bool global_map_mid_prefer = false;
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -450,6 +450,38 @@ bool sync_packages(MeasureGroup &meas)
     static bool odin_selected = false;
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
+
+    // Dual fusion (~50k pts/frame) can fall tens–hundreds of seconds behind.
+    // Odin buffer is only ~50 frames (~10s), so a lagged Mid scan can NEVER
+    // pair → perpetual skip=unpaired and /cloud_registered_body loses Odin.
+    // Drop stale Mid (and matching old IMU) to stay near realtime.
+    {
+        const double max_mid_lag_sec = 0.50;
+        int dropped = 0;
+        while (lidar_buffer.size() > 1 &&
+               (last_timestamp_lidar - time_buffer.front()) > max_mid_lag_sec)
+        {
+            const double drop_end = time_buffer.front() + 0.15;
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            while (!imu_buffer.empty() &&
+                   rclcpp::Time(imu_buffer.front()->header.stamp).seconds() < drop_end)
+                imu_buffer.pop_front();
+            lidar_pushed = false;
+            ++dropped;
+        }
+        if (dropped > 0)
+        {
+            static int lag_drop_log = 0;
+            if ((++lag_drop_log % 20) == 1)
+                std::cout << "[pv-dual] drop_stale_mid n=" << dropped
+                          << " mid_buf=" << lidar_buffer.size()
+                          << " odin_buf=" << lidar_buffer2.size()
+                          << " lag_ms="
+                          << (last_timestamp_lidar - time_buffer.front()) * 1000.0
+                          << std::endl;
+        }
+    }
 
     auto fill_odin = [&](size_t i, double score, double signed_dt, double end_dt) {
         auto cloud = lidar_buffer2[i];
@@ -1116,7 +1148,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
-    node->declare_parameter<bool>("publish.global_map_mid_prefer", true);
+    node->declare_parameter<bool>("publish.global_map_mid_prefer", false);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
@@ -1319,10 +1351,10 @@ int main(int argc, char** argv)
                 odin_skip = tag;
             };
             auto hold_odin = [&](const char *tag) -> bool {
-                // soft_wait makes wall-gap from last ok often ~0.25–0.35s.
+                // Bridge brief unpaired gaps; hold frames are gated out of Global.
                 if (last_odin_fused && !last_odin_fused->empty() &&
                     last_odin_fused_wall > 0.0 &&
-                    (now_wall - last_odin_fused_wall) <= 0.40)
+                    (now_wall - last_odin_fused_wall) <= 1.0)
                 {
                     PointCloudXYZI hold = *last_odin_fused;
                     append_odin_body(hold, tag);

@@ -65,8 +65,9 @@
       publish_max_voxel_layer: 1
       # Official has no Global leaf; 0.2 looked sparse. 0.1 ≈ dense indoor scans.pcd.
       global_map_leaf_size: 0.1
-      # Mid wins overlap voxels; Odin still enters Global where Mid has no hit (keep Odin FOV).
-      global_map_mid_prefer: true
+      # false: insert Mid+Odin both into Global (user needs Odin visible in map).
+      # true: Mid wins overlap voxels (cuts blur but hid most Odin indoors).
+      global_map_mid_prefer: false
       path_en: true
       scan_publish_en: true
       dense_publish_en: true
