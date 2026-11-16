@@ -1224,10 +1224,12 @@ int main(int argc, char** argv)
     auto tf_br = std::make_shared<tf2_ros::TransformBroadcaster>(node);
 
     PointCloudXYZI::Ptr global_pending_t(new PointCloudXYZI());
-    PointCloudXYZI::Ptr global_chunk_t(new PointCloudXYZI());
-    PointCloudXYZI::Ptr global_pub_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_merged_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_filtered_t(new PointCloudXYZI());
 
-    // Timer: voxelize ONLY new points, append to permanent map, publish full map.
+    // Timer: merge pending into map, then VoxelGrid the WHOLE map so density is
+    // uniform. Per-chunk-only voxelize left "一团一团" clumps (same cells kept
+    // multiple points across seconds). leaf=0.2 + drop_stale keeps this cheap.
     auto timer = node->create_wall_timer(1s,
         [&]()
         {
@@ -1237,30 +1239,30 @@ int main(int argc, char** argv)
                     return;
                 global_pending_t.swap(global_cloud_map_pending);
                 global_cloud_map_pending.reset(new PointCloudXYZI());
-                *global_pub_t = *global_cloud_map;
+                *global_merged_t = *global_cloud_map;
             }
             if (!global_pending_t->empty())
-            {
-                downSizeFilterGlobal.setInputCloud(global_pending_t);
-                downSizeFilterGlobal.filter(*global_chunk_t);
-                if (global_chunk_t->empty())
-                    *global_chunk_t = *global_pending_t;
-                *global_pub_t += *global_chunk_t;
-                {
-                    std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                    *global_cloud_map += *global_chunk_t;
-                }
-            }
+                *global_merged_t += *global_pending_t;
             global_pending_t.reset(new PointCloudXYZI());
-            global_chunk_t.reset(new PointCloudXYZI());
-            if (global_pub_t->empty()) return;
+            if (global_merged_t->empty()) return;
+
+            downSizeFilterGlobal.setInputCloud(global_merged_t);
+            downSizeFilterGlobal.filter(*global_filtered_t);
+            if (global_filtered_t->empty())
+                global_filtered_t.swap(global_merged_t);
+            {
+                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                *global_cloud_map = *global_filtered_t;
+            }
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
-            pcl::toROSMsg(*global_pub_t, laserCloudmsg);
+            pcl::toROSMsg(*global_filtered_t, laserCloudmsg);
             // Points are camera_init coords. stamp=now()+frame world made RViz
             // re-apply latest TF to historical map → motion smear illusion.
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
             laserCloudmsg.header.frame_id = "camera_init";
             pubGlobalCloudMap->publish(laserCloudmsg);
+            global_merged_t.reset(new PointCloudXYZI());
+            global_filtered_t.reset(new PointCloudXYZI());
         }
     );
 //------------------------------------------------------------------------------------------------------
