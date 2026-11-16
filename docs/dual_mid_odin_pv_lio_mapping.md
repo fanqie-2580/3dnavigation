@@ -185,7 +185,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 1. Odin deskew：**静止不去畸变；运动 gyro-only**，目标时刻 **chase Mid-end**（禁止 accel 积分）。
 2. **真紧耦合**：配对成功即进 `feats_undistort` → IEKF + voxel_map；`lidar2_cov_scale=4`。
 3. 同步窗宽：`max_sync_dt=0.20` / `soft_wait=0.18`；空档 `hold` 上一帧（Global 跳过 hold）。
-4. 外参地面标定：**Ry≈-13.8° / T≈[0.132,-0.010,0.129]**（相对 -13°/0.159，Tz↓3cm、俯仰再俯 0.8°）；yaml **RowMajor**。
+4. 外参地面标定：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**（相对 -13°/0.159，Tz 共↓6cm、俯仰再俯 0.8°）；yaml **RowMajor**。
 5. `ok_nodeskew` 仅当静止且 `|end_dt|≤30ms`；更宽相位仍 gyro-only chase Mid-end（防地面双层）。
 6. Global：融合 dense 点直接累加（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
 
