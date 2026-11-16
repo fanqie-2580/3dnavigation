@@ -1355,18 +1355,13 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Deskew Odin to Mid-end on Odin clock so both share end pose
-                // before T_L2 (tight couple + no turn smear).
-                const double mid_end_on_odin =
-                    Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                if (p_imu->UndistortOdinNative(odin_cloud, Measures,
-                                               V3D::Zero(), V3D::Zero(),
-                                               mid_end_on_odin))
+                // Tight couple: T_L2 + deskew on Mid IMUpose (same as Mid).
+                // Separate Odin-IMU deskew left ~12cm residual and vertical
+                // Global smear under IEKF fusion.
+                if (p_imu->UndistortOdinWithMidImu(
+                        odin_cloud, Measures, kf, LiDAR2_R_wrt_LiDAR1,
+                        LiDAR2_T_wrt_LiDAR1, lidar2_stamp_bias_sec))
                 {
-                    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-                    T.block<3,3>(0,0)=LiDAR2_R_wrt_LiDAR1;
-                    T.block<3,1>(0,3)=LiDAR2_T_wrt_LiDAR1;
-                    pcl::transformPointCloud(odin_cloud, odin_cloud, T);
                     for (auto &pt:odin_cloud.points) pt.intensity = 200.0f;
                     odin_used_now = odin_cloud.size();
                     if (bundle_odin_reused)

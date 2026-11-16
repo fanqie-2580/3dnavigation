@@ -182,8 +182,9 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 紧耦合策略（当前）：
 
 1. **新鲜配对的 Odin 进 IEKF + Global**（与 Mid 紧耦合）。
-2. **复用 Odin（补 5–6Hz 空档）只进 body/world 显示**，不进 IEKF（同一帧多次更新会漂）。
-3. Odin deskew 回到 **aa15460**：原生加速度、**不加重力项**（重力修正在紧耦合下会拉歪 Mid↔Odin）。
+2. **复用 Odin（补 5–6Hz 空档）只进 body/world 显示**，不进 IEKF。
+3. Odin deskew：`UndistortOdinWithMidImu`——先 `T_L2`，再用 **Mid 的 IMUpose** 去畸变（与 Mid 同一运动轨迹）。独立 Odin-IMU deskew 会在紧耦合下造成竖向拖影/双层墙。
+4. `extrinsic_T_L2_wrt_L1.z≈0.116`（按 body Mid−Odin Δz 残差下调）。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 

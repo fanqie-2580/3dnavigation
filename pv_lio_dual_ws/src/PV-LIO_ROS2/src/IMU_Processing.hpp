@@ -56,6 +56,13 @@ class ImuProcess
   bool UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &meas,
                            const V3D &bg, const V3D &ba,
                            double target_end_time = -1.0);
+  // Tight-couple deskew: apply T_L2 then undistort with Mid IMUpose (same
+  // trajectory as Mid UndistortPcl). Avoids dual-IMU relative warp that was
+  // pulling IEKF and painting vertical Global ghosts.
+  bool UndistortOdinWithMidImu(PointCloudXYZI &cloud, const MeasureGroup &meas,
+                               esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
+                               const M3D &R_L2_wrt_L1, const V3D &T_L2_wrt_L1,
+                               double stamp_bias_sec);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -387,6 +394,68 @@ bool ImuProcess::UndistortOdinNative(PointCloudXYZI &cloud, const MeasureGroup &
       auto &pt=cloud.points[order[i]];
       const double t=static_cast<double>(pt.curvature)/1000.0;
       apply_pose(pt,t,R_imu,pos_imu,vel_imu,acc_imu,gyr_imu,head->offset_time);
+    }
+  }
+  return true;
+}
+
+bool ImuProcess::UndistortOdinWithMidImu(
+    PointCloudXYZI &cloud, const MeasureGroup &meas,
+    esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
+    const M3D &R_L2_wrt_L1, const V3D &T_L2_wrt_L1, double stamp_bias_sec)
+{
+  if (cloud.points.empty() || IMUpose.size() <= 1)
+    return false;
+  const double mid_beg = meas.lidar_beg_time;
+  const double mid_end = meas.lidar_end_time;
+  const double odin_beg = meas.lidar_beg_time2;
+  const double mid_span = std::max(1e-3, mid_end - mid_beg);
+  // 1) Odin lidar → Mid lidar (rigid T_L2). Remap curvature onto Mid scan
+  // timeline; clamp into [0, mid_span] so phase offset does not drop most
+  // points (dropping caused fused≪odin_in and intermittent deskew_fail).
+  for (auto &pt : cloud.points)
+  {
+    const V3D p_o(pt.x, pt.y, pt.z);
+    const V3D p_m = R_L2_wrt_L1 * p_o + T_L2_wrt_L1;
+    const double t_abs = odin_beg + stamp_bias_sec + pt.curvature / 1000.0;
+    const double offs = std::max(0.0, std::min(t_abs - mid_beg, mid_span));
+    pt.x = static_cast<float>(p_m(0));
+    pt.y = static_cast<float>(p_m(1));
+    pt.z = static_cast<float>(p_m(2));
+    pt.curvature = static_cast<float>(offs * 1000.0);
+  }
+  sort(cloud.points.begin(), cloud.points.end(), time_list);
+
+  // 2) Same backward deskew as Mid UndistortPcl → Mid-lidar @ mid_end.
+  state_ikfom imu_state = kf_state.get_x();
+  auto it_pcl = cloud.points.end() - 1;
+  for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
+  {
+    auto head = it_kp - 1;
+    auto tail = it_kp;
+    M3D R_imu;
+    V3D vel_imu, pos_imu, acc_imu, angvel_avr;
+    R_imu << MAT_FROM_ARRAY(head->rot);
+    vel_imu << VEC_FROM_ARRAY(head->vel);
+    pos_imu << VEC_FROM_ARRAY(head->pos);
+    acc_imu << VEC_FROM_ARRAY(tail->acc);
+    angvel_avr << VEC_FROM_ARRAY(tail->gyr);
+    for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--)
+    {
+      const double dt = it_pcl->curvature / double(1000) - head->offset_time;
+      M3D R_i(R_imu * Exp(angvel_avr, dt));
+      V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
+      V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);
+      V3D P_compensate =
+          imu_state.offset_R_L_I.conjugate() *
+          (imu_state.rot.conjugate() *
+               (R_i * (imu_state.offset_R_L_I * P_i + imu_state.offset_T_L_I) + T_ei) -
+           imu_state.offset_T_L_I);
+      it_pcl->x = P_compensate(0);
+      it_pcl->y = P_compensate(1);
+      it_pcl->z = P_compensate(2);
+      if (it_pcl == cloud.points.begin())
+        break;
     }
   }
   return true;
