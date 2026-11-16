@@ -175,15 +175,16 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 日志里正常配对示例：
 
 ```text
-[pv-dual] ... odin_used=20xxx ... skip=ok
-[pv-dual] ... odin_used=20xxx ... skip=reuse   # Mid 空档复用上一帧 Odin 并 deskew 到本 Mid-end
+[pv-dual] ... odin_used=20xxx ... skip=ok         # IEKF + Body/Global
+[pv-dual] ... odin_used=20xxx ... skip=disp_only  # 仅 Body/Global（chase Mid-end）
+[pv-dual] ... odin_used=0 ... skip=phase_wide     # |end_dt|>80ms，本帧不画 Odin
 ```
 
 紧耦合 + 干净 Global（当前）：
 
 1. Odin deskew：**aa15460 `UndistortOdinNative`** + `T_L2`。
-2. **IEKF 硬门控**：仅 `|end_dt|≤40ms` 且**每个 Odin 扫描最多融合一次**（`dup_odin`/`phase_wide`/`reuse` 只显示）。去掉滞回——armed 时仍把 50–80ms 帧融进 IEKF 是“还漂一点”的主因。
-3. 对齐帧 chase Mid-end；其它帧 deskew 到 Odin end 仅用于 body 显示。
+2. **IEKF 硬门控**：仅 `|end_dt|≤40ms` 且每 Odin 扫描最多一次。
+3. **Body/Global 显示门控**：仅 `|end_dt|≤80ms` 且 **chase Mid-end** 才画 Odin；更宽相位（`phase_wide`/`reuse_wide`）本帧不画 Odin，避免 deskew-to-Odin-end + Mid 位姿造成 Odin 拖影。
 4. `lidar2_cov_scale=80`。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
 5. **IEKF voxel 地图只写 Mid**（Odin 可进当帧残差，但不入库，避免 10cm+ 外参残差污染匹配面）。**Global** 显示：重叠 ≤`nn`0.08m 或 Mid 盲区 ≥`free`0.45m；分通道 VoxelGrid。
 

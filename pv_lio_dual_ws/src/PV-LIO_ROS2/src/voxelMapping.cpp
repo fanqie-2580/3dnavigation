@@ -104,6 +104,7 @@ double lidar2_bias_ema = 0.05;             // online stamp-bias adaptation rate
 double lidar2_cov_scale = 4.0;
 double lidar2_reuse_max_age = 0.22;        // re-deskew last Odin across Mid-only gaps
 double lidar2_fuse_max_end_dt = 0.10;      // |end_dt| above → skip Odin in IEKF
+double lidar2_display_max_end_dt = 0.08;   // Body/Global Odin only if Mid-end chase OK
 double global_odin_nn_m = 0.0;             // overlap keep if NN Mid <= this
 double global_odin_free_m = 0.45;          // keep Odin if no Mid within this (FOV-only)
 double bundle_center_dt = 0.0;             // last Mid↔Odin end/center residual (signed)
@@ -1066,6 +1067,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("common.lidar2_bias_ema", 0.05);
     node->declare_parameter<double>("common.lidar2_reuse_max_age", 0.22);
     node->declare_parameter<double>("common.lidar2_fuse_max_end_dt", 0.08);
+    node->declare_parameter<double>("common.lidar2_display_max_end_dt", 0.08);
     node->get_parameter("common.multi_lidar_en", multi_lidar_en);
     node->get_parameter("common.lid_topic2", lid_topic2);
     node->get_parameter("common.imu_topic2", imu_topic2);
@@ -1075,6 +1077,9 @@ int main(int argc, char** argv)
     node->get_parameter("common.lidar2_bias_ema", lidar2_bias_ema);
     node->get_parameter("common.lidar2_reuse_max_age", lidar2_reuse_max_age);
     node->get_parameter("common.lidar2_fuse_max_end_dt", lidar2_fuse_max_end_dt);
+    node->get_parameter("common.lidar2_display_max_end_dt", lidar2_display_max_end_dt);
+    if (lidar2_display_max_end_dt < lidar2_fuse_max_end_dt)
+        lidar2_display_max_end_dt = lidar2_fuse_max_end_dt;
 
     // mapping algorithm params
     node->declare_parameter<double>("mapping.det_range", 300.0);
@@ -1397,29 +1402,34 @@ int main(int argc, char** argv)
             else
             {
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
-                // Remaining "漂一点" root causes after soft cov / loose hysteresis:
-                // 1) Hysteresis kept IEKF armed and still fused |end_dt| up to
-                //    fuse_exit (~80ms). Mid-end chase over that window injects
-                //    Δt×ω residual (Z path span ~1m in minutes).
-                // 2) Mid10/Odin5 beat flips Mid-only↔dual every good phase,
-                //    re-using the same Odin scan on a later Mid-end.
-                // Fix: hard |end_dt| gate every frame + fuse each Odin beg once.
+                // Odin "有时漂" root cause: phase_wide/reuse deskewed to Odin-end
+                // then published/Global-inserted with Mid-end pose → Δt×ω smear
+                // (see UndistortOdinNative comment). Never show/map Odin unless
+                // Mid-end chase is valid. IEKF still harder-gated + once-per-scan.
                 const double edt = std::abs(bundle_end_dt);
                 const double fuse_max = std::max(0.02, lidar2_fuse_max_end_dt);
+                const double disp_max =
+                    std::max(fuse_max, lidar2_display_max_end_dt);
                 const bool same_odin_again =
                     (last_iekf_odin_beg > 0.0) &&
                     std::fabs(Measures.lidar_beg_time2 - last_iekf_odin_beg) < 1e-3;
+                const bool can_chase = (edt <= disp_max);
                 const bool iekf_ok =
                     !bundle_odin_reused &&
                     !same_odin_again &&
                     (edt <= fuse_max);
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
-                // IEKF frames must chase Mid-end; display-only uses native end.
-                const double chase_end = iekf_ok ? mid_end_on_odin : -1.0;
-                if (p_imu->UndistortOdinNative(odin_cloud, Measures,
-                                               V3D::Zero(), V3D::Zero(),
-                                               chase_end))
+                // Chase Mid-end whenever we will show or fuse Odin.
+                const double chase_end = can_chase ? mid_end_on_odin : -1.0;
+                if (!can_chase)
+                {
+                    // Skip publish/Global for this Odin — Mid-only this frame.
+                    odin_skip = bundle_odin_reused ? "reuse_wide" : "phase_wide";
+                }
+                else if (p_imu->UndistortOdinNative(odin_cloud, Measures,
+                                                    V3D::Zero(), V3D::Zero(),
+                                                    chase_end))
                 {
                     Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
                     T.block<3, 3>(0, 0) = LiDAR2_R_wrt_LiDAR1;
@@ -1440,13 +1450,14 @@ int main(int argc, char** argv)
                     }
                     else
                     {
+                        // Mid-chased display only (Body/Global), not IEKF.
                         *odin_pub_only = odin_cloud;
                         if (bundle_odin_reused)
                             odin_skip = "reuse";
                         else if (same_odin_again)
                             odin_skip = "dup_odin";
                         else
-                            odin_skip = "phase_wide";
+                            odin_skip = "disp_only";
                     }
                 }
                 else
@@ -1657,7 +1668,7 @@ int main(int argc, char** argv)
                     else
                         mid_body->push_back(pt);
                 }
-                // Display-only Odin (phase_wide/reuse) can still densify Global.
+                // Mid-chased display-only Odin (disp_only/reuse/dup) densifies Global.
                 if (odin_pub_only && !odin_pub_only->empty())
                     odin_body->points.insert(odin_body->points.end(),
                                              odin_pub_only->points.begin(),
@@ -1749,7 +1760,7 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
-            // Merge display-only reused Odin for body/world topics (not IEKF).
+            // Merge Mid-chased display-only Odin for body/world (not IEKF).
             PointCloudXYZI::Ptr pub_cloud;
             if (!odin_pub_only->empty())
             {

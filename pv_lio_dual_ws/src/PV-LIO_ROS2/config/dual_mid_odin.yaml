@@ -14,8 +14,10 @@
       lidar2_max_sync_dt: 0.15
       lidar2_soft_wait_sec: 0.15
       lidar2_reuse_max_age: 0.22
-      # Hard IEKF |end_dt| gate (no hysteresis). >40ms Mid-end chase warps pose.
+      # Hard IEKF |end_dt| gate. Body/Global Odin require Mid-end chase too.
       lidar2_fuse_max_end_dt: 0.04
+      # Do not paint Odin at Mid pose when |end_dt| larger (causes Odin smear).
+      lidar2_display_max_end_dt: 0.08
       lidar2_bias_ema: 0.0
     preprocess:
       lidar_type: 1
