@@ -1528,17 +1528,23 @@ int main(int argc, char** argv)
                     *global_cloud_map_pending += *world_lidar;
                 }
 
+                // IEKF voxel map must stay Mid-only. Odin (~10–14cm residual)
+                // permanently pollutes match surfaces → slow pose "漂".
                 std::vector<pointWithCov> pv_list;
+                PointCloudXYZI::Ptr world_mid_init(new PointCloudXYZI);
+                if (mid_init->empty())
+                    *mid_init = *feats_undistort;
+                transformLidar(state_point, mid_init, world_mid_init);
 
                 std::cout << kf.get_P() << std::endl;
 
-                for (size_t i = 0; i < world_lidar->size(); i++) {
+                for (size_t i = 0; i < world_mid_init->size(); i++) {
                     pointWithCov pv;
-                    pv.point << world_lidar->points[i].x, world_lidar->points[i].y,
-                            world_lidar->points[i].z;
-                    V3D point_this(map_init->points[i].x,
-                                   map_init->points[i].y,
-                                   map_init->points[i].z);
+                    pv.point << world_mid_init->points[i].x, world_mid_init->points[i].y,
+                            world_mid_init->points[i].z;
+                    V3D point_this(mid_init->points[i].x,
+                                   mid_init->points[i].y,
+                                   mid_init->points[i].z);
                     if (point_this[2] == 0) {
                         point_this[2] = 0.001;
                     }
@@ -1710,7 +1716,12 @@ int main(int argc, char** argv)
             Eigen::Quaterniond ext_q(ext_q_coeffs[3], ext_q_coeffs[0], ext_q_coeffs[1], ext_q_coeffs[2]);
             Eigen::Matrix3d ext_R = ext_q.toRotationMatrix();
             (void)ext_t; (void)ext_R;
+            // Map maintenance Mid-only. Odin may still enter IEKF residual this
+            // frame, but must not be written into voxel_map (extrinsic residual
+            // otherwise becomes permanent "ghost walls" Mid keeps matching).
             for (size_t i = 0; i < feats_down_body->size(); i++) {
+                if (feats_down_body->points[i].intensity >= 199.5f)
+                    continue;
                 pointWithCov pv;
                 pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
                 M3D cov_lidar = var_down_body[i];

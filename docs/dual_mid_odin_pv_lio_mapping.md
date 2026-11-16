@@ -185,7 +185,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 2. **IEKF 硬门控**：仅 `|end_dt|≤40ms` 且**每个 Odin 扫描最多融合一次**（`dup_odin`/`phase_wide`/`reuse` 只显示）。去掉滞回——armed 时仍把 50–80ms 帧融进 IEKF 是“还漂一点”的主因。
 3. 对齐帧 chase Mid-end；其它帧 deskew 到 Odin end 仅用于 body 显示。
 4. `lidar2_cov_scale=80`。外参 **Ry=-14° / T≈[0.14,-0.02,0.09]**。
-5. **Global**：Mid 全写；Odin 在距 Mid ≤`nn`(0.15m) **或** ≥`free`(0.45m，Mid 照不到的区域) 时写入，中间带丢弃防重影。1Hz Mid/Odin **分通道 VoxelGrid** 保留 intensity=200。RViz Global 用 Intensity 着色。
+5. **IEKF voxel 地图只写 Mid**（Odin 可进当帧残差，但不入库，避免 10cm+ 外参残差污染匹配面）。**Global** 显示：重叠 ≤`nn`0.08m 或 Mid 盲区 ≥`free`0.45m；分通道 VoxelGrid。
 
 `skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；当前代码有 `drop_stale_mid`，仍异常则重启建图节点。
 
