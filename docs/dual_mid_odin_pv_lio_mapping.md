@@ -187,9 +187,10 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 3. 同步窗宽：`max_sync_dt=0.20` / `soft_wait=0.18`；空档 `hold` 上一帧（Global 跳过 hold）。
 4. 外参地面标定：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**（相对 -13°/0.159，Tz 共↓6cm、俯仰再俯 0.8°）；yaml **RowMajor**。
 5. `ok_nodeskew` 仅当静止且 `|end_dt|≤30ms`；更宽相位仍 gyro-only chase Mid-end（防地面双层）。
-6. Global：融合 dense 点直接累加（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
+6. Global：新点进 pending，1Hz **只体素化新增**；`drop_stale_mid`（lag>0.5s）防 Mid 积压后 Odin 永久 `unpaired` 消失。
+7. `hold` 上一帧好 Odin ≤1.0s 填空档。
 
-`skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；重启建图节点。
+`skip=unpaired` 且 `odin_in=0`：先看是否在 `drop_stale_mid`；仍异常则重启建图。
 
 ---
 
