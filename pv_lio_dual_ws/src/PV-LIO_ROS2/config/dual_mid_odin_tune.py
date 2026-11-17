@@ -20,7 +20,8 @@ TUNE = {
     "odin_s2_gyr_gate": 0.12,      # rad/s; skip S2 when moving
     # Live: accept_s2 clip_r mean~0.82 → Odin≠Mid map but still densified (ghost walls).
     # FAST_LIO_MULTI / residual-outlier: reject S2 + skip Global Odin when clip high.
-    "odin_s2_max_clip_ratio": 0.55,
+    # Live later: reject_s2 clip_r~0.85; early accept~0.45 still painted Odin layers.
+    "odin_s2_max_clip_ratio": 0.40,
 
     # --- IEKF jump reject ---
     "iekf_max_upd": 0.08,          # m, Mid stage-1
@@ -33,11 +34,14 @@ TUNE = {
     "map_jump_upd": 0.05,          # m; still + large EKF step → skip Global
     "map_jump_frame": 0.12,        # reserved
     "map_max_range": 25.0,         # m; body-range clip for Global densify
-    "odin_global_insert_en": True,  # with require_s2 + clip gate (anti dual-wall)
-    # True: densify Odin only after accepted S2 (synced+good clip). Stops ok_map
-    # / ok_map_gyr painting dual walls (engcang/FAST_LIO_MULTI densify-when-fused).
+    # Point-LIO/FAST_LIO_MULTI: don't paint Global while moving (Mid smear).
+    "map_require_still": True,
+    "map_still_gyr": 0.12,         # rad/s; same order as S2 gyr gate
+    "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
+    "odin_global_insert_en": False,  # Mid-only Global until Mid↔Odin clip stays low
     "odin_global_require_s2": True,
-    "odin_body_pub_en": True,      # Body always can show Odin (alignment check)
+    # Body+misaligned Odin looked like drift even when Global Odin was gated.
+    "odin_body_pub_en": False,
 }
 
 

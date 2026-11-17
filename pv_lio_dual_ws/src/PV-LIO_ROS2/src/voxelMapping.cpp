@@ -132,10 +132,13 @@ double map_jump_upd = 0.05;
 double map_jump_frame = 0.12;
 int consec_bad_freeze = 2;
 float map_max_range = 25.0f;
-bool odin_global_insert_en = true;
+bool map_require_still = true;        // skip Global densify when moving
+double map_still_gyr = 0.12;          // rad/s
+bool map_use_downsample = true;       // Global Mid downs (not dense undistort)
+bool odin_global_insert_en = false;
 bool odin_global_require_s2 = true;   // densify Odin only after good S2
-double odin_s2_max_clip_ratio = 0.55; // reject S2 / densify if clip_r above
-bool odin_body_pub_en = true;
+double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
+bool odin_body_pub_en = false;
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
 int iekf_odin_res_clip = 0;
@@ -1225,6 +1228,9 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.map_jump_upd", map_jump_upd);
     node->declare_parameter<double>("dual_tune.map_jump_frame", map_jump_frame);
     node->declare_parameter<double>("dual_tune.map_max_range", map_max_range);
+    node->declare_parameter<bool>("dual_tune.map_require_still", map_require_still);
+    node->declare_parameter<double>("dual_tune.map_still_gyr", map_still_gyr);
+    node->declare_parameter<bool>("dual_tune.map_use_downsample", map_use_downsample);
     node->declare_parameter<bool>("dual_tune.odin_global_insert_en", odin_global_insert_en);
     node->declare_parameter<bool>("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->declare_parameter<double>("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
@@ -1258,6 +1264,9 @@ int main(int argc, char** argv)
         node->get_parameter("dual_tune.map_max_range", mr);
         map_max_range = static_cast<float>(mr);
     }
+    node->get_parameter("dual_tune.map_require_still", map_require_still);
+    node->get_parameter("dual_tune.map_still_gyr", map_still_gyr);
+    node->get_parameter("dual_tune.map_use_downsample", map_use_downsample);
     node->get_parameter("dual_tune.odin_global_insert_en", odin_global_insert_en);
     node->get_parameter("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->get_parameter("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
@@ -1267,7 +1276,8 @@ int main(int argc, char** argv)
               << " gyr=" << odin_s2_gyr_gate
               << " res=" << odin_max_residual
               << " clip_max=" << odin_s2_max_clip_ratio
-              << " cov_w=" << odin_info_weight
+              << " still=" << map_require_still
+              << " downs=" << map_use_downsample
               << " odin_global=" << odin_global_insert_en
               << " req_s2=" << odin_global_require_s2
               << " odin_body=" << odin_body_pub_en
@@ -1993,17 +2003,22 @@ int main(int argc, char** argv)
                 // permanently blocked all later inserts (ins_ok stuck at 0).
                 const bool jump_gate =
                     frame_quasi_static && (d_upd > map_jump_upd);
+                const bool motion_gate =
+                    map_require_still && (frame_gyr_mean >= map_still_gyr);
                 const char *skip_why = nullptr;
                 if (state_bad) { skip_why = "bad"; ++map_skip_bad; }
                 else if (fuse_is_hold) { skip_why = "hold"; ++map_skip_hold; }
                 else if (jump_gate) { skip_why = "jump"; ++map_skip_jump; }
+                else if (motion_gate) { skip_why = "motion"; ++map_skip_jump; }
                 (void)d_frame; (void)map_jump_frame;
 
                 if (skip_why == nullptr)
                 {
-                    // Global: Mid (from undistort) + full Odin (not IEKF subsample).
+                    // Point-LIO / FAST_LIO_MULTI: densify map with downs when still.
                     PointCloudXYZI::Ptr body_src =
-                        dense_pub_en ? feats_undistort : feats_down_body;
+                        map_use_downsample
+                            ? feats_down_body
+                            : (dense_pub_en ? feats_undistort : feats_down_body);
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     // FAST_LIO_MULTI-style: densify secondary only when fused well.
                     // Live root cause: ok_map/ok_map_gyr + high clip_r still painted

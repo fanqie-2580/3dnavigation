@@ -67,10 +67,12 @@
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
       # Keep 0.1: finer leaf + large pose span → PCL VoxelGrid integer overflow.
-      global_map_leaf_size: 0.1
+      # 0.15: coarser leaf reduces Mid-motion smear visibility (PCL-safe).
+      global_map_leaf_size: 0.15
       path_en: true
       scan_publish_en: true
-      dense_publish_en: true
+      # Point-LIO-style: downs for publish/Global density (anti smear).
+      dense_publish_en: false
       scan_bodyframe_pub_en: true
     pcd_save:
       pcd_save_en: false
