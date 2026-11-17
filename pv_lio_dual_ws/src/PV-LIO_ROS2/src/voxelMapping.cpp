@@ -2072,30 +2072,29 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
-            // Publish Mid + full Odin (hold is display-only; fresh uses odin_map_full).
-            PointCloudXYZI::Ptr pub_cloud;
-            if ((odin_display_only && !odin_display_only->empty()) ||
-                (odin_map_full && !odin_map_full->empty()))
+            // Publish: Mid always. Odin only when synced/S2 — same gate as Global
+            // densify (FAST_LIO_MULTI: don't stack secondary on unsynced Mid pose).
+            // Previously Body/cloud_registered always merged full Odin on ok_map /
+            // ok_map_gyr / hold → RViz double walls that looked like drift.
+            const bool odin_pub_ok = !fuse_is_hold && !state_bad &&
+                odin_map_full && !odin_map_full->empty() &&
+                (odin_s2_accepted ||
+                 (frame_gyr_mean < kOdinMapInsertGyr &&
+                  std::abs(bundle_end_dt) <= kOdinIekfMaxEndDt));
+            PointCloudXYZI::Ptr pub_cloud(new PointCloudXYZI());
             {
-                pub_cloud.reset(new PointCloudXYZI());
                 const auto &src = dense_pub_en ? *feats_undistort : *feats_down_body;
                 pub_cloud->points.reserve(
-                    src.size() +
-                    (odin_display_only ? odin_display_only->size() : 0) +
-                    (odin_map_full ? odin_map_full->size() : 0));
+                    src.size() + (odin_pub_ok ? odin_map_full->size() : 0));
                 for (const auto &pt : src.points)
                 {
                     if (pt.intensity >= 150.0f) continue;  // drop IEKF subsample
                     pub_cloud->points.push_back(pt);
                 }
-                if (odin_map_full && !odin_map_full->empty())
+                if (odin_pub_ok)
                     pub_cloud->points.insert(pub_cloud->points.end(),
                                             odin_map_full->points.begin(),
                                             odin_map_full->points.end());
-                else if (odin_display_only && !odin_display_only->empty())
-                    pub_cloud->points.insert(pub_cloud->points.end(),
-                                            odin_display_only->points.begin(),
-                                            odin_display_only->points.end());
                 pub_cloud->width = pub_cloud->size();
                 pub_cloud->height = 1;
             }
