@@ -198,6 +198,8 @@ std::string pcd_save_path;
 std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map;
 std::mutex global_cloud_map_mtx;
 PointCloudXYZI::Ptr global_cloud_map(new PointCloudXYZI());
+// New world points since last 1Hz tick; timer voxelizes ONLY these (anti-lag).
+PointCloudXYZI::Ptr global_cloud_map_pending(new PointCloudXYZI());
 pcl::VoxelGrid<PointType> downSizeFilterGlobal;
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -442,6 +444,37 @@ bool sync_packages(MeasureGroup &meas)
 {
     std::lock_guard<std::mutex> lk(mtx_buffer);
     if (lidar_buffer.empty() || imu_buffer.empty()) return false;
+    // If Mid queue lags, Odin buffer (~50 frames/~10s) is drained by the
+    // beg-time prune → perpetual unpaired and Odin vanishes after hold.
+    // Drop stale Mid (+IMU) so pairing stays near realtime. (Polka/aggregator
+    // pattern: drop stale sources; never paint old geometry at new pose.)
+    {
+        const double max_mid_lag_sec = 0.50;
+        int dropped = 0;
+        while (lidar_buffer.size() > 1 &&
+               (last_timestamp_lidar - time_buffer.front()) > max_mid_lag_sec)
+        {
+            const double drop_end = time_buffer.front() + 0.15;
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            while (!imu_buffer.empty() &&
+                   rclcpp::Time(imu_buffer.front()->header.stamp).seconds() < drop_end)
+                imu_buffer.pop_front();
+            lidar_pushed = false;
+            ++dropped;
+        }
+        if (dropped > 0)
+        {
+            static int lag_drop_log = 0;
+            if ((++lag_drop_log % 20) == 1)
+                std::cout << "[pv-dual] drop_stale_mid n=" << dropped
+                          << " mid_buf=" << lidar_buffer.size()
+                          << " odin_buf=" << lidar_buffer2.size()
+                          << " lag_ms="
+                          << (last_timestamp_lidar - time_buffer.front()) * 1000.0
+                          << std::endl;
+        }
+    }
     static bool odin_selected = false;
     static size_t odin_selected_i = 0;
     const double wall_sec = omp_get_wtime();
@@ -667,11 +700,13 @@ bool sync_packages(MeasureGroup &meas)
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 
-void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull)
+void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull,
+                         const PointCloudXYZI::Ptr &cloud_override = PointCloudXYZI::Ptr())
 {
     if(scan_pub_en)
     {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+        PointCloudXYZI::Ptr laserCloudFullRes =
+            cloud_override ? cloud_override : (dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
         PointCloudXYZI laserCloudWorld;
         for (int i = 0; i < size; i++)
@@ -696,9 +731,11 @@ void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>:
 
 }
 
-void publish_frame_body(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull_body)
+void publish_frame_body(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFull_body,
+                        const PointCloudXYZI::Ptr &cloud_override = PointCloudXYZI::Ptr())
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+    PointCloudXYZI::Ptr laserCloudFullRes =
+        cloud_override ? cloud_override : (dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
     for (int i = 0; i < size; i++)
@@ -1237,32 +1274,36 @@ int main(int argc, char** argv)
 
     auto tf_br = std::make_shared<tf2_ros::TransformBroadcaster>(node);
 
-    PointCloudXYZI::Ptr global_cloud_map_t(new PointCloudXYZI());
-    PointCloudXYZI::Ptr filter_global_cloud_map_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_pending_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_chunk_t(new PointCloudXYZI());
+    PointCloudXYZI::Ptr global_pub_t(new PointCloudXYZI());
 
-    // Timer to publish global map
+    // Timer: voxelize ONLY new points — full-history VoxelGrid caused Mid lag.
     auto timer = node->create_wall_timer(1s,
         [&]()
         {
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map_t = *global_cloud_map;
-                global_cloud_map.reset(new PointCloudXYZI());
+                if (global_cloud_map_pending->empty() && global_cloud_map->empty())
+                    return;
+                global_pending_t.swap(global_cloud_map_pending);
+                global_cloud_map_pending.reset(new PointCloudXYZI());
+                *global_pub_t = *global_cloud_map;
             }
-            downSizeFilterGlobal.setInputCloud(global_cloud_map_t);
-            downSizeFilterGlobal.filter(*filter_global_cloud_map_t);
-            // If VoxelGrid fails/empties (extent overflow), restore unfiltered
-            // copy — never publish/keep an emptied map.
-            if (filter_global_cloud_map_t->empty() && !global_cloud_map_t->empty())
-                *filter_global_cloud_map_t = *global_cloud_map_t;
+            if (!global_pending_t->empty())
             {
-                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *filter_global_cloud_map_t;
+                downSizeFilterGlobal.setInputCloud(global_pending_t);
+                downSizeFilterGlobal.filter(*global_chunk_t);
+                if (global_chunk_t->empty() && !global_pending_t->empty())
+                    *global_chunk_t = *global_pending_t;
+                {
+                    std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                    *global_cloud_map += *global_chunk_t;
+                    *global_pub_t = *global_cloud_map;
+                }
             }
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
-            pcl::toROSMsg(*filter_global_cloud_map_t, laserCloudmsg);
-            // Points are camera_init coords. stamp=now()+frame world made RViz
-            // re-apply latest TF to historical map → motion smear illusion.
+            pcl::toROSMsg(*global_pub_t, laserCloudmsg);
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
             laserCloudmsg.header.frame_id = "camera_init";
             pubGlobalCloudMap->publish(laserCloudmsg);
@@ -1302,7 +1343,10 @@ int main(int argc, char** argv)
             bool fuse_is_hold = false;
             bool frame_quasi_static = false;
             const double now_wall = omp_get_wtime();
-            auto append_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) {
+            // Display-only Odin (never into IEKF): hold of old body cloud at a
+            // new Mid pose is the classic smear. Only allow when still.
+            PointCloudXYZI::Ptr odin_display_only(new PointCloudXYZI());
+            auto append_odin_iekf = [&](PointCloudXYZI &odin_cloud, const char *tag) {
                 feats_undistort->points.insert(feats_undistort->points.end(),
                                                odin_cloud.points.begin(), odin_cloud.points.end());
                 feats_undistort->width = feats_undistort->size();
@@ -1310,14 +1354,15 @@ int main(int argc, char** argv)
                 odin_used_now = odin_cloud.size();
                 odin_skip = tag;
             };
-            auto hold_odin = [&](const char *tag) -> bool {
-                // soft_wait makes wall-gap from last ok often ~0.25–0.35s.
+            auto hold_odin_display = [&](const char *tag) -> bool {
+                if (!frame_quasi_static) return false;
                 if (last_odin_fused && !last_odin_fused->empty() &&
                     last_odin_fused_wall > 0.0 &&
-                    (now_wall - last_odin_fused_wall) <= 0.40)
+                    (now_wall - last_odin_fused_wall) <= 1.0)
                 {
-                    PointCloudXYZI hold = *last_odin_fused;
-                    append_odin_body(hold, tag);
+                    *odin_display_only = *last_odin_fused;
+                    odin_used_now = odin_display_only->size();
+                    odin_skip = tag;
                     fuse_is_hold = true;
                     return true;
                 }
@@ -1365,9 +1410,27 @@ int main(int argc, char** argv)
                 *last_odin_fused = gated;
                 last_odin_fused_wall = now_wall;
                 last_odin_good_n = gated.size();
-                append_odin_body(gated, tag);
+                append_odin_iekf(gated, tag);
                 return true;
             };
+
+            // Prefer Odin IMU for still-gate; fall back to Mid IMU when unpaired.
+            {
+                const auto &imu_src = !Measures.imu2.empty() ? Measures.imu2 : Measures.imu;
+                if (imu_src.size() >= 2)
+                {
+                    double sum = 0.0; int n = 0;
+                    for (const auto &im : imu_src)
+                    {
+                        const double wx = im->angular_velocity.x;
+                        const double wy = im->angular_velocity.y;
+                        const double wz = im->angular_velocity.z;
+                        sum += std::sqrt(wx * wx + wy * wy + wz * wz);
+                        ++n;
+                    }
+                    frame_quasi_static = n > 0 && (sum / n) < kOdinStaticGyro;
+                }
+            }
 
             if (!multi_lidar_en)
                 odin_skip = "multi_off";
@@ -1376,7 +1439,7 @@ int main(int argc, char** argv)
             else if (!Measures.lidar2_fresh || !Measures.lidar2 || Measures.lidar2->empty()
                      || Measures.imu2.size() < 2)
             {
-                if (!hold_odin("hold_1"))
+                if (!hold_odin_display("hold_1"))
                 {
                     if (!Measures.lidar2_fresh)
                         odin_skip = "unpaired";
@@ -1388,7 +1451,7 @@ int main(int argc, char** argv)
             }
             else if (!odin_dense_enough(Measures.lidar2->size()))
             {
-                if (!hold_odin("hold_sparse"))
+                if (!hold_odin_display("hold_sparse"))
                     odin_skip = "sparse_l2";
             }
             else
@@ -1418,11 +1481,11 @@ int main(int argc, char** argv)
                 {
                     if (!commit_odin_body(odin_cloud, tag))
                     {
-                        if (!hold_odin("hold_sparse_z"))
+                        if (!hold_odin_display("hold_sparse_z"))
                             odin_skip = "sparse_z";
                     }
                 }
-                else if (!hold_odin("hold_deskew"))
+                else if (!hold_odin_display("hold_deskew"))
                     odin_skip = "deskew_fail";
             }
 
@@ -1470,7 +1533,7 @@ int main(int argc, char** argv)
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                    *global_cloud_map += *world_lidar;
+                    *global_cloud_map_pending += *world_lidar;
                 }
                 last_global_map_pos = state_point.pos;
                 last_global_map_pose_ok = true;
@@ -1612,7 +1675,7 @@ int main(int argc, char** argv)
                     PointCloudXYZI::Ptr world_dense(new PointCloudXYZI);
                     transformLidar(state_point, body_f, world_dense);
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                    *global_cloud_map += *world_dense;
+                    *global_cloud_map_pending += *world_dense;
                     last_global_map_pos = state_point.pos;
                     last_global_map_pose_ok = true;
                     ++map_ins_ok;
@@ -1635,7 +1698,10 @@ int main(int argc, char** argv)
             Eigen::Quaterniond ext_q(ext_q_coeffs[3], ext_q_coeffs[0], ext_q_coeffs[1], ext_q_coeffs[2]);
             Eigen::Matrix3d ext_R = ext_q.toRotationMatrix();
             (void)ext_t; (void)ext_R;
+            // IEKF residual may use Odin; voxel map stays Mid-only to avoid
+            // ~10cm extrinsic residual permanently smearing match surfaces.
             for (size_t i = 0; i < feats_down_body->size(); i++) {
+                if (feats_down_body->points[i].intensity >= 199.5f) continue;
                 pointWithCov pv;
                 pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
                 M3D cov_lidar = var_down_body[i];
@@ -1663,10 +1729,22 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
+            // Static display-only hold (not IEKF). Fresh Odin already in feats.
+            PointCloudXYZI::Ptr pub_cloud;
+            if (odin_display_only && !odin_display_only->empty())
+            {
+                pub_cloud.reset(new PointCloudXYZI(
+                    dense_pub_en ? *feats_undistort : *feats_down_body));
+                pub_cloud->points.insert(pub_cloud->points.end(),
+                                        odin_display_only->points.begin(),
+                                        odin_display_only->points.end());
+                pub_cloud->width = pub_cloud->size();
+                pub_cloud->height = 1;
+            }
             if (scan_pub_en)
-                                                 publish_frame_world(pubLaserCloudFull);
-
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+                publish_frame_world(pubLaserCloudFull, pub_cloud);
+            if (scan_pub_en && scan_body_pub_en)
+                publish_frame_body(pubLaserCloudFull_body, pub_cloud);
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
             }

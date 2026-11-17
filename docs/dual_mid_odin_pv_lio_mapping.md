@@ -177,19 +177,20 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 ```text
 [pv-dual] ... odin_used=20xxx ... skip=ok           # 运动：gyro-only deskew + Mid-end
 [pv-dual] ... odin_used=20xxx ... skip=ok_nodeskew  # 静止：跳过 deskew（防 Z 抖）
-[pv-dual] ... odin_used=20xxx ... skip=hold_*       # 空档复用上一帧好 Odin（≤0.4s）
+[pv-dual] ... odin_used=20xxx ... skip=hold_*       # 仅静止 display-hold（≤1s，不进 IEKF）
 ```
 
-紧耦合 baseline（回退到 **`2ee511b` + `2b847cd` RowMajor 外参**，用户确认几乎不漂）：
 
-1. Odin deskew：**静止不去畸变；运动 gyro-only**，目标时刻 **chase Mid-end**（禁止 accel 积分）。
-2. **真紧耦合**：配对成功即进 `feats_undistort` → IEKF + voxel_map；`lidar2_cov_scale=4`。
-3. 同步窗宽：`max_sync_dt=0.20` / `soft_wait=0.18`；空档 `hold` 上一帧（Global 跳过 hold）。
-4. 外参地面标定：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**（相对 -13°/0.159，Tz 共↓6cm、俯仰再俯 0.8°）；yaml **RowMajor**。
-5. `ok_nodeskew` 仅当静止且 `|end_dt|≤30ms`；更宽相位仍 gyro-only chase Mid-end（防地面双层）。
-6. Global：融合 dense 点直接累加（`leaf=0.1`）；仅 hold / 静止大跳 / bad state 跳过。
+紧耦合 + 不拖影 + Odin 不消失：
 
-`skip=unpaired` 且 `odin_in=0` 持续出现时，多半是建图算不过来、Mid 积压；重启建图节点。
+1. Odin deskew：**静止且 `|end_dt|≤30ms` 可不去畸变；否则 gyro-only chase Mid-end**（禁 accel）。
+2. **真紧耦合**：配对成功 → `feats_undistort` → IEKF 残差 + **Global 地图**（intensity≈200）；`cov×4`。
+3. **IEKF voxel 匹配面只写 Mid**（防外参残差污染）；**Global 仍含 Mid+Odin**。
+4. **防消失**：`drop_stale_mid`（lag>0.5s）+ Global **只体素化 pending**；`point_filter=2` 减算力。
+5. **防拖影**：运动时禁止 hold 进 IEKF/地图；仅静止时可 display-hold≤1s（Global 仍跳过 hold）。
+6. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**，yaml RowMajor。
+
+`skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 
 ---
 
