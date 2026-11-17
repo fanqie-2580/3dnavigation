@@ -146,11 +146,14 @@ int iekf_reject_jump = 0;
 constexpr double kMapJumpUpd = 0.05;   // m, single EKF update
 constexpr double kMapJumpFrame = 0.12; // m, vs last inserted pose
 // After Mid match fails, IMU-only prop pollutes voxel map → reject_s1 cascade.
-// Freeze to last good lidar pose (FAST_LIO-like: no map update without valid residual).
+// Freeze to last good lidar pose + ZUPT (LIO-SAM failure recovery): zero vel so
+// next IMU step cannot fly ~7m/frame with corrupted velocity (observed live).
 state_ikfom last_good_lidar_state;
 bool have_last_good_lidar = false;
 int consec_iekf_bad = 0;
-constexpr int kConsecBadFreeze = 2;
+constexpr int kConsecBadFreeze = 1;       // ZUPT immediately on first Mid fail
+constexpr double kMaxGoodVel = 2.5;       // m/s; refuse to lock last_good above this
+constexpr double kMaxImuStep = 0.45;      // m; IMU prop vs last_good → force ZUPT
 // Per-frame Odin residual inflation (set when fusing).
 double odin_frame_cov_scale = 4.0;
 
@@ -1758,19 +1761,33 @@ int main(int argc, char** argv)
             PointCloudXYZI::Ptr mid_down_body(new PointCloudXYZI(*feats_down_body));
             std::vector<M3D> mid_var_down = var_down_body;
             last_mid_effct_feat_num = 0;
-            kf.update_iterated_dyn_share_diagonal();
+
+            // If IMU already flew far from last good pose, skip Mid update and ZUPT.
+            bool imu_flew = false;
+            if (have_last_good_lidar)
+            {
+                const double imu_step =
+                    (state_before_update.pos - last_good_lidar_state.pos).norm();
+                const double vel_n = state_before_update.vel.norm();
+                if (imu_step > kMaxImuStep || vel_n > kMaxGoodVel)
+                    imu_flew = true;
+            }
+
+            if (!imu_flew)
+                kf.update_iterated_dyn_share_diagonal();
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
 
             state_point = kf.get_x();
             bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
-            iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
+            if (!imu_flew)
+                iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
             // Mid match failed → restore & skip S2 (prevents IMU-only flyaway + soft Odin yank).
-            const bool mid_no_eff = (last_mid_effct_feat_num < 1);
-            bool jump_reject = (!state_bad) &&
+            const bool mid_no_eff = (!imu_flew) && (last_mid_effct_feat_num < 1);
+            bool jump_reject = (!imu_flew) && (!state_bad) &&
                 (d_upd_chk > kIekfMaxUpd || d_rot_chk > kIekfMaxRot);
-            if (state_bad || jump_reject || mid_no_eff)
+            if (state_bad || jump_reject || mid_no_eff || imu_flew)
             {
                 if (jump_reject)
                 {
@@ -1785,6 +1802,12 @@ int main(int argc, char** argv)
                     RCLCPP_ERROR(node->get_logger(),
                         "Divergence detected (pos_norm=%.1f)! Restoring previous state.",
                         state_point.pos.norm());
+                }
+                else if (imu_flew && (consec_iekf_bad % 20) == 0)
+                {
+                    std::cout << "[pv-iekf] imu_flew step="
+                              << (state_before_update.pos - last_good_lidar_state.pos).norm()
+                              << " vel=" << state_before_update.vel.norm() << std::endl;
                 }
                 else if ((iekf_reject_jump % 20) == 1)
                 {
@@ -1862,24 +1885,49 @@ int main(int argc, char** argv)
                 }
             }
 
-            // Mid/S2 failed: do not keep integrating IMU into a wrong pose —
-            // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
+            // Mid/S2 failed: ZUPT-hold last good pose (zero velocity). Without
+            // zeroing vel, freeze restored pose but IMU still flew ~7m/frame.
+            auto apply_zupt_hold = [&](state_ikfom base) {
+                base.vel = Zero3d;
+                kf.change_x(base);
+                state_point = base;
+                last_good_lidar_state = base;
+                have_last_good_lidar = true;
+            };
             if (!state_bad)
             {
-                last_good_lidar_state = state_point;
-                have_last_good_lidar = true;
-                consec_iekf_bad = 0;
+                if (state_point.vel.norm() > kMaxGoodVel)
+                {
+                    // Pose ok-ish but velocity exploded — hold pose, kill vel.
+                    state_bad = true;
+                    ++consec_iekf_bad;
+                    apply_zupt_hold(state_point);
+                    if ((consec_iekf_bad % 20) == 0)
+                        std::cout << "[pv-iekf] zupt_vel_kill vel was "
+                                  << state_before_update.vel.norm() << std::endl;
+                }
+                else
+                {
+                    last_good_lidar_state = state_point;
+                    have_last_good_lidar = true;
+                    consec_iekf_bad = 0;
+                }
             }
             else
             {
                 ++consec_iekf_bad;
                 if (have_last_good_lidar && consec_iekf_bad >= kConsecBadFreeze)
                 {
-                    kf.change_x(last_good_lidar_state);
-                    state_point = last_good_lidar_state;
+                    apply_zupt_hold(last_good_lidar_state);
                     if ((consec_iekf_bad % 20) == 0)
-                        std::cout << "[pv-iekf] freeze_pose consec_bad="
+                        std::cout << "[pv-iekf] freeze_zupt consec_bad="
                                   << consec_iekf_bad << std::endl;
+                }
+                else if (!have_last_good_lidar)
+                {
+                    // Bootstrap: at least kill velocity on current state.
+                    state_point.vel = Zero3d;
+                    kf.change_x(state_point);
                 }
             }
 
