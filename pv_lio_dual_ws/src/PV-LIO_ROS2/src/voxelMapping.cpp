@@ -2050,12 +2050,17 @@ int main(int argc, char** argv)
                                    ? feats_undistort
                                    : feats_down_body);
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                    // Odin→Global only after accepted S2. ok_map/ok_map_gyr +
-                    // reject_s2(clip~0.8) painted a second wavy floor/walls.
+                    // Odin→Global:
+                    //  require_s2: only accept_s2 (live: accept~0.3% → almost empty).
+                    //  !require_s2: allow ok_map* (S2 not run); still block this
+                    //  frame if S2 ran and was rejected (clip~0.8 dual floor).
+                    const bool s2_attempted = odin_iekf_n > 0;
                     const bool odin_densify_ok =
                         odin_global_insert_en && odin_map_full &&
                         !odin_map_full->empty() &&
-                        (!odin_global_require_s2 || odin_s2_accepted);
+                        (odin_global_require_s2
+                             ? odin_s2_accepted
+                             : (odin_s2_accepted || !s2_attempted));
                     const size_t odin_extra =
                         odin_densify_ok ? odin_map_full->size() : 0;
                     if (!odin_densify_ok && odin_map_full &&

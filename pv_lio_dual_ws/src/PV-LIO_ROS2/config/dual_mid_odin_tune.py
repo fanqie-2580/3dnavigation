@@ -40,9 +40,10 @@ TUNE = {
     "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
     # False: still frames use dense; moving frames use downs (code path).
     "map_use_downsample": False,
-    # Odin→Global only on accept_s2. reject/ok_map_gyr painted dual wavy floor.
+    # Live 18:07 run: req_s2=1 → accept_s2 1/312 (clip~0.84>0.55) → Global几乎无Odin。
+    # False: ok_map* 可进图；C++ 仍在本帧 reject_s2 后禁 densify。
     "odin_global_insert_en": True,
-    "odin_global_require_s2": True,
+    "odin_global_require_s2": False,
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
 }

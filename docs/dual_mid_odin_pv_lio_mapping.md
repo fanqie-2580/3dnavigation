@@ -189,7 +189,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 2. **真紧耦合**：配对成功 → Odin 进 IEKF 残差 + **Global**（intensity≈200）。
 3. **两段式紧耦合（MA-LIO + FAST_LIO_MULTI mid_odin）**：① Mid-only 锁位姿；② `|end_dt|≤50ms` 且 `|ω|<0.12` 时软 Odin（≤400 点，`cov×100`×范围²，`|残差|>5cm` 置零）；二段 `|Δp|>1.5cm` 回滚。运动 → `ok_map_gyr`；大 skew → `ok_map*`（Odin 仍全量进 Global）。**Mid 失败 → 回滚并禁 S2**。
 4. **IEKF voxel 匹配面只写 Mid**；**Global = Mid + 全量 Odin**。**Mid `reject_s1` / 无有效点时禁止写 voxel+Global**；连续失败 ≥2 帧冻结到上一帧好位姿（防 IMU 空推漂）。
-5. **免编译调参**：`dual_mid_odin_tune.py`。Body 稠密显示；Global：**静止 dense / 运动 downs** + **`leaf=0.08`** + **每 5s 异步全图重体素**（消 Mid360「一团一团」）；**Odin→Global 仅 `accept_s2`**（禁 reject/ok_map_gyr 双地面）；改 `.py`/yaml 后重启，C++ 改动需编译。
+5. **免编译调参**：`dual_mid_odin_tune.py`。Body 稠密显示；Global：**静止 dense / 运动 downs** + **`leaf=0.08`** + **每 5s 异步全图重体素**；**Odin→Global：`ok_map*` 可进，本帧 `reject_s2` 禁进**（`req_s2=1` 时 accept≈0.3%/clip~0.84 会导致图里几乎无 Odin）；改 `.py`/yaml 后重启，C++ 改动需编译。
 6. **防消失**：`drop_stale_mid` + pending 增量体素 + 周期性全图 remap；Mid/Odin `point_filter=2`，Odin `max_range2=20`。
 7. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
 8. **存图异步**：`/save_map` 快照后后台写 PCD。
