@@ -58,11 +58,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <pcl/io/pcd_io.h>
-#include <pcl/common/transforms.h>
 #include <sys/stat.h>
-#include <algorithm>
-#include <cmath>
-#include <unordered_set>
 #include "preprocess.h"
 #include "voxel_map_util.hpp"
 
@@ -187,24 +183,8 @@ deque<PointCloudXYZI::Ptr> lidar_buffer2;
 deque<sensor_msgs::msg::Imu::SharedPtr> imu_buffer2;
 M3D LiDAR2_R_wrt_LiDAR1 = Eye3d;
 V3D LiDAR2_T_wrt_LiDAR1 = Zero3d;
-M3D LiDAR2_R_yaml = Eye3d;
-V3D LiDAR2_T_yaml = Zero3d;
 M3D Lidar2_R_wrt_IMU2 = Eye3d;
 V3D Lidar2_T_wrt_IMU2 = Zero3d;
-// Online Mid↔Odin extrinsic (external Multi_LiCa ground + constrained yaw/xy ICP).
-// NOT from workspace FAST_LIO_MULTI / MA-LIO — refs: TUMFTM/Multi_LiCa,
-// pixmoving-moveit/multi_lidar_calibration_ros2.
-// Bootstrap below gate so yaml-refined extrinsic can S2/map before first still frame.
-double align_angle_deg = 2.0;
-double align_dz = 0.0;
-int align_ok_count = 3;
-int align_attempt = 0;
-constexpr double kAlignEma = 0.08;
-constexpr double kAlignAngleGateDeg = 2.5;
-constexpr double kAlignMaxAngleDeg = 15.0;
-constexpr double kAlignMaxYawDeg = 1.5;   // reject wild yaw ICP steps
-constexpr double kAlignMaxTxy = 0.08;     // m, per-update xy clamp
-constexpr double kAlignTWander = 0.20;    // m, abs drift vs yaml T
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -339,286 +319,6 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 
     po->curvature = pi->curvature;
     po->normal_x = pi->normal_x;
-}
-
-// Multi_LiCa-style ground PCA (lowest ~12% Z) → normal + median height.
-static bool fit_ground_pca(const PointCloudXYZI &cloud, V3D &n_out, double &z_med,
-                           int *n_used = nullptr)
-{
-    const size_t n = cloud.points.size();
-    if (n < 200) return false;
-    std::vector<float> zs;
-    zs.reserve(n);
-    for (const auto &p : cloud.points) zs.push_back(p.z);
-    const size_t k = std::max<size_t>(80, n * 12 / 100);
-    std::nth_element(zs.begin(), zs.begin() + static_cast<long>(k), zs.end());
-    const float thr = zs[k];
-    std::vector<V3D> g;
-    g.reserve(k + 16);
-    for (const auto &p : cloud.points)
-        if (p.z <= thr) g.emplace_back(p.x, p.y, p.z);
-    if (g.size() < 80) return false;
-    V3D c = Zero3d;
-    for (const auto &v : g) c += v;
-    c /= static_cast<double>(g.size());
-    Eigen::Matrix3d C = Eigen::Matrix3d::Zero();
-    for (const auto &v : g)
-    {
-        const V3D d = v - c;
-        C += d * d.transpose();
-    }
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(C);
-    n_out = es.eigenvectors().col(0);
-    if (n_out.z() < 0.0) n_out = -n_out;
-    std::vector<double> gz;
-    gz.reserve(g.size());
-    for (const auto &v : g) gz.push_back(v.z());
-    std::nth_element(gz.begin(), gz.begin() + static_cast<long>(gz.size() / 2), gz.end());
-    z_med = gz[gz.size() / 2];
-    if (n_used) *n_used = static_cast<int>(g.size());
-    return n_out.z() > 0.85;
-}
-
-static M3D rot_from_to(const V3D &a, const V3D &b)
-{
-    const V3D v = a.cross(b);
-    const double s = v.norm();
-    const double c = std::clamp(a.dot(b), -1.0, 1.0);
-    if (s < 1e-8) return Eye3d;
-    M3D vx;
-    vx << 0.0, -v.z(), v.y(),
-          v.z(), 0.0, -v.x(),
-         -v.y(), v.x(), 0.0;
-    return Eye3d + vx + vx * vx * ((1.0 - c) / (s * s));
-}
-
-// Online Mid↔Odin extrinsic monitor / optional refine.
-// IMPORTANT: Odin1 is nearly horizontally mounted (raw ground ~2° vs +Z).
-// Applying Multi_LiCa ground-to-Mid Rodrigues (~7–8°) tilted the map downward
-// and walked Tz. Default: measure-only, do NOT mutate LiDAR2_R/T.
-static void online_align_extrinsic(const PointCloudXYZI &mid, PointCloudXYZI &odin_mid)
-{
-    V3D nm, no;
-    double zm = 0.0, zo = 0.0;
-    if (!fit_ground_pca(mid, nm, zm) || !fit_ground_pca(odin_mid, no, zo))
-        return;
-    double ang = std::acos(std::clamp(nm.dot(no), -1.0, 1.0)) * (180.0 / M_PI);
-    const double odin_tilt_z =
-        std::acos(std::clamp(no.z(), -1.0, 1.0)) * (180.0 / M_PI);
-    const double mid_tilt_z =
-        std::acos(std::clamp(nm.z(), -1.0, 1.0)) * (180.0 / M_PI);
-    align_angle_deg = ang;
-    align_dz = zo - zm;
-    // Both nearly level → treat as aligned for S2/Global gate (don't require
-    // Mid median-Z match; Mid lowest-12% z_med≈0 is not a reliable floor).
-    if (odin_tilt_z < 4.0 && mid_tilt_z < 4.0 && ang < 6.0)
-    {
-        ++align_ok_count;
-        if ((++align_attempt % 30) == 0)
-        {
-            std::cout << "[pv-align] monitor ang_deg=" << ang
-                      << " odin_tilt_z=" << odin_tilt_z
-                      << " mid_tilt_z=" << mid_tilt_z
-                      << " dz=" << align_dz
-                      << " ok=" << align_ok_count
-                      << " (no extrinsic update)" << std::endl;
-        }
-        return;
-    }
-    // Large residual: log only unless explicitly enabled.
-    constexpr bool kAlignUpdateExtrinsic = false;
-    if (!kAlignUpdateExtrinsic)
-    {
-        if ((++align_attempt % 30) == 0)
-        {
-            std::cout << "[pv-align] skip_update ang_deg=" << ang
-                      << " odin_tilt_z=" << odin_tilt_z
-                      << " dz=" << align_dz << std::endl;
-        }
-        return;
-    }
-    if (ang < 0.30 && std::fabs(align_dz) < 0.025)
-    {
-        ++align_ok_count;
-        return;  // freeze when already good
-    }
-    // After enough good frames, stop updating extrinsic (anti slow walk).
-    if (align_ok_count >= 40 && ang < 1.0)
-        return;
-    if (ang > kAlignMaxAngleDeg)
-        return;
-
-    const M3D Rd = rot_from_to(no, nm);
-    PointCloudXYZI tmp;
-    {
-        Eigen::Matrix4d Td = Eigen::Matrix4d::Identity();
-        Td.block<3, 3>(0, 0) = Rd;
-        pcl::transformPointCloud(odin_mid, tmp, Td);
-    }
-    V3D ntmp;
-    double ztmp = 0.0;
-    if (!fit_ground_pca(tmp, ntmp, ztmp))
-        return;
-    const V3D tcorr(0.0, 0.0, zm - ztmp);
-
-    // Wall band for yaw/xy (skip near/far); voxel-downsample 0.25 m.
-    auto fill_walls = [](const PointCloudXYZI &src, std::vector<Eigen::Vector2d> &xy,
-                         std::vector<V3D> &xyz) {
-        xy.clear();
-        xyz.clear();
-        std::unordered_set<long long> seen;
-        seen.reserve(src.points.size() / 2 + 16);
-        for (const auto &p : src.points)
-        {
-            const double r2 = static_cast<double>(p.x) * p.x + static_cast<double>(p.y) * p.y;
-            if (r2 < 4.0 || r2 > 144.0) continue;
-            if (p.z < -0.8f || p.z > 1.8f) continue;
-            const long long key =
-                (static_cast<long long>(std::lround(p.x / 0.25f)) << 32) ^
-                (static_cast<long long>(std::lround(p.y / 0.25f)) << 16) ^
-                static_cast<long long>(std::lround(p.z / 0.25f));
-            if (!seen.insert(key).second) continue;
-            xy.emplace_back(p.x, p.y);
-            xyz.emplace_back(p.x, p.y, p.z);
-        }
-    };
-
-    std::vector<Eigen::Vector2d> mid_xy, od_xy;
-    std::vector<V3D> mid_xyz, od_xyz;
-    fill_walls(mid, mid_xy, mid_xyz);
-    PointCloudXYZI od_g = tmp;
-    for (auto &p : od_g.points) p.z += static_cast<float>(tcorr.z());
-    fill_walls(od_g, od_xy, od_xyz);
-
-    // Yaw/xy only after ground is close; clamp to avoid Tx sign-flip drift.
-    // Disabled by default: live run showed yaw ICP walked T.x across zero and
-    // painted Global ghosts while ground normal was already <0.3°.
-    double yaw = 0.0, tx = 0.0, ty = 0.0;
-    constexpr bool kEnableYawXyIcp = false;
-    const double ang_after_g =
-        std::acos(std::clamp(nm.dot(ntmp), -1.0, 1.0)) * (180.0 / M_PI);
-    if (kEnableYawXyIcp && ang_after_g < 3.0 && mid_xyz.size() >= 80 &&
-        od_xyz.size() >= 80)
-    {
-        auto nn = [&](const Eigen::Vector2d &q, double &best_d, int &best_i) {
-            best_d = 1e9;
-            best_i = -1;
-            for (size_t i = 0; i < mid_xy.size(); ++i)
-            {
-                const double d = (mid_xy[i] - q).squaredNorm();
-                if (d < best_d)
-                {
-                    best_d = d;
-                    best_i = static_cast<int>(i);
-                }
-            }
-            best_d = std::sqrt(best_d);
-        };
-        std::vector<V3D> B0 = od_xyz;
-        for (int it = 0; it < 6; ++it)
-        {
-            const double c = std::cos(yaw), s = std::sin(yaw);
-            std::vector<Eigen::Vector2d> As, Bs;
-            As.reserve(B0.size());
-            Bs.reserve(B0.size());
-            for (const auto &p : B0)
-            {
-                Eigen::Vector2d q(c * p.x() - s * p.y() + tx, s * p.x() + c * p.y() + ty);
-                double d;
-                int j;
-                nn(q, d, j);
-                if (j < 0 || d > 0.45) continue;
-                As.emplace_back(mid_xy[static_cast<size_t>(j)]);
-                Bs.emplace_back(p.x(), p.y());
-            }
-            if (As.size() < 80) break;
-            Eigen::Vector2d ca = Eigen::Vector2d::Zero(), cb = Eigen::Vector2d::Zero();
-            for (size_t i = 0; i < As.size(); ++i)
-            {
-                ca += As[i];
-                cb += Bs[i];
-            }
-            ca /= static_cast<double>(As.size());
-            cb /= static_cast<double>(Bs.size());
-            Eigen::Matrix2d H = Eigen::Matrix2d::Zero();
-            for (size_t i = 0; i < As.size(); ++i)
-                H += (Bs[i] - cb) * (As[i] - ca).transpose();
-            Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-            Eigen::Matrix2d R2d = svd.matrixV() * svd.matrixU().transpose();
-            if (R2d.determinant() < 0.0)
-            {
-                Eigen::Matrix2d V = svd.matrixV();
-                V.col(1) *= -1.0;
-                R2d = V * svd.matrixU().transpose();
-            }
-            const Eigen::Vector2d t2d = ca - R2d * cb;
-            yaw = std::atan2(R2d(1, 0), R2d(0, 0));
-            tx = t2d.x();
-            ty = t2d.y();
-        }
-        if (std::fabs(yaw) * (180.0 / M_PI) > kAlignMaxYawDeg ||
-            std::hypot(tx, ty) > kAlignMaxTxy)
-        {
-            yaw = 0.0;
-            tx = 0.0;
-            ty = 0.0;
-        }
-    }
-
-    M3D Rz = Eye3d;
-    Rz << std::cos(yaw), -std::sin(yaw), 0.0,
-          std::sin(yaw),  std::cos(yaw), 0.0,
-          0.0, 0.0, 1.0;
-    const V3D txy(tx, ty, 0.0);
-    const M3D Rdelta = Rz * Rd;
-    const V3D tdelta = Rz * tcorr + txy;
-
-    // Immediate snap for this frame's Odin cloud.
-    {
-        Eigen::Matrix4d Tfix = Eigen::Matrix4d::Identity();
-        Tfix.block<3, 3>(0, 0) = Rdelta;
-        Tfix.block<3, 1>(0, 3) = tdelta;
-        pcl::transformPointCloud(odin_mid, odin_mid, Tfix);
-    }
-
-    // EMA update extrinsic used by next frames.
-    M3D R_new = Rdelta * LiDAR2_R_wrt_LiDAR1;
-    V3D T_new = Rdelta * LiDAR2_T_wrt_LiDAR1 + tdelta;
-    {
-        Eigen::JacobiSVD<M3D> svd(R_new, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        R_new = svd.matrixU() * svd.matrixV().transpose();
-        if (R_new.determinant() < 0.0) R_new.col(2) *= -1.0;
-    }
-    Eigen::Quaterniond q0(LiDAR2_R_wrt_LiDAR1), q1(R_new);
-    if (q0.dot(q1) < 0.0) q1.coeffs() = -q1.coeffs();
-    LiDAR2_R_wrt_LiDAR1 = q0.slerp(kAlignEma, q1).toRotationMatrix();
-    LiDAR2_T_wrt_LiDAR1 = (1.0 - kAlignEma) * LiDAR2_T_wrt_LiDAR1 + kAlignEma * T_new;
-    // Soft clamp vs yaml so yaw ICP cannot walk T into the wrong octant.
-    for (int i = 0; i < 3; ++i)
-    {
-        const double lo = LiDAR2_T_yaml[i] - kAlignTWander;
-        const double hi = LiDAR2_T_yaml[i] + kAlignTWander;
-        LiDAR2_T_wrt_LiDAR1[i] = std::clamp(LiDAR2_T_wrt_LiDAR1[i], lo, hi);
-    }
-
-    if (fit_ground_pca(odin_mid, no, zo))
-    {
-        align_angle_deg = std::acos(std::clamp(nm.dot(no), -1.0, 1.0)) * (180.0 / M_PI);
-        align_dz = zo - zm;
-    }
-    if (align_angle_deg < kAlignAngleGateDeg)
-        ++align_ok_count;
-    else
-        align_ok_count = std::max(0, align_ok_count - 1);
-
-    if ((++align_attempt % 15) == 0)
-    {
-        std::cout << "[pv-align] ang_deg=" << align_angle_deg
-                  << " dz=" << align_dz
-                  << " yaw_deg=" << (yaw * 180.0 / M_PI)
-                  << " ok=" << align_ok_count
-                  << " T=" << LiDAR2_T_wrt_LiDAR1.transpose() << std::endl;
-    }
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -1512,8 +1212,6 @@ int main(int argc, char** argv)
     // transposed Ry(±13°) → Odin tilted ~13° vs Mid. Load RowMajor explicitly.
     if(extrinR_l2.size()==9)
       LiDAR2_R_wrt_LiDAR1 = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(extrinR_l2.data());
-    LiDAR2_R_yaml = LiDAR2_R_wrt_LiDAR1;
-    LiDAR2_T_yaml = LiDAR2_T_wrt_LiDAR1;
     if(extrinT_oi.size()==3) Lidar2_T_wrt_IMU2<<VEC_FROM_ARRAY(extrinT_oi);
     if(extrinR_oi.size()==9)
       Lidar2_R_wrt_IMU2 = Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>(extrinR_oi.data());
@@ -1803,12 +1501,6 @@ int main(int argc, char** argv)
                 T.block<3,3>(0,0) = LiDAR2_R_wrt_LiDAR1;
                 T.block<3,1>(0,3) = LiDAR2_T_wrt_LiDAR1;
                 pcl::transformPointCloud(odin_cloud, odin_cloud, T);
-                // Low-motion online extrinsic: Multi_LiCa ground + yaw/xy ICP.
-                if (frame_gyr_mean < 0.08 && feats_undistort && feats_undistort->size() > 500 &&
-                    odin_cloud.size() > 2000)
-                {
-                    online_align_extrinsic(*feats_undistort, odin_cloud);
-                }
                 PointCloudXYZI gated;
                 gated.points.reserve(odin_cloud.points.size());
                 for (const auto &pt : odin_cloud.points)
@@ -1841,9 +1533,7 @@ int main(int argc, char** argv)
                 // Gyro gate (FAST_LIO_MULTI): moving → map densify only.
                 const bool s2_time_ok = edt <= kOdinIekfMaxEndDt;
                 const bool s2_motion_ok = frame_gyr_mean < kOdinS2GyrGate;
-                const bool s2_align_ok =
-                    (align_angle_deg < kAlignAngleGateDeg) || (align_ok_count >= 5);
-                if (kOdinIekfEnable && s2_time_ok && s2_motion_ok && s2_align_ok)
+                if (kOdinIekfEnable && s2_time_ok && s2_motion_ok)
                 {
                     *odin_iekf_body = subsample_odin_iekf(gated);
                     odin_iekf_n = odin_iekf_body->size();
@@ -1853,9 +1543,7 @@ int main(int argc, char** argv)
                 {
                     odin_iekf_body->clear();
                     odin_iekf_n = 0;
-                    if (!s2_align_ok)
-                        odin_skip = "ok_map_align";
-                    else if (!s2_motion_ok)
+                    if (!s2_motion_ok)
                         odin_skip = "ok_map_gyr";
                     else
                         odin_skip = nodeskew ? "ok_nodeskew_map" : "ok_map";
@@ -1909,15 +1597,13 @@ int main(int argc, char** argv)
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 bool deskew_ok = true;
                 const char *tag = "ok";
-                // Prefer nodeskew whenever Mid-end is close: Odin IMU is pitched
-                // ~13° vs nearly-level Odin LiDAR; gyro deskew with bad R_LI
-                // wedges the cloud downward even after R_LI yaml fix.
+                // Stationary: skip Odin deskew (az noise) ONLY if Mid-end is
+                // close. |end_dt|>30ms + nodeskew left ground double layers.
                 frame_quasi_static = imu2_quasi_static();
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
                 const bool nodeskew_ok =
-                    (std::abs(bundle_end_dt) <= 0.05) &&
-                    (frame_quasi_static || frame_gyr_mean < 0.15);
+                    frame_quasi_static && (std::abs(bundle_end_dt) <= 0.03);
                 if (nodeskew_ok)
                 {
                     tag = "ok_nodeskew";
@@ -2291,9 +1977,7 @@ int main(int argc, char** argv)
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     const bool odin_have =
                         (odin_map_full && !odin_map_full->empty());
-                    const bool odin_align_ok =
-                        (align_angle_deg < kAlignAngleGateDeg) || (align_ok_count >= 5);
-                    const bool odin_insert_ok = odin_have && !state_bad && odin_align_ok &&
+                    const bool odin_insert_ok = odin_have && !state_bad &&
                         (odin_s2_accepted ||
                          (frame_gyr_mean < kOdinMapInsertGyr &&
                           std::abs(bundle_end_dt) <= kOdinIekfMaxEndDt));

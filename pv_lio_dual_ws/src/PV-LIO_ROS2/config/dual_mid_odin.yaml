@@ -45,16 +45,14 @@
       det_range: 30.0
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
-      # Mid LiDAR ~level but Mid IMU pitch≈+8.7°. R_LI=I left camera_init map
-      # pitched; Odin frontal FOV looked "downward" in RViz side view.
-      # R_LI: Mid lidar up(+Z) → Mid IMU gravity (static accel).
-      extrinsic_R: [0.9894828, 0.0004981, -0.1446499, 0.0004981, 0.9999764, 0.0068500, 0.1446499, -0.0068500, 0.9894592]
-      # Both lidars nearly level → R_L2≈I. Odin IMU pitched ≈-12.8° vs its LiDAR
-      # → keep Odin R_LI for gyro deskew. T mechanical.
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
+      # Absolute Mid ground still ~-0.25m (body Odin near floor ~-0.29m); Mid pitch TBD.
+      # Ry -13.8°. Yaml R row-major.
       extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.078]
-      extrinsic_R_L2_wrt_L1: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
-      extrinsic_R_L2_wrt_odin_imu: [0.9828973, -0.0062779, 0.1840475, -0.0061219, 0.9977525, 0.0667273, -0.1840528, -0.0667128, 0.9806498]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       # Stage-2 soft Odin (FAST_LIO_MULTI-like ×100 + residual clip 5cm + gyr gate).
       lidar2_cov_scale: 100.0
     noise_model:
