@@ -117,20 +117,25 @@ constexpr float kOdinBodyZMin = -2.0f;
 constexpr float kOdinBodyZMax = 3.5f;
 // Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
 constexpr double kOdinStaticGyro = 0.05;
-// Two-stage tight couple (MA-LIO / constraint-fusion inspired):
-// (1) Mid-only IEKF locks pose; (2) soft Odin with point-wise range uncertainty
-// + secondary-lidar info downweight; reject S2 if it yanks Mid. Odin → Global always.
+// Two-stage tight couple (MA-LIO + FAST_LIO_MULTI mid_odin):
+// (1) Mid-only IEKF locks pose; (2) soft Odin with range cov, info downweight,
+//     residual clip, and gyro gate; reject S2 if it yanks Mid. Odin → Global.
 constexpr size_t kOdinIekfMaxPts = 400;
 constexpr double kOdinIekfMaxEndDt = 0.05;  // s; else Global-only (no stage-2)
 constexpr bool kOdinIekfEnable = true;
-constexpr double kOdinInfoWeight = 0.25;    // like Hb*W: info↓ → cov×(1/W)
+constexpr double kOdinInfoWeight = 0.15;    // like Hb*W (stronger downweight)
 constexpr double kOdinRangeRef = 6.0;       // m; MA-LIO-like range growth
+constexpr double kOdinMaxResidual = 0.05;   // m; FAST_LIO_MULTI residual clip
+constexpr double kOdinS2GyrGate = 0.12;     // rad/s; skip S2 when moving
 constexpr double kIekfMaxUpd = 0.08;        // m, stage-1 Mid reject
 constexpr double kIekfMaxRot = 0.08;        // rad
-constexpr double kIekfS2MaxUpd = 0.03;      // m, stage-2 Odin reject vs Mid-locked
-constexpr double kIekfS2MaxRot = 0.035;     // rad ≈2°
+constexpr double kIekfS2MaxUpd = 0.015;     // m, stage-2 Odin reject vs Mid-locked
+constexpr double kIekfS2MaxRot = 0.025;     // rad ≈1.4°
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
+int iekf_odin_res_clip = 0;
+bool iekf_odin_stage = false;              // observation_model: clip Odin residuals
+double frame_gyr_mean = 0.0;
 // Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
 V3D last_global_map_pos = Zero3d;
 bool last_global_map_pose_ok = false;
@@ -996,7 +1001,22 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + norm_vec.y() * ptpl_list[i].point_world.y()
                 + norm_vec.z() * ptpl_list[i].point_world.z()
                 + ptpl_list[i].d;
+
+        // FAST_LIO_MULTI: clip large Odin point-to-plane residuals in stage-2.
+        if (iekf_odin_stage && std::fabs(pd2) > kOdinMaxResidual)
+        {
+            ekfom_data.h(i) = 0.0;
+            ekfom_data.h_x.row(i).setZero();
+            ekfom_data.R(i) = 1e-12;  // R is information weight
+#ifdef MP_EN
+#pragma omp atomic
+#endif
+            iekf_odin_res_clip++;
+            continue;
+        }
+
         ekfom_data.h(i) = -pd2;
+        total_residual += std::fabs(pd2);
 
         V3D point_world = ptpl_list[i].point_world;
         Eigen::Matrix<double, 1, 6> J_nq;
@@ -1011,7 +1031,7 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         ekfom_data.R(i) = R_inv;
     }
 
-    res_mean_last = total_residual / effct_feat_num;
+    res_mean_last = (effct_feat_num > 0) ? (total_residual / effct_feat_num) : 0.0;
 }
 
 bool saveMapToFile(const std::string &dir) {
@@ -1360,7 +1380,9 @@ int main(int argc, char** argv)
             const char *odin_skip = "none";
             bool fuse_is_hold = false;
             bool frame_quasi_static = false;
+            frame_gyr_mean = 0.0;
             odin_frame_cov_scale = lidar2_cov_scale;
+            iekf_odin_stage = false;
             const double now_wall = omp_get_wtime();
             // Display-only Odin (never into IEKF): hold of old body cloud at a
             // new Mid pose is the classic smear. Only allow when still.
@@ -1418,7 +1440,8 @@ int main(int argc, char** argv)
                     sum += std::sqrt(wx * wx + wy * wy + wz * wz);
                     ++n;
                 }
-                return n > 0 && (sum / n) < kOdinStaticGyro;
+                if (n > 0) frame_gyr_mean = sum / n;
+                return n > 0 && frame_gyr_mean < kOdinStaticGyro;
             };
             auto commit_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) -> bool {
                 Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
@@ -1454,7 +1477,10 @@ int main(int argc, char** argv)
                 const std::string tag_s = tag ? tag : "ok";
                 const bool nodeskew = tag_s.find("nodeskew") != std::string::npos;
                 // Never merge Odin into Mid feats_undistort (that was single-shot yank).
-                if (kOdinIekfEnable && edt <= kOdinIekfMaxEndDt)
+                // Gyro gate (FAST_LIO_MULTI): moving → map densify only.
+                const bool s2_time_ok = edt <= kOdinIekfMaxEndDt;
+                const bool s2_motion_ok = frame_gyr_mean < kOdinS2GyrGate;
+                if (kOdinIekfEnable && s2_time_ok && s2_motion_ok)
                 {
                     *odin_iekf_body = subsample_odin_iekf(gated);
                     odin_iekf_n = odin_iekf_body->size();
@@ -1464,7 +1490,10 @@ int main(int argc, char** argv)
                 {
                     odin_iekf_body->clear();
                     odin_iekf_n = 0;
-                    odin_skip = nodeskew ? "ok_nodeskew_map" : "ok_map";
+                    if (!s2_motion_ok)
+                        odin_skip = "ok_map_gyr";
+                    else
+                        odin_skip = nodeskew ? "ok_nodeskew_map" : "ok_map";
                 }
                 return true;
             };
@@ -1483,7 +1512,8 @@ int main(int argc, char** argv)
                         sum += std::sqrt(wx * wx + wy * wy + wz * wz);
                         ++n;
                     }
-                    frame_quasi_static = n > 0 && (sum / n) < kOdinStaticGyro;
+                    frame_gyr_mean = (n > 0) ? (sum / n) : 0.0;
+                    frame_quasi_static = frame_gyr_mean < kOdinStaticGyro;
                 }
             }
 
@@ -1734,10 +1764,14 @@ int main(int argc, char** argv)
                 }
                 if (feats_down_size >= 5)
                 {
+                    iekf_odin_stage = true;
+                    const int clip_before = iekf_odin_res_clip;
                     t_update_start = omp_get_wtime();
                     kf.update_iterated_dyn_share_diagonal();
                     t_update_end = omp_get_wtime();
                     sum_optimize_time += t_update_end - t_update_start;
+                    iekf_odin_stage = false;
+                    const int clipped = iekf_odin_res_clip - clip_before;
 
                     state_ikfom state_s2 = kf.get_x();
                     bool s2_bad = false;
@@ -1752,6 +1786,7 @@ int main(int argc, char** argv)
                             std::cout << "[pv-iekf] reject_s2 d_upd=" << s2_du
                                       << " d_rot=" << s2_dr
                                       << " odin_iekf=" << odin_iekf_n
+                                      << " clip=" << clipped
                                       << " cov=" << odin_frame_cov_scale
                                       << " n=" << iekf_reject_s2 << std::endl;
                         kf.change_x(state_after_mid);
@@ -1765,6 +1800,7 @@ int main(int argc, char** argv)
                             std::cout << "[pv-iekf] accept_s2 d_upd=" << s2_du
                                       << " d_rot=" << s2_dr
                                       << " odin_iekf=" << odin_iekf_n
+                                      << " clip=" << clipped
                                       << " acc=" << iekf_accept_s2
                                       << " rej=" << iekf_reject_s2 << std::endl;
                     }

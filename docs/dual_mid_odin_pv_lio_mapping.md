@@ -175,9 +175,11 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 日志里正常配对示例：
 
 ```text
-[pv-dual] ... odin_used=20xxx ... skip=ok           # 运动：gyro-only deskew + Mid-end
-[pv-dual] ... odin_used=20xxx ... skip=ok_nodeskew  # 静止：跳过 deskew（防 Z 抖）
-[pv-dual] ... odin_used=20xxx ... skip=hold_*       # 仅静止 display-hold（≤1s，不进 IEKF）
+[pv-dual] ... skip=ok_s2 / ok_nodeskew_s2   # 二段软 Odin 进 IEKF
+[pv-dual] ... skip=ok_map / ok_nodeskew_map # 仅 Global（end_dt 大）
+[pv-dual] ... skip=ok_map_gyr               # 运动 |ω|≥0.12：禁 S2，Odin 仍进 Global
+[pv-dual] ... skip=hold_*                   # 仅静止 display-hold（≤1s，不进 IEKF）
+[pv-iekf] accept_s2 ... clip=N acc=A rej=0  # N=残差裁剪点数；rej>0 表示 S2 回滚
 ```
 
 
@@ -185,12 +187,12 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 
 1. Odin deskew：**静止且 `|end_dt|≤30ms` 可不去畸变；否则 gyro-only chase Mid-end**（禁 accel）。
 2. **真紧耦合**：配对成功 → Odin 进 IEKF 残差 + **Global**（intensity≈200）。
-3. **两段式紧耦合（参考 MA-LIO / 约束级融合）**：① Mid-only IEKF 锁位姿；② `|end_dt|≤50ms` 时软 Odin 二段（≤400 点；`cov×48`，再×`1/info_weight`，再×范围²）；二段相对 Mid `|Δp|>3cm` / `|Δθ|>~2°` 回滚。更大 skew → `ok_*_map`（Odin 仍全量进 Global）。
+3. **两段式紧耦合（MA-LIO + FAST_LIO_MULTI mid_odin）**：① Mid-only 锁位姿；② `|end_dt|≤50ms` 且 `|ω|<0.12` 时软 Odin（≤400 点，`cov×100`×范围²，`|残差|>5cm` 置零）；二段 `|Δp|>1.5cm` 回滚。运动 → `ok_map_gyr`；大 skew → `ok_map*`（Odin 仍全量进 Global）。
 4. **IEKF voxel 匹配面只写 Mid**；**Global = Mid + 全量 Odin**。
 5. **防消失**：`drop_stale_mid` + Global 只体素化 pending；`point_filter=2`。
 6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
 7. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.078]**，yaml RowMajor。  
-   验证（2026-11-17）：Global Mid 地面≈−0.25m（相对安装偏高约5–10cm）；Odin 近处 body≈−0.29m；相对 Δz 约 +2cm 已用 Tz↓ 补偿。
+   验证（2026-11-17）：S2 `d_upd`≪1mm、`rej=0`、运动帧走 `ok_map_gyr`；静止 odom 约 cm 级抖动。
 
 `skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 
