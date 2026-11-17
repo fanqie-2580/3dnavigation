@@ -229,6 +229,7 @@ bool has_save_opt = false;
 bool pcd_save_en = false;
 std::string pcd_save_path;
 std::atomic<bool> save_map_busy{false};
+std::atomic<bool> global_remap_busy{false};
 
 std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map;
 std::mutex global_cloud_map_mtx;
@@ -1444,10 +1445,13 @@ int main(int argc, char** argv)
     PointCloudXYZI::Ptr global_chunk_t(new PointCloudXYZI());
     PointCloudXYZI::Ptr global_pub_t(new PointCloudXYZI());
 
-    // Timer: voxelize ONLY new points — full-history VoxelGrid caused Mid lag.
+    // Timer: voxelize new points each 1s. Periodically re-VoxelGrid the FULL
+    // Global map async — pending-only left Mid360 non-repetitive scans as
+    // independent centroid lattices ("一团一团") and wavy floors.
     auto timer = node->create_wall_timer(1s,
         [&]()
         {
+            static int global_remap_tick = 0;
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 if (global_cloud_map_pending->empty() && global_cloud_map->empty())
@@ -1467,6 +1471,29 @@ int main(int argc, char** argv)
                     *global_cloud_map += *global_chunk_t;
                     *global_pub_t = *global_cloud_map;
                 }
+            }
+            // Every 5s: unify leaf lattice across history (async, non-blocking).
+            if ((++global_remap_tick % 5) == 0 &&
+                !global_pub_t->empty() &&
+                !global_remap_busy.exchange(true))
+            {
+                PointCloudXYZI::Ptr remap_in(new PointCloudXYZI(*global_pub_t));
+                const float leaf = static_cast<float>(global_map_leaf_size);
+                std::thread([remap_in, leaf]() {
+                    pcl::VoxelGrid<PointType> vg;
+                    vg.setLeafSize(leaf, leaf, leaf);
+                    PointCloudXYZI::Ptr remap_out(new PointCloudXYZI());
+                    vg.setInputCloud(remap_in);
+                    vg.filter(*remap_out);
+                    if (!remap_out->empty())
+                    {
+                        std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                        // Replace history only; leave pending for the 1s path
+                        // (pending was not in remap_in snapshot).
+                        global_cloud_map.swap(remap_out);
+                    }
+                    global_remap_busy.store(false);
+                }).detach();
             }
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
             pcl::toROSMsg(*global_pub_t, laserCloudmsg);
@@ -2014,15 +2041,17 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
-                    // Point-LIO / FAST_LIO_MULTI: densify map with downs when still.
+                    // Global densify: still→dense fill; moving→downs (anti ground
+                    // ripple / Mid360 smear clumps). map_use_downsample forces downs.
                     PointCloudXYZI::Ptr body_src =
                         map_use_downsample
                             ? feats_down_body
-                            : (dense_pub_en ? feats_undistort : feats_down_body);
+                            : ((dense_pub_en && frame_quasi_static)
+                                   ? feats_undistort
+                                   : feats_down_body);
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                    // FAST_LIO_MULTI-style: densify secondary only when fused well.
-                    // Live root cause: ok_map/ok_map_gyr + high clip_r still painted
-                    // full Odin → dual-wall ghosts in Global.
+                    // Odin→Global only after accepted S2. ok_map/ok_map_gyr +
+                    // reject_s2(clip~0.8) painted a second wavy floor/walls.
                     const bool odin_densify_ok =
                         odin_global_insert_en && odin_map_full &&
                         !odin_map_full->empty() &&
