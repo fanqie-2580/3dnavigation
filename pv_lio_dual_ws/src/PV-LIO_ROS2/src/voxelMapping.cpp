@@ -117,11 +117,13 @@ constexpr float kOdinBodyZMin = -2.0f;
 constexpr float kOdinBodyZMax = 3.5f;
 // Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
 constexpr double kOdinStaticGyro = 0.05;
-// Tight-couple safety: Odin still enters IEKF, but Mid must dominate residuals.
+// Tight-couple safety: Odin enters IEKF only when Mid↔Odin end-time is close.
+// Large end_dt still densifies Global/publish (map-only) — keeps couple without yank.
 // Full Odin (~18k) vs Mid (~6k) previously yanked pose → km-scale divergence.
-constexpr size_t kOdinIekfMaxPts = 2500;
-constexpr double kIekfMaxUpd = 0.12;   // m, reject IEKF step (keep prior)
-constexpr double kIekfMaxRot = 0.10;   // rad ≈5.7°, reject IEKF step
+constexpr size_t kOdinIekfMaxPts = 1200;
+constexpr double kOdinIekfMaxEndDt = 0.05;  // s; beyond → Global only
+constexpr double kIekfMaxUpd = 0.08;   // m, reject IEKF step (keep prior)
+constexpr double kIekfMaxRot = 0.08;   // rad ≈4.6°, reject IEKF step
 // Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
 V3D last_global_map_pos = Zero3d;
 bool last_global_map_pose_ok = false;
@@ -1441,13 +1443,23 @@ int main(int argc, char** argv)
                 last_odin_good_n = gated.size();
                 *odin_map_full = gated;
                 odin_used_now = gated.size();
-                // Soften Odin residuals when Mid↔Odin end-time skew is large or moving.
+                const double edt = std::abs(bundle_end_dt);
+                // Soften when admitted; large skew → map-only (still fused into Global).
                 {
-                    const double edt = std::abs(bundle_end_dt);
-                    const double ratio = edt / 0.03;
+                    const double ratio = edt / 0.025;
                     double soft = std::max(1.0, ratio * ratio);
-                    if (!frame_quasi_static) soft *= 2.0;
-                    odin_frame_cov_scale = std::min(64.0, lidar2_cov_scale * soft);
+                    if (!frame_quasi_static) soft *= 2.5;
+                    odin_frame_cov_scale = std::min(128.0, lidar2_cov_scale * soft);
+                }
+                if (edt > kOdinIekfMaxEndDt)
+                {
+                    // Deskewed Odin keeps Global dense; skip IEKF to stop pose yank.
+                    odin_iekf_n = 0;
+                    const std::string tag_s = tag ? tag : "ok";
+                    odin_skip = (tag_s.find("nodeskew") != std::string::npos)
+                                   ? "ok_nodeskew_maponly"
+                                   : "ok_maponly";
+                    return true;
                 }
                 PointCloudXYZI iekf_cloud = subsample_odin_iekf(gated);
                 append_odin_iekf(iekf_cloud, tag);
