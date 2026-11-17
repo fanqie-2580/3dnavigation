@@ -110,28 +110,30 @@ double bundle_end_dt = 0.0;                // mid_end - (odin_end + bias)
 PointCloudXYZI::Ptr last_odin_fused(new PointCloudXYZI());
 double last_odin_fused_wall = -1.0;
 size_t last_odin_good_n = 0;
-// Measured sparse spikes: n_odin dropped to ~40 while normal ~20k → +0.3–0.4m cz jump.
-constexpr size_t kOdinMinPts = 4000;
-constexpr double kOdinMinFrac = 0.35;
-// Body-frame Z gate after T_L2 (m): cut ceiling/floor depth flicker on fused cz.
-constexpr float kOdinBodyZMin = -2.0f;
-constexpr float kOdinBodyZMax = 3.5f;
-// Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
-constexpr double kOdinStaticGyro = 0.05;
-// Two-stage tight couple (MA-LIO + FAST_LIO_MULTI mid_odin):
-// (1) Mid-only IEKF locks pose; (2) soft Odin with range cov, info downweight,
-//     residual clip, and gyro gate; reject S2 if it yanks Mid. Odin → Global.
-constexpr size_t kOdinIekfMaxPts = 400;
-constexpr double kOdinIekfMaxEndDt = 0.05;  // s; else Global-only (no stage-2)
-constexpr bool kOdinIekfEnable = true;
-constexpr double kOdinInfoWeight = 0.15;    // like Hb*W (stronger downweight)
-constexpr double kOdinRangeRef = 6.0;       // m; MA-LIO-like range growth
-constexpr double kOdinMaxResidual = 0.05;   // m; FAST_LIO_MULTI residual clip
-constexpr double kOdinS2GyrGate = 0.12;     // rad/s; skip S2 when moving
-constexpr double kIekfMaxUpd = 0.08;        // m, stage-1 Mid reject
-constexpr double kIekfMaxRot = 0.08;        // rad
-constexpr double kIekfS2MaxUpd = 0.015;     // m, stage-2 Odin reject vs Mid-locked
-constexpr double kIekfS2MaxRot = 0.025;     // rad ≈1.4°
+// Dual-tune knobs: defaults = 2e98c1d; override via config/dual_mid_odin_tune.py
+// (launch → dual_tune.*). Edit the .py and restart — no rebuild.
+int odin_min_pts = 4000;
+double odin_min_frac = 0.35;
+float odin_body_z_min = -2.0f;
+float odin_body_z_max = 3.5f;
+double odin_static_gyro = 0.05;
+int odin_iekf_max_pts = 400;
+double odin_iekf_max_end_dt = 0.05;
+bool odin_s2_enable = true;
+double odin_info_weight = 0.15;
+double odin_range_ref = 6.0;
+double odin_max_residual = 0.05;
+double odin_s2_gyr_gate = 0.12;
+double iekf_max_upd = 0.08;
+double iekf_max_rot = 0.08;
+double iekf_s2_max_upd = 0.015;
+double iekf_s2_max_rot = 0.025;
+double map_jump_upd = 0.05;
+double map_jump_frame = 0.12;
+int consec_bad_freeze = 2;
+float map_max_range = 25.0f;
+bool odin_global_insert_en = true;
+bool odin_body_pub_en = true;
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
 int iekf_odin_res_clip = 0;
@@ -143,14 +145,11 @@ V3D last_global_map_pos = Zero3d;
 bool last_global_map_pose_ok = false;
 int map_ins_ok = 0, map_skip_hold = 0, map_skip_jump = 0, map_skip_bad = 0;
 int iekf_reject_jump = 0;
-constexpr double kMapJumpUpd = 0.05;   // m, single EKF update
-constexpr double kMapJumpFrame = 0.12; // m, vs last inserted pose
 // After Mid match fails, IMU-only prop pollutes voxel map → reject_s1 cascade.
 // Freeze to last good lidar pose (FAST_LIO-like: no map update without valid residual).
 state_ikfom last_good_lidar_state;
 bool have_last_good_lidar = false;
 int consec_iekf_bad = 0;
-constexpr int kConsecBadFreeze = 2;
 // Per-frame Odin residual inflation (set when fusing).
 double odin_frame_cov_scale = 4.0;
 
@@ -1014,7 +1013,7 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + ptpl_list[i].d;
 
         // FAST_LIO_MULTI: clip large Odin point-to-plane residuals in stage-2.
-        if (iekf_odin_stage && std::fabs(pd2) > kOdinMaxResidual)
+        if (iekf_odin_stage && std::fabs(pd2) > odin_max_residual)
         {
             ekfom_data.h(i) = 0.0;
             ekfom_data.h_x.row(i).setZero();
@@ -1202,6 +1201,70 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_T_L2_wrt_odin_imu", extrinT_oi);
     node->get_parameter("mapping.extrinsic_R_L2_wrt_odin_imu", extrinR_oi);
     node->get_parameter("mapping.lidar2_cov_scale", lidar2_cov_scale);
+
+    // dual_tune.* from config/dual_mid_odin_tune.py (edit py → restart, no rebuild)
+    node->declare_parameter<int>("dual_tune.odin_min_pts", odin_min_pts);
+    node->declare_parameter<double>("dual_tune.odin_min_frac", odin_min_frac);
+    node->declare_parameter<double>("dual_tune.odin_body_z_min", odin_body_z_min);
+    node->declare_parameter<double>("dual_tune.odin_body_z_max", odin_body_z_max);
+    node->declare_parameter<double>("dual_tune.odin_static_gyro", odin_static_gyro);
+    node->declare_parameter<bool>("dual_tune.odin_s2_enable", odin_s2_enable);
+    node->declare_parameter<int>("dual_tune.odin_iekf_max_pts", odin_iekf_max_pts);
+    node->declare_parameter<double>("dual_tune.odin_iekf_max_end_dt", odin_iekf_max_end_dt);
+    node->declare_parameter<double>("dual_tune.odin_info_weight", odin_info_weight);
+    node->declare_parameter<double>("dual_tune.odin_range_ref", odin_range_ref);
+    node->declare_parameter<double>("dual_tune.odin_max_residual", odin_max_residual);
+    node->declare_parameter<double>("dual_tune.odin_s2_gyr_gate", odin_s2_gyr_gate);
+    node->declare_parameter<double>("dual_tune.iekf_max_upd", iekf_max_upd);
+    node->declare_parameter<double>("dual_tune.iekf_max_rot", iekf_max_rot);
+    node->declare_parameter<double>("dual_tune.iekf_s2_max_upd", iekf_s2_max_upd);
+    node->declare_parameter<double>("dual_tune.iekf_s2_max_rot", iekf_s2_max_rot);
+    node->declare_parameter<int>("dual_tune.consec_bad_freeze", consec_bad_freeze);
+    node->declare_parameter<double>("dual_tune.map_jump_upd", map_jump_upd);
+    node->declare_parameter<double>("dual_tune.map_jump_frame", map_jump_frame);
+    node->declare_parameter<double>("dual_tune.map_max_range", map_max_range);
+    node->declare_parameter<bool>("dual_tune.odin_global_insert_en", odin_global_insert_en);
+    node->declare_parameter<bool>("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
+    node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
+    {
+        double z0 = odin_body_z_min, z1 = odin_body_z_max;
+        node->get_parameter("dual_tune.odin_body_z_min", z0);
+        node->get_parameter("dual_tune.odin_body_z_max", z1);
+        odin_body_z_min = static_cast<float>(z0);
+        odin_body_z_max = static_cast<float>(z1);
+    }
+    node->get_parameter("dual_tune.odin_static_gyro", odin_static_gyro);
+    node->get_parameter("dual_tune.odin_s2_enable", odin_s2_enable);
+    node->get_parameter("dual_tune.odin_iekf_max_pts", odin_iekf_max_pts);
+    node->get_parameter("dual_tune.odin_iekf_max_end_dt", odin_iekf_max_end_dt);
+    node->get_parameter("dual_tune.odin_info_weight", odin_info_weight);
+    node->get_parameter("dual_tune.odin_range_ref", odin_range_ref);
+    node->get_parameter("dual_tune.odin_max_residual", odin_max_residual);
+    node->get_parameter("dual_tune.odin_s2_gyr_gate", odin_s2_gyr_gate);
+    node->get_parameter("dual_tune.iekf_max_upd", iekf_max_upd);
+    node->get_parameter("dual_tune.iekf_max_rot", iekf_max_rot);
+    node->get_parameter("dual_tune.iekf_s2_max_upd", iekf_s2_max_upd);
+    node->get_parameter("dual_tune.iekf_s2_max_rot", iekf_s2_max_rot);
+    node->get_parameter("dual_tune.consec_bad_freeze", consec_bad_freeze);
+    node->get_parameter("dual_tune.map_jump_upd", map_jump_upd);
+    node->get_parameter("dual_tune.map_jump_frame", map_jump_frame);
+    {
+        double mr = map_max_range;
+        node->get_parameter("dual_tune.map_max_range", mr);
+        map_max_range = static_cast<float>(mr);
+    }
+    node->get_parameter("dual_tune.odin_global_insert_en", odin_global_insert_en);
+    node->get_parameter("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    std::cout << "[dual_tune] s2=" << odin_s2_enable
+              << " end_dt=" << odin_iekf_max_end_dt
+              << " gyr=" << odin_s2_gyr_gate
+              << " res=" << odin_max_residual
+              << " cov_w=" << odin_info_weight
+              << " odin_global=" << odin_global_insert_en
+              << " odin_body=" << odin_body_pub_en
+              << std::endl;
+
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);
     // Yaml lists R row-major. Eigen comma-init is column-major; MAT_FROM_ARRAY
     // transposed Ry(±13°) → Odin tilted ~13° vs Mid. Load RowMajor explicitly.
@@ -1441,13 +1504,13 @@ int main(int argc, char** argv)
             auto subsample_odin_iekf = [&](const PointCloudXYZI &src) -> PointCloudXYZI {
                 PointCloudXYZI out;
                 if (src.empty()) return out;
-                if (src.size() <= kOdinIekfMaxPts)
+                const size_t max_pts = static_cast<size_t>(std::max(1, odin_iekf_max_pts));
+                if (src.size() <= max_pts)
                 {
                     out = src;
                     return out;
                 }
-                const size_t stride =
-                    (src.size() + kOdinIekfMaxPts - 1) / kOdinIekfMaxPts;
+                const size_t stride = (src.size() + max_pts - 1) / max_pts;
                 out.points.reserve((src.size() / stride) + 1);
                 for (size_t i = 0; i < src.size(); i += stride)
                     out.points.push_back(src.points[i]);
@@ -1470,9 +1533,9 @@ int main(int argc, char** argv)
                 return false;
             };
             auto odin_dense_enough = [&](size_t n) -> bool {
-                if (n < kOdinMinPts) return false;
+                if (n < odin_min_pts) return false;
                 if (last_odin_good_n > 0 &&
-                    n < static_cast<size_t>(kOdinMinFrac * static_cast<double>(last_odin_good_n)))
+                    n < static_cast<size_t>(odin_min_frac * static_cast<double>(last_odin_good_n)))
                     return false;
                 return true;
             };
@@ -1489,7 +1552,7 @@ int main(int argc, char** argv)
                     ++n;
                 }
                 if (n > 0) frame_gyr_mean = sum / n;
-                return n > 0 && frame_gyr_mean < kOdinStaticGyro;
+                return n > 0 && frame_gyr_mean < odin_static_gyro;
             };
             auto commit_odin_body = [&](PointCloudXYZI &odin_cloud, const char *tag) -> bool {
                 Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
@@ -1500,7 +1563,7 @@ int main(int argc, char** argv)
                 gated.points.reserve(odin_cloud.points.size());
                 for (const auto &pt : odin_cloud.points)
                 {
-                    if (pt.z < kOdinBodyZMin || pt.z > kOdinBodyZMax) continue;
+                    if (pt.z < odin_body_z_min || pt.z > odin_body_z_max) continue;
                     PointType q = pt;
                     q.intensity = 200.0f;
                     gated.points.push_back(q);
@@ -1526,9 +1589,9 @@ int main(int argc, char** argv)
                 const bool nodeskew = tag_s.find("nodeskew") != std::string::npos;
                 // Never merge Odin into Mid feats_undistort (that was single-shot yank).
                 // Gyro gate (FAST_LIO_MULTI): moving → map densify only.
-                const bool s2_time_ok = edt <= kOdinIekfMaxEndDt;
-                const bool s2_motion_ok = frame_gyr_mean < kOdinS2GyrGate;
-                if (kOdinIekfEnable && s2_time_ok && s2_motion_ok)
+                const bool s2_time_ok = edt <= odin_iekf_max_end_dt;
+                const bool s2_motion_ok = frame_gyr_mean < odin_s2_gyr_gate;
+                if (odin_s2_enable && s2_time_ok && s2_motion_ok)
                 {
                     *odin_iekf_body = subsample_odin_iekf(gated);
                     odin_iekf_n = odin_iekf_body->size();
@@ -1561,7 +1624,7 @@ int main(int argc, char** argv)
                         ++n;
                     }
                     frame_gyr_mean = (n > 0) ? (sum / n) : 0.0;
-                    frame_quasi_static = frame_gyr_mean < kOdinStaticGyro;
+                    frame_quasi_static = frame_gyr_mean < odin_static_gyro;
                 }
             }
 
@@ -1769,7 +1832,7 @@ int main(int argc, char** argv)
             // Mid match failed → restore & skip S2 (prevents IMU-only flyaway + soft Odin yank).
             const bool mid_no_eff = (last_mid_effct_feat_num < 1);
             bool jump_reject = (!state_bad) &&
-                (d_upd_chk > kIekfMaxUpd || d_rot_chk > kIekfMaxRot);
+                (d_upd_chk > iekf_max_upd || d_rot_chk > iekf_max_rot);
             if (state_bad || jump_reject || mid_no_eff)
             {
                 if (jump_reject)
@@ -1808,10 +1871,10 @@ int main(int argc, char** argv)
                     V3D point_this(pt.x, pt.y, pt.z);
                     M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
                     // Secondary-lidar info weight (constraint-fusion Hb*W).
-                    double s = odin_frame_cov_scale / std::max(1e-3, kOdinInfoWeight);
+                    double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
                     // MA-LIO-like point-wise: farther points → larger uncertainty.
                     const double r = point_this.norm();
-                    const double rr = r / kOdinRangeRef;
+                    const double rr = r / odin_range_ref;
                     s *= (1.0 + rr * rr);
                     if (s > 256.0) s = 256.0;
                     cov_lidar *= s;
@@ -1833,7 +1896,7 @@ int main(int argc, char** argv)
                     double s2_du = 0.0, s2_dr = 0.0;
                     iekf_jump_metrics(state_after_mid, state_s2, s2_du, s2_dr, s2_bad);
                     const bool s2_reject = s2_bad ||
-                        (s2_du > kIekfS2MaxUpd) || (s2_dr > kIekfS2MaxRot);
+                        (s2_du > iekf_s2_max_upd) || (s2_dr > iekf_s2_max_rot);
                     if (s2_reject)
                     {
                         ++iekf_reject_s2;
@@ -1873,7 +1936,7 @@ int main(int argc, char** argv)
             else
             {
                 ++consec_iekf_bad;
-                if (have_last_good_lidar && consec_iekf_bad >= kConsecBadFreeze)
+                if (have_last_good_lidar && consec_iekf_bad >= consec_bad_freeze)
                 {
                     kf.change_x(last_good_lidar_state);
                     state_point = last_good_lidar_state;
@@ -1909,12 +1972,12 @@ int main(int argc, char** argv)
                 // sticky d_frame>threshold alone — after init a ~0.15m settle
                 // permanently blocked all later inserts (ins_ok stuck at 0).
                 const bool jump_gate =
-                    frame_quasi_static && (d_upd > kMapJumpUpd);
+                    frame_quasi_static && (d_upd > map_jump_upd);
                 const char *skip_why = nullptr;
                 if (state_bad) { skip_why = "bad"; ++map_skip_bad; }
                 else if (fuse_is_hold) { skip_why = "hold"; ++map_skip_hold; }
                 else if (jump_gate) { skip_why = "jump"; ++map_skip_jump; }
-                (void)d_frame; (void)kMapJumpFrame;
+                (void)d_frame; (void)map_jump_frame;
 
                 if (skip_why == nullptr)
                 {
@@ -1923,10 +1986,12 @@ int main(int argc, char** argv)
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
                     const size_t odin_extra =
-                        (odin_map_full && !odin_map_full->empty()) ? odin_map_full->size() : 0;
+                        (odin_global_insert_en && odin_map_full &&
+                         !odin_map_full->empty())
+                            ? odin_map_full->size()
+                            : 0;
                     body_f->points.reserve(body_src->size() + odin_extra);
-                    constexpr float kMapMaxRange = 25.0f;
-                    const float r2max = kMapMaxRange * kMapMaxRange;
+                    const float r2max = map_max_range * map_max_range;
                     for (const auto &pt : body_src->points)
                     {
                         // Drop IEKF-subsampled Odin; re-add full cloud below.
@@ -2008,27 +2073,28 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
-            // Publish Mid + full Odin (hold is display-only; fresh uses odin_map_full).
-            PointCloudXYZI::Ptr pub_cloud;
-            if ((odin_display_only && !odin_display_only->empty()) ||
-                (odin_map_full && !odin_map_full->empty()))
+            // Publish Mid + optional Odin (odin_body_pub_en from dual_mid_odin_tune.py).
+            PointCloudXYZI::Ptr pub_cloud(new PointCloudXYZI());
             {
-                pub_cloud.reset(new PointCloudXYZI());
+                const bool odin_pub_have = odin_body_pub_en &&
+                    (((odin_map_full && !odin_map_full->empty()) ||
+                      (odin_display_only && !odin_display_only->empty())));
                 const auto &src = dense_pub_en ? *feats_undistort : *feats_down_body;
                 pub_cloud->points.reserve(
                     src.size() +
-                    (odin_display_only ? odin_display_only->size() : 0) +
-                    (odin_map_full ? odin_map_full->size() : 0));
+                    (odin_pub_have && odin_map_full ? odin_map_full->size() : 0) +
+                    (odin_pub_have && odin_display_only ? odin_display_only->size() : 0));
                 for (const auto &pt : src.points)
                 {
                     if (pt.intensity >= 150.0f) continue;  // drop IEKF subsample
                     pub_cloud->points.push_back(pt);
                 }
-                if (odin_map_full && !odin_map_full->empty())
+                if (odin_pub_have && odin_map_full && !odin_map_full->empty())
                     pub_cloud->points.insert(pub_cloud->points.end(),
                                             odin_map_full->points.begin(),
                                             odin_map_full->points.end());
-                else if (odin_display_only && !odin_display_only->empty())
+                else if (odin_pub_have && odin_display_only &&
+                         !odin_display_only->empty())
                     pub_cloud->points.insert(pub_cloud->points.end(),
                                             odin_display_only->points.begin(),
                                             odin_display_only->points.end());
