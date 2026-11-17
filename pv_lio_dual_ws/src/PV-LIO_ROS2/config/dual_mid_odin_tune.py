@@ -21,7 +21,7 @@ TUNE = {
     # Live: accept_s2 clip_r mean~0.82 → Odin≠Mid map but still densified (ghost walls).
     # FAST_LIO_MULTI / residual-outlier: reject S2 + skip Global Odin when clip high.
     # Live later: reject_s2 clip_r~0.85; early accept~0.45 still painted Odin layers.
-    "odin_s2_max_clip_ratio": 0.40,
+    "odin_s2_max_clip_ratio": 0.55,
 
     # --- IEKF jump reject ---
     "iekf_max_upd": 0.08,          # m, Mid stage-1
@@ -39,9 +39,8 @@ TUNE = {
     "map_require_still": False,
     "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
     "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
-    # Global densify still gated (require_s2 + clip). Keep False until clip stays low,
-    # or set True to densify only on good S2.
-    "odin_global_insert_en": False,
+    # True: Odin enters Global when S2 accepted and clip_r ≤ max (anti dual-wall).
+    "odin_global_insert_en": True,
     "odin_global_require_s2": True,
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
