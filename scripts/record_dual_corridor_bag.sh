@@ -8,7 +8,9 @@ set -eo pipefail
 OUT_ROOT="${BAG_OUT_ROOT:-/home/ll/pv_lio_dual_ws/bags}"
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT_DIR="${OUT_ROOT}/corridor_${STAMP}"
-mkdir -p "$OUT_DIR"
+# Only create parent; ros2 bag record creates OUT_DIR itself.
+mkdir -p "$OUT_ROOT"
+rmdir "$OUT_DIR" 2>/dev/null || true
 
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 # shellcheck disable=SC1091
