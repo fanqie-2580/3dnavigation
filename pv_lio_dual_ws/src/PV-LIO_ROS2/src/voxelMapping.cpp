@@ -145,6 +145,12 @@ int map_ins_ok = 0, map_skip_hold = 0, map_skip_jump = 0, map_skip_bad = 0;
 int iekf_reject_jump = 0;
 constexpr double kMapJumpUpd = 0.05;   // m, single EKF update
 constexpr double kMapJumpFrame = 0.12; // m, vs last inserted pose
+// After Mid match fails, IMU-only prop pollutes voxel map → reject_s1 cascade.
+// Freeze to last good lidar pose (FAST_LIO-like: no map update without valid residual).
+state_ikfom last_good_lidar_state;
+bool have_last_good_lidar = false;
+int consec_iekf_bad = 0;
+constexpr int kConsecBadFreeze = 2;
 // Per-frame Odin residual inflation (set when fusing).
 double odin_frame_cov_scale = 4.0;
 
@@ -213,7 +219,7 @@ std::vector<double> layer_point_size;
 bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
-double global_map_leaf_size = 0.08; // denser far ground without Odin overload
+double global_map_leaf_size = 0.1; // 0.08+huge span triggered PCL VoxelGrid overflow
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -1225,7 +1231,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.pub_voxel_map", false);
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
-    node->declare_parameter<double>("publish.global_map_leaf_size", 0.05);
+    node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
@@ -1856,6 +1862,27 @@ int main(int argc, char** argv)
                 }
             }
 
+            // Mid/S2 failed: do not keep integrating IMU into a wrong pose —
+            // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
+            if (!state_bad)
+            {
+                last_good_lidar_state = state_point;
+                have_last_good_lidar = true;
+                consec_iekf_bad = 0;
+            }
+            else
+            {
+                ++consec_iekf_bad;
+                if (have_last_good_lidar && consec_iekf_bad >= kConsecBadFreeze)
+                {
+                    kf.change_x(last_good_lidar_state);
+                    state_point = last_good_lidar_state;
+                    if ((consec_iekf_bad % 20) == 0)
+                        std::cout << "[pv-iekf] freeze_pose consec_bad="
+                                  << consec_iekf_bad << std::endl;
+                }
+            }
+
             // Voxel/map insert must use Mid downs, not stage-2 Odin cloud.
             *feats_down_body = *mid_down_body;
             var_down_body = mid_var_down;
@@ -1947,25 +1974,30 @@ int main(int argc, char** argv)
             (void)ext_t; (void)ext_R;
             // IEKF residual may use Odin; voxel map stays Mid-only to avoid
             // ~10cm extrinsic residual permanently smearing match surfaces.
-            for (size_t i = 0; i < feats_down_body->size(); i++) {
-                if (feats_down_body->points[i].intensity >= 199.5f) continue;
-                pointWithCov pv;
-                pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
-                M3D cov_lidar = var_down_body[i];
-                M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
+            // CRITICAL: never insert when Mid match failed — wrong pose pollutes
+            // planes → reject_s1 storm → visible drift / Eigen crash.
+            if (!state_bad)
+            {
+                for (size_t i = 0; i < feats_down_body->size(); i++) {
+                    if (feats_down_body->points[i].intensity >= 199.5f) continue;
+                    pointWithCov pv;
+                    pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
+                    M3D cov_lidar = var_down_body[i];
+                    M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
 
-                pv.cov = cov_world;
-                pv.point << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
-                pv_list.push_back(pv);
+                    pv.cov = cov_world;
+                    pv.point << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
+                    pv_list.push_back(pv);
+                }
+
+                t_update_start = omp_get_wtime();
+                std::sort(pv_list.begin(), pv_list.end(), var_contrast);
+                updateVoxelMapOMP(pv_list, max_voxel_size, max_layer, layer_size,
+                               max_points_size, max_points_size, min_eigen_value,
+                               voxel_map);
+                t_update_end = omp_get_wtime();
+                sum_update_time += t_update_end - t_update_start;
             }
-
-            t_update_start = omp_get_wtime();
-            std::sort(pv_list.begin(), pv_list.end(), var_contrast);
-            updateVoxelMapOMP(pv_list, max_voxel_size, max_layer, layer_size,
-                           max_points_size, max_points_size, min_eigen_value,
-                           voxel_map);
-            t_update_end = omp_get_wtime();
-            sum_update_time += t_update_end - t_update_start;
 
             scan_index++;
 

@@ -66,8 +66,8 @@
       pub_voxel_map: false
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
-      # 0.05 + dense Odin overloaded Jetson; 0.08 densifies far without killing Mid lock.
-      global_map_leaf_size: 0.08
+      # Keep 0.1: finer leaf + large pose span → PCL VoxelGrid integer overflow.
+      global_map_leaf_size: 0.1
       path_en: true
       scan_publish_en: true
       dense_publish_en: true
