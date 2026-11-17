@@ -181,14 +181,15 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 ```
 
 
-紧耦合 + 不拖影 + Odin 不消失：
+紧耦合 + 不拖影 + Odin 不消失 + 防漂：
 
 1. Odin deskew：**静止且 `|end_dt|≤30ms` 可不去畸变；否则 gyro-only chase Mid-end**（禁 accel）。
-2. **真紧耦合**：配对成功 → `feats_undistort` → IEKF 残差 + **Global 地图**（intensity≈200）；`cov×4`。
-3. **IEKF voxel 匹配面只写 Mid**（防外参残差污染）；**Global 仍含 Mid+Odin**。
-4. **防消失**：`drop_stale_mid`（lag>0.5s）+ Global **只体素化 pending**；`point_filter=2` 减算力。
-5. **防拖影**：运动时禁止 hold 进 IEKF/地图；仅静止时可 display-hold≤1s（Global 仍跳过 hold）。
-6. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**，yaml RowMajor。
+2. **真紧耦合**：配对成功 → Odin 进 IEKF 残差 + **Global**（intensity≈200）。
+3. **防漂（仍紧耦合）**：IEKF 只用 Odin **子样 ≤2500 点**（全量进 Global/显示）；`cov` 基线×16，并按 `|end_dt|/30ms`² 再抬（上限×64）；单帧 `|Δp|>12cm` 或 `|Δθ|>~5.7°` **整帧回滚**。
+4. **IEKF voxel 匹配面只写 Mid**；**Global = Mid + 全量 Odin**。
+5. **防消失**：`drop_stale_mid` + Global 只体素化 pending；`point_filter=2`。
+6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
+7. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**，yaml RowMajor。
 
 `skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 

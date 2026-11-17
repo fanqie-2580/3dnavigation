@@ -117,12 +117,20 @@ constexpr float kOdinBodyZMin = -2.0f;
 constexpr float kOdinBodyZMax = 3.5f;
 // Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
 constexpr double kOdinStaticGyro = 0.05;
+// Tight-couple safety: Odin still enters IEKF, but Mid must dominate residuals.
+// Full Odin (~18k) vs Mid (~6k) previously yanked pose → km-scale divergence.
+constexpr size_t kOdinIekfMaxPts = 2500;
+constexpr double kIekfMaxUpd = 0.12;   // m, reject IEKF step (keep prior)
+constexpr double kIekfMaxRot = 0.10;   // rad ≈5.7°, reject IEKF step
 // Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
 V3D last_global_map_pos = Zero3d;
 bool last_global_map_pose_ok = false;
 int map_ins_ok = 0, map_skip_hold = 0, map_skip_jump = 0, map_skip_bad = 0;
+int iekf_reject_jump = 0;
 constexpr double kMapJumpUpd = 0.05;   // m, single EKF update
 constexpr double kMapJumpFrame = 0.12; // m, vs last inserted pose
+// Per-frame Odin residual inflation (set when fusing).
+double odin_frame_cov_scale = 4.0;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_lidar2 = -1.0, last_timestamp_imu = -1.0, last_timestamp_imu2 = -1.0;
@@ -1339,19 +1347,40 @@ int main(int argc, char** argv)
 
             p_imu->Process(Measures, kf, feats_undistort);
             size_t odin_used_now = 0;
+            size_t odin_iekf_n = 0;
             const char *odin_skip = "none";
             bool fuse_is_hold = false;
             bool frame_quasi_static = false;
+            odin_frame_cov_scale = lidar2_cov_scale;
             const double now_wall = omp_get_wtime();
             // Display-only Odin (never into IEKF): hold of old body cloud at a
             // new Mid pose is the classic smear. Only allow when still.
             PointCloudXYZI::Ptr odin_display_only(new PointCloudXYZI());
+            // Full gated Odin for Global/publish; IEKF gets a subsample.
+            PointCloudXYZI::Ptr odin_map_full(new PointCloudXYZI());
+            auto subsample_odin_iekf = [&](const PointCloudXYZI &src) -> PointCloudXYZI {
+                PointCloudXYZI out;
+                if (src.empty()) return out;
+                if (src.size() <= kOdinIekfMaxPts)
+                {
+                    out = src;
+                    return out;
+                }
+                const size_t stride =
+                    (src.size() + kOdinIekfMaxPts - 1) / kOdinIekfMaxPts;
+                out.points.reserve((src.size() / stride) + 1);
+                for (size_t i = 0; i < src.size(); i += stride)
+                    out.points.push_back(src.points[i]);
+                out.width = out.points.size();
+                out.height = 1;
+                return out;
+            };
             auto append_odin_iekf = [&](PointCloudXYZI &odin_cloud, const char *tag) {
                 feats_undistort->points.insert(feats_undistort->points.end(),
                                                odin_cloud.points.begin(), odin_cloud.points.end());
                 feats_undistort->width = feats_undistort->size();
                 feats_undistort->height = 1;
-                odin_used_now = odin_cloud.size();
+                odin_iekf_n = odin_cloud.size();
                 odin_skip = tag;
             };
             auto hold_odin_display = [&](const char *tag) -> bool {
@@ -1410,7 +1439,18 @@ int main(int argc, char** argv)
                 *last_odin_fused = gated;
                 last_odin_fused_wall = now_wall;
                 last_odin_good_n = gated.size();
-                append_odin_iekf(gated, tag);
+                *odin_map_full = gated;
+                odin_used_now = gated.size();
+                // Soften Odin residuals when Mid↔Odin end-time skew is large or moving.
+                {
+                    const double edt = std::abs(bundle_end_dt);
+                    const double ratio = edt / 0.03;
+                    double soft = std::max(1.0, ratio * ratio);
+                    if (!frame_quasi_static) soft *= 2.0;
+                    odin_frame_cov_scale = std::min(64.0, lidar2_cov_scale * soft);
+                }
+                PointCloudXYZI iekf_cloud = subsample_odin_iekf(gated);
+                append_odin_iekf(iekf_cloud, tag);
                 return true;
             };
 
@@ -1496,6 +1536,8 @@ int main(int argc, char** argv)
                 std::cout << "[pv-dual] mid=" << Measures.lidar->size()
                           << " odin_in=" << (Measures.lidar2 ? Measures.lidar2->size() : 0)
                           << " odin_used=" << odin_used_now
+                          << " odin_iekf=" << odin_iekf_n
+                          << " odin_cov=" << odin_frame_cov_scale
                           << " imu2=" << Measures.imu2.size()
                           << " fused=" << feats_undistort->size()
                           << " pair_dt_ms="
@@ -1590,7 +1632,7 @@ int main(int argc, char** argv)
             for (auto & pt:feats_down_body->points) {
                 V3D point_this(pt.x, pt.y, pt.z);
                 M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                if (pt.intensity >= 200.0f) cov_lidar *= lidar2_cov_scale;
+                if (pt.intensity >= 200.0f) cov_lidar *= odin_frame_cov_scale;
                 var_down_body.push_back(cov_lidar);
             }
 
@@ -1609,23 +1651,46 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
 
-            // Guard against divergence: if the updated state is NaN or has blown up,
-            // restore the previous valid state to prevent crash
+            // Guard against divergence / Odin residual yank: restore prior state.
             state_point = kf.get_x();
             bool state_bad = std::isnan(state_point.pos(0)) || std::isnan(state_point.pos(1)) || std::isnan(state_point.pos(2));
-            // Check for position blow-up (normal driving should never exceed 1e4 meters)
             double pos_norm = state_point.pos.norm();
             if (pos_norm > 1e4) state_bad = true;
-            // Check rotation matrix validity (Frobenius norm of a valid SO3 should be ~sqrt(3)≈1.732)
             auto rot_coeffs = state_point.rot.coeffs();
             double rot_norm = 0;
             for (int i = 0; i < 4; i++) rot_norm += rot_coeffs[i] * rot_coeffs[i];
             if (std::isnan(rot_norm) || std::fabs(rot_norm - 1.0) > 0.1) state_bad = true;
-            if (state_bad)
+            const double d_upd_chk = (state_point.pos - state_before_update.pos).norm();
+            Eigen::Quaterniond q_before(
+                state_before_update.rot.coeffs()[3], state_before_update.rot.coeffs()[0],
+                state_before_update.rot.coeffs()[1], state_before_update.rot.coeffs()[2]);
+            Eigen::Quaterniond q_after(
+                state_point.rot.coeffs()[3], state_point.rot.coeffs()[0],
+                state_point.rot.coeffs()[1], state_point.rot.coeffs()[2]);
+            const double d_rot_chk = q_before.angularDistance(q_after);
+            bool jump_reject = (!state_bad) &&
+                (d_upd_chk > kIekfMaxUpd || d_rot_chk > kIekfMaxRot);
+            if (state_bad || jump_reject)
             {
-                RCLCPP_ERROR(node->get_logger(), "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.", pos_norm, rot_norm);
+                if (jump_reject)
+                {
+                    ++iekf_reject_jump;
+                    if ((iekf_reject_jump % 10) == 1)
+                        std::cout << "[pv-iekf] reject_jump d_upd=" << d_upd_chk
+                                  << " d_rot=" << d_rot_chk
+                                  << " odin_iekf=" << odin_iekf_n
+                                  << " cov=" << odin_frame_cov_scale
+                                  << " n=" << iekf_reject_jump << std::endl;
+                }
+                else
+                {
+                    RCLCPP_ERROR(node->get_logger(),
+                        "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.",
+                        pos_norm, rot_norm);
+                }
                 kf.change_x(state_before_update);
                 state_point = kf.get_x();
+                state_bad = true;  // skip Global/voxel insert this frame
             }
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1658,17 +1723,31 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
+                    // Global: Mid (from undistort) + full Odin (not IEKF subsample).
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                    body_f->points.reserve(body_src->size());
+                    const size_t odin_extra =
+                        (odin_map_full && !odin_map_full->empty()) ? odin_map_full->size() : 0;
+                    body_f->points.reserve(body_src->size() + odin_extra);
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
                     for (const auto &pt : body_src->points)
                     {
+                        // Drop IEKF-subsampled Odin; re-add full cloud below.
+                        if (pt.intensity >= 150.0f) continue;
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
                         body_f->points.push_back(pt);
+                    }
+                    if (odin_extra > 0)
+                    {
+                        for (const auto &pt : odin_map_full->points)
+                        {
+                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                            if (r2 > r2max) continue;
+                            body_f->points.push_back(pt);
+                        }
                     }
                     body_f->width = body_f->points.size();
                     body_f->height = 1;
@@ -1729,15 +1808,30 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
 
-            // Static display-only hold (not IEKF). Fresh Odin already in feats.
+            // Publish Mid + full Odin (hold is display-only; fresh uses odin_map_full).
             PointCloudXYZI::Ptr pub_cloud;
-            if (odin_display_only && !odin_display_only->empty())
+            if ((odin_display_only && !odin_display_only->empty()) ||
+                (odin_map_full && !odin_map_full->empty()))
             {
-                pub_cloud.reset(new PointCloudXYZI(
-                    dense_pub_en ? *feats_undistort : *feats_down_body));
-                pub_cloud->points.insert(pub_cloud->points.end(),
-                                        odin_display_only->points.begin(),
-                                        odin_display_only->points.end());
+                pub_cloud.reset(new PointCloudXYZI());
+                const auto &src = dense_pub_en ? *feats_undistort : *feats_down_body;
+                pub_cloud->points.reserve(
+                    src.size() +
+                    (odin_display_only ? odin_display_only->size() : 0) +
+                    (odin_map_full ? odin_map_full->size() : 0));
+                for (const auto &pt : src.points)
+                {
+                    if (pt.intensity >= 150.0f) continue;  // drop IEKF subsample
+                    pub_cloud->points.push_back(pt);
+                }
+                if (odin_map_full && !odin_map_full->empty())
+                    pub_cloud->points.insert(pub_cloud->points.end(),
+                                            odin_map_full->points.begin(),
+                                            odin_map_full->points.end());
+                else if (odin_display_only && !odin_display_only->empty())
+                    pub_cloud->points.insert(pub_cloud->points.end(),
+                                            odin_display_only->points.begin(),
+                                            odin_display_only->points.end());
                 pub_cloud->width = pub_cloud->size();
                 pub_cloud->height = 1;
             }
