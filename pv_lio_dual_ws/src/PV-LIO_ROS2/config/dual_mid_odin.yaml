@@ -46,11 +46,13 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
-      # Absolute Mid ground still ~-0.25m (body Odin near floor ~-0.29m); Mid pitch TBD.
-      # Ry -13.8°. Yaml R row-major.
-      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.078]
-      extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
+      # Live body Mid↔Odin 2026-11-17: yaml Ry-13.8° left ~6.2° ground-normal
+      # mismatch + Δz≈-12cm (double walls in RViz). Re-solved via Multi_LiCa-style
+      # ground PCA (roll/pitch/z) + constrained yaw/xy ICP (external repos, not
+      # workspace FAST_LIO_MULTI). Online EMA continue in voxelMapping.
+      # ground-only Multi_LiCa solve (yaw/xy ICP disabled online — caused Tx walk)
+      extrinsic_T_L2_wrt_L1: [0.1399412, -0.0117380, 0.2391580]
+      extrinsic_R_L2_wrt_L1: [0.9908896, 0.0004808, -0.1346758, -0.0031811, 0.9997982, -0.0198364, 0.1346391, 0.0200841, 0.9906912]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       # Stage-2 soft Odin (FAST_LIO_MULTI-like ×100 + residual clip 5cm + gyr gate).

@@ -188,12 +188,12 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 1. Odin deskew：**静止且 `|end_dt|≤30ms` 可不去畸变；否则 gyro-only chase Mid-end**（禁 accel）。
 2. **真紧耦合**：配对成功 → Odin 进 IEKF 残差 + **Global**（intensity≈200）。
 3. **两段式紧耦合（MA-LIO + FAST_LIO_MULTI mid_odin）**：① Mid-only 锁位姿；② `|end_dt|≤50ms` 且 `|ω|<0.12` 时软 Odin（≤400 点，`cov×100`×范围²，`|残差|>5cm` 置零）；二段 `|Δp|>1.5cm` 回滚。运动 → `ok_map_gyr`；大 skew → `ok_map*`（Odin 仍全量进 Global）。**Mid 失败 → 回滚并禁 S2**。
-4. **IEKF voxel 匹配面只写 Mid**；**Global Mid 始终可写**；**Odin 进 Global 仅当 S2 成功或 `|ω|<0.12` 且 `|end_dt|≤50ms`**（FAST_LIO_MULTI mid_odin 静止门控）。运动 `ok_map_gyr` 仍把全量 Odin 叠进 Global 会造成双墙重影。Mid 失败禁止写 voxel+Global，并 **ZUPT 清零速度**。
+4. **IEKF voxel 匹配面只写 Mid**；**Global Mid 始终可写**；**Odin 进 Global 仅当外参对齐门控通过** 且（S2 成功或 `|ω|<0.12` 且 `|end_dt|≤50ms`）。Mid 失败禁止写 voxel+Global，并 **ZUPT 清零速度**。
 5. **防消失**：`drop_stale_mid` + Global 只体素化 pending；Mid/Odin `point_filter=2`，Odin `max_range2=20`。
 6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
 7. **存图异步**：`/save_map` 快照后后台写 PCD。
 8. **远处地面**：单次经过更稀；`global_map_leaf_size=0.1`（过细 + 位姿飞了会 PCL overflow）。
-9. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.078]**，yaml RowMajor。
+9. 外参：yaml RowMajor；**在线对齐**（[Multi_LiCa](https://github.com/TUMFTM/Multi_LiCa) 地面 PCA roll/pitch/z + [multi_lidar_calibration_ros2](https://github.com/pixmoving-moveit/multi_lidar_calibration_ros2) 约束 yaw/xy ICP，EMA）。日志 `[pv-align]`；未对齐 → `ok_map_align` 禁 S2/Odin-Global。
 
 `skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 
@@ -310,6 +310,15 @@ colcon build --symlink-install --packages-select pv_lio --allow-overriding pv_li
 - `extrinsic_T_L2_wrt_L1` / `extrinsic_R_L2_wrt_L1`：Odin 相对 Mid
 - `global_map_leaf_size`：累积地图体素
 - `lidar2_max_sync_dt` / `lidar2_soft_wait_sec` / `lidar2_reuse_max_age`：双雷达时间配对与 Odin 复用
+
+2026-11-17 实测：旧 `Ry≈-13.8°/Tz=0.078` 体坐标系地面法向差 **~6°**、Δz **~-12cm** → RViz 双墙。已改为 **Multi_LiCa 地面 PCA** 解（在线 yaw/xy ICP 关掉，避免 Tx 漂移）：
+
+```text
+T ≈ [0.140, -0.012, 0.239]
+R row-major ≈ [0.9909, 0.0005, -0.1347, -0.0032, 0.9998, -0.0198, 0.1346, 0.0201, 0.9907]
+```
+
+体坐标验证：地面法向差 **~0.2°**、Δz **~0**。Global 仍可能有无回环 LIO 的扫描—地图残差；Odin 叠图受 `[pv-align]` 门控。
 
 方向约定（本机视觉标定）：
 
