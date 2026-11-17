@@ -193,7 +193,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
 7. **存图异步**：`/save_map` 快照后后台写 PCD。
 8. **远处地面**：单次经过更稀；`global_map_leaf_size=0.1`（过细 + 位姿飞了会 PCL overflow）。
-9. 外参：yaml RowMajor；**在线对齐**（[Multi_LiCa](https://github.com/TUMFTM/Multi_LiCa) 地面 PCA roll/pitch/z + [multi_lidar_calibration_ros2](https://github.com/pixmoving-moveit/multi_lidar_calibration_ros2) 约束 yaw/xy ICP，EMA）。日志 `[pv-align]`；未对齐 → `ok_map_align` 禁 S2/Odin-Global。
+9. 外参：yaml RowMajor；**Odin≈水平 → `R≈I`，机械 T≈[0.132,-0.010,0.078]**。禁止用地面 PCA 往 Mid 拧大俯仰（实测会把水平 Odin 拧成下斜并漂 Tz）。`[pv-align]` 默认只监控；未对齐 → `ok_map_align` 禁 S2/Odin-Global。
 
 `skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 
@@ -311,14 +311,16 @@ colcon build --symlink-install --packages-select pv_lio --allow-overriding pv_li
 - `global_map_leaf_size`：累积地图体素
 - `lidar2_max_sync_dt` / `lidar2_soft_wait_sec` / `lidar2_reuse_max_age`：双雷达时间配对与 Odin 复用
 
-2026-11-17 实测：旧 `Ry≈-13.8°/Tz=0.078` 体坐标系地面法向差 **~6°**、Δz **~-12cm** → RViz 双墙。已改为 **Multi_LiCa 地面 PCA** 解（在线 yaw/xy ICP 关掉，避免 Tx 漂移）：
+2026-11-17 RViz 侧视：洋红 Odin 下俯、绿 Mid 更直立。实测 **两雷达都近水平**，但 **Mid IMU≈+8.7° / Odin IMU≈-12.8°**。`camera_init` 用 Mid IMU 重力且 Mid `R_LI=I` → 整图带俯仰，Odin 前视楔形更显眼。勿用大 Ry 硬拧 Odin。当前：
 
 ```text
-T ≈ [0.140, -0.012, 0.239]
-R row-major ≈ [0.9909, 0.0005, -0.1347, -0.0032, 0.9998, -0.0198, 0.1346, 0.0201, 0.9907]
+Mid R_LI  : lidar up(+Z) → Mid IMU 重力   (~Ry -8.3°)
+Odin R_LI : lidar up → Odin IMU 重力      (deskew)
+R_L2      : I   (两雷达近水平)
+T_L2      : [0.132, -0.010, 0.078]
 ```
 
-体坐标验证：地面法向差 **~0.2°**、Δz **~0**。Global 仍可能有无回环 LIO 的扫描—地图残差；Odin 叠图受 `[pv-align]` 门控。
+`[pv-align]` 只监控。
 
 方向约定（本机视觉标定）：
 

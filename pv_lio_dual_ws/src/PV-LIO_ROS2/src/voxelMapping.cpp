@@ -392,9 +392,10 @@ static M3D rot_from_to(const V3D &a, const V3D &b)
     return Eye3d + vx + vx * vx * ((1.0 - c) / (s * s));
 }
 
-// Refine LiDAR2_R/T online; also snap current Odin-in-Mid cloud by the same delta.
-// Ground roll/pitch/z (Multi_LiCa calibrate_pitch) + constrained yaw/xy ICP
-// (multi_lidar_calibration_ros2 idea, yaw-only to avoid fighting ground).
+// Online Mid↔Odin extrinsic monitor / optional refine.
+// IMPORTANT: Odin1 is nearly horizontally mounted (raw ground ~2° vs +Z).
+// Applying Multi_LiCa ground-to-Mid Rodrigues (~7–8°) tilted the map downward
+// and walked Tz. Default: measure-only, do NOT mutate LiDAR2_R/T.
 static void online_align_extrinsic(const PointCloudXYZI &mid, PointCloudXYZI &odin_mid)
 {
     V3D nm, no;
@@ -402,8 +403,40 @@ static void online_align_extrinsic(const PointCloudXYZI &mid, PointCloudXYZI &od
     if (!fit_ground_pca(mid, nm, zm) || !fit_ground_pca(odin_mid, no, zo))
         return;
     double ang = std::acos(std::clamp(nm.dot(no), -1.0, 1.0)) * (180.0 / M_PI);
+    const double odin_tilt_z =
+        std::acos(std::clamp(no.z(), -1.0, 1.0)) * (180.0 / M_PI);
+    const double mid_tilt_z =
+        std::acos(std::clamp(nm.z(), -1.0, 1.0)) * (180.0 / M_PI);
     align_angle_deg = ang;
     align_dz = zo - zm;
+    // Both nearly level → treat as aligned for S2/Global gate (don't require
+    // Mid median-Z match; Mid lowest-12% z_med≈0 is not a reliable floor).
+    if (odin_tilt_z < 4.0 && mid_tilt_z < 4.0 && ang < 6.0)
+    {
+        ++align_ok_count;
+        if ((++align_attempt % 30) == 0)
+        {
+            std::cout << "[pv-align] monitor ang_deg=" << ang
+                      << " odin_tilt_z=" << odin_tilt_z
+                      << " mid_tilt_z=" << mid_tilt_z
+                      << " dz=" << align_dz
+                      << " ok=" << align_ok_count
+                      << " (no extrinsic update)" << std::endl;
+        }
+        return;
+    }
+    // Large residual: log only unless explicitly enabled.
+    constexpr bool kAlignUpdateExtrinsic = false;
+    if (!kAlignUpdateExtrinsic)
+    {
+        if ((++align_attempt % 30) == 0)
+        {
+            std::cout << "[pv-align] skip_update ang_deg=" << ang
+                      << " odin_tilt_z=" << odin_tilt_z
+                      << " dz=" << align_dz << std::endl;
+        }
+        return;
+    }
     if (ang < 0.30 && std::fabs(align_dz) < 0.025)
     {
         ++align_ok_count;
@@ -1876,13 +1909,15 @@ int main(int argc, char** argv)
                 PointCloudXYZI odin_cloud = *Measures.lidar2;
                 bool deskew_ok = true;
                 const char *tag = "ok";
-                // Stationary: skip Odin deskew (az noise) ONLY if Mid-end is
-                // close. |end_dt|>30ms + nodeskew left ground double layers.
+                // Prefer nodeskew whenever Mid-end is close: Odin IMU is pitched
+                // ~13° vs nearly-level Odin LiDAR; gyro deskew with bad R_LI
+                // wedges the cloud downward even after R_LI yaml fix.
                 frame_quasi_static = imu2_quasi_static();
                 const double mid_end_on_odin =
                     Measures.lidar_end_time - lidar2_stamp_bias_sec;
                 const bool nodeskew_ok =
-                    frame_quasi_static && (std::abs(bundle_end_dt) <= 0.03);
+                    (std::abs(bundle_end_dt) <= 0.05) &&
+                    (frame_quasi_static || frame_gyr_mean < 0.15);
                 if (nodeskew_ok)
                 {
                     tag = "ok_nodeskew";
