@@ -128,6 +128,8 @@ constexpr double kOdinInfoWeight = 0.15;    // like Hb*W (stronger downweight)
 constexpr double kOdinRangeRef = 6.0;       // m; MA-LIO-like range growth
 constexpr double kOdinMaxResidual = 0.05;   // m; FAST_LIO_MULTI residual clip
 constexpr double kOdinS2GyrGate = 0.12;     // rad/s; skip S2 when moving
+// FAST_LIO_MULTI mid_odin: only densify secondary lidar into map when still/synced.
+constexpr double kOdinMapInsertGyr = 0.12;  // rad/s; else Mid-only Global (anti ghost walls)
 constexpr double kIekfMaxUpd = 0.08;        // m, stage-1 Mid reject
 constexpr double kIekfMaxRot = 0.08;        // rad
 constexpr double kIekfS2MaxUpd = 0.015;     // m, stage-2 Odin reject vs Mid-locked
@@ -1820,6 +1822,7 @@ int main(int argc, char** argv)
 
             /*** Stage-2: soft Odin IEKF from Mid-locked state (true tight couple) ***/
             state_ikfom state_after_mid = kf.get_x();
+            bool odin_s2_accepted = false;
             if (!state_bad && odin_iekf_body && !odin_iekf_body->empty())
             {
                 *feats_down_body = *odin_iekf_body;
@@ -1873,6 +1876,7 @@ int main(int argc, char** argv)
                     else
                     {
                         ++iekf_accept_s2;
+                        odin_s2_accepted = true;
                         state_point = state_s2;
                         if ((iekf_accept_s2 % 50) == 1)
                             std::cout << "[pv-iekf] accept_s2 d_upd=" << s2_du
@@ -1966,12 +1970,18 @@ int main(int argc, char** argv)
 
                 if (skip_why == nullptr)
                 {
-                    // Global: Mid (from undistort) + full Odin (not IEKF subsample).
+                    // Global Mid always (when pose ok). Odin only when still+synced or
+                    // S2 accepted — motion ok_map_gyr was painting double walls.
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                    const size_t odin_extra =
-                        (odin_map_full && !odin_map_full->empty()) ? odin_map_full->size() : 0;
+                    const bool odin_have =
+                        (odin_map_full && !odin_map_full->empty());
+                    const bool odin_insert_ok = odin_have && !state_bad &&
+                        (odin_s2_accepted ||
+                         (frame_gyr_mean < kOdinMapInsertGyr &&
+                          std::abs(bundle_end_dt) <= kOdinIekfMaxEndDt));
+                    const size_t odin_extra = odin_insert_ok ? odin_map_full->size() : 0;
                     body_f->points.reserve(body_src->size() + odin_extra);
                     constexpr float kMapMaxRange = 25.0f;
                     const float r2max = kMapMaxRange * kMapMaxRange;
@@ -1991,6 +2001,12 @@ int main(int argc, char** argv)
                             if (r2 > r2max) continue;
                             body_f->points.push_back(pt);
                         }
+                    }
+                    else if (odin_have && ((map_ins_ok % 50) == 1))
+                    {
+                        std::cout << "[pv-map] odin_map_skip gyr=" << frame_gyr_mean
+                                  << " end_dt_ms=" << (bundle_end_dt * 1e3)
+                                  << " s2=" << odin_s2_accepted << std::endl;
                     }
                     body_f->width = body_f->points.size();
                     body_f->height = 1;
