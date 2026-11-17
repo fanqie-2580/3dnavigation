@@ -34,9 +34,10 @@ TUNE = {
     "map_jump_upd": 0.05,          # m; still + large EKF step → skip Global
     "map_jump_frame": 0.12,        # reserved
     "map_max_range": 25.0,         # m; body-range clip for Global densify
-    # Point-LIO/FAST_LIO_MULTI: don't paint Global while moving (Mid smear).
-    "map_require_still": True,
-    "map_still_gyr": 0.12,         # rad/s; same order as S2 gyr gate
+    # False: accumulate Global while walking (user needs live densify).
+    # True: only densify when |ω|<map_still_gyr (less smear, no walk growth).
+    "map_require_still": False,
+    "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
     "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
     # Global densify still gated (require_s2 + clip). Keep False until clip stays low,
     # or set True to densify only on good S2.
