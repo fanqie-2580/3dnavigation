@@ -66,13 +66,13 @@
       pub_voxel_map: false
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
-      # Keep 0.1: finer leaf + large pose span → PCL VoxelGrid integer overflow.
-      # 0.15: coarser leaf reduces Mid-motion smear visibility (PCL-safe).
-      global_map_leaf_size: 0.15
+      # Classic PV-LIO / avia_indoor: leaf 0.1 (finer than 0.15 → less “clump”).
+      # Do not go <<0.05 with huge pose span (PCL VoxelGrid int overflow).
+      global_map_leaf_size: 0.1
       path_en: true
       scan_publish_en: true
-      # Point-LIO-style: downs for publish/Global density (anti smear).
-      dense_publish_en: false
+      # Classic: dense undistort for Body/World publish (not sparse downs).
+      dense_publish_en: true
       scan_bodyframe_pub_en: true
     pcd_save:
       pcd_save_en: false

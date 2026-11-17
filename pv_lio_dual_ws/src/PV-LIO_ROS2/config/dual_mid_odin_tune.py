@@ -38,7 +38,8 @@ TUNE = {
     # True: only densify when |ω|<map_still_gyr (less smear, no walk growth).
     "map_require_still": False,
     "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
-    "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
+    # Classic PV-LIO: Global from dense undistort (downs@0.2 looked like clumps).
+    "map_use_downsample": False,
     # True: Odin enters Global with Mid inserts.
     # require_s2=True blocked all walk densify (S2 skipped when |ω|≥gyr_gate).
     "odin_global_insert_en": True,
