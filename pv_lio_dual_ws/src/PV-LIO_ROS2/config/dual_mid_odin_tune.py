@@ -18,6 +18,9 @@ TUNE = {
     "odin_range_ref": 6.0,         # m; range² cov growth
     "odin_max_residual": 0.05,     # m; residual clip
     "odin_s2_gyr_gate": 0.12,      # rad/s; skip S2 when moving
+    # Live: accept_s2 clip_r mean~0.82 → Odin≠Mid map but still densified (ghost walls).
+    # FAST_LIO_MULTI / residual-outlier: reject S2 + skip Global Odin when clip high.
+    "odin_s2_max_clip_ratio": 0.55,
 
     # --- IEKF jump reject ---
     "iekf_max_upd": 0.08,          # m, Mid stage-1
@@ -30,8 +33,11 @@ TUNE = {
     "map_jump_upd": 0.05,          # m; still + large EKF step → skip Global
     "map_jump_frame": 0.12,        # reserved
     "map_max_range": 25.0,         # m; body-range clip for Global densify
-    "odin_global_insert_en": True, # False → Mid-only Global (Odin still in Body)
-    "odin_body_pub_en": True,      # False → Mid-only Body/cloud_registered
+    "odin_global_insert_en": True,  # with require_s2 + clip gate (anti dual-wall)
+    # True: densify Odin only after accepted S2 (synced+good clip). Stops ok_map
+    # / ok_map_gyr painting dual walls (engcang/FAST_LIO_MULTI densify-when-fused).
+    "odin_global_require_s2": True,
+    "odin_body_pub_en": True,      # Body always can show Odin (alignment check)
 }
 
 

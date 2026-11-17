@@ -133,6 +133,8 @@ double map_jump_frame = 0.12;
 int consec_bad_freeze = 2;
 float map_max_range = 25.0f;
 bool odin_global_insert_en = true;
+bool odin_global_require_s2 = true;   // densify Odin only after good S2
+double odin_s2_max_clip_ratio = 0.55; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = true;
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
@@ -1224,6 +1226,8 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.map_jump_frame", map_jump_frame);
     node->declare_parameter<double>("dual_tune.map_max_range", map_max_range);
     node->declare_parameter<bool>("dual_tune.odin_global_insert_en", odin_global_insert_en);
+    node->declare_parameter<bool>("dual_tune.odin_global_require_s2", odin_global_require_s2);
+    node->declare_parameter<double>("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->declare_parameter<bool>("dual_tune.odin_body_pub_en", odin_body_pub_en);
     node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
     node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
@@ -1255,13 +1259,17 @@ int main(int argc, char** argv)
         map_max_range = static_cast<float>(mr);
     }
     node->get_parameter("dual_tune.odin_global_insert_en", odin_global_insert_en);
+    node->get_parameter("dual_tune.odin_global_require_s2", odin_global_require_s2);
+    node->get_parameter("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->get_parameter("dual_tune.odin_body_pub_en", odin_body_pub_en);
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
               << " gyr=" << odin_s2_gyr_gate
               << " res=" << odin_max_residual
+              << " clip_max=" << odin_s2_max_clip_ratio
               << " cov_w=" << odin_info_weight
               << " odin_global=" << odin_global_insert_en
+              << " req_s2=" << odin_global_require_s2
               << " odin_body=" << odin_body_pub_en
               << std::endl;
 
@@ -1860,6 +1868,8 @@ int main(int argc, char** argv)
 
             /*** Stage-2: soft Odin IEKF from Mid-locked state (true tight couple) ***/
             state_ikfom state_after_mid = kf.get_x();
+            bool odin_s2_accepted = false;
+            double odin_s2_clip_ratio = 1.0;
             if (!state_bad && odin_iekf_body && !odin_iekf_body->empty())
             {
                 *feats_down_body = *odin_iekf_body;
@@ -1890,12 +1900,19 @@ int main(int argc, char** argv)
                     sum_optimize_time += t_update_end - t_update_start;
                     iekf_odin_stage = false;
                     const int clipped = iekf_odin_res_clip - clip_before;
+                    odin_s2_clip_ratio =
+                        (odin_iekf_n > 0)
+                            ? (static_cast<double>(clipped) /
+                               static_cast<double>(odin_iekf_n))
+                            : 1.0;
 
                     state_ikfom state_s2 = kf.get_x();
                     bool s2_bad = false;
                     double s2_du = 0.0, s2_dr = 0.0;
                     iekf_jump_metrics(state_after_mid, state_s2, s2_du, s2_dr, s2_bad);
-                    const bool s2_reject = s2_bad ||
+                    const bool s2_clip_reject =
+                        odin_s2_clip_ratio > odin_s2_max_clip_ratio;
+                    const bool s2_reject = s2_bad || s2_clip_reject ||
                         (s2_du > iekf_s2_max_upd) || (s2_dr > iekf_s2_max_rot);
                     if (s2_reject)
                     {
@@ -1905,6 +1922,7 @@ int main(int argc, char** argv)
                                       << " d_rot=" << s2_dr
                                       << " odin_iekf=" << odin_iekf_n
                                       << " clip=" << clipped
+                                      << " clip_r=" << odin_s2_clip_ratio
                                       << " cov=" << odin_frame_cov_scale
                                       << " n=" << iekf_reject_s2 << std::endl;
                         kf.change_x(state_after_mid);
@@ -1913,12 +1931,14 @@ int main(int argc, char** argv)
                     else
                     {
                         ++iekf_accept_s2;
+                        odin_s2_accepted = true;
                         state_point = state_s2;
                         if ((iekf_accept_s2 % 50) == 1)
                             std::cout << "[pv-iekf] accept_s2 d_upd=" << s2_du
                                       << " d_rot=" << s2_dr
                                       << " odin_iekf=" << odin_iekf_n
                                       << " clip=" << clipped
+                                      << " clip_r=" << odin_s2_clip_ratio
                                       << " acc=" << iekf_accept_s2
                                       << " rej=" << iekf_reject_s2 << std::endl;
                     }
@@ -1985,11 +2005,24 @@ int main(int argc, char** argv)
                     PointCloudXYZI::Ptr body_src =
                         dense_pub_en ? feats_undistort : feats_down_body;
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
+                    // FAST_LIO_MULTI-style: densify secondary only when fused well.
+                    // Live root cause: ok_map/ok_map_gyr + high clip_r still painted
+                    // full Odin → dual-wall ghosts in Global.
+                    const bool odin_densify_ok =
+                        odin_global_insert_en && odin_map_full &&
+                        !odin_map_full->empty() &&
+                        (!odin_global_require_s2 || odin_s2_accepted);
                     const size_t odin_extra =
-                        (odin_global_insert_en && odin_map_full &&
-                         !odin_map_full->empty())
-                            ? odin_map_full->size()
-                            : 0;
+                        odin_densify_ok ? odin_map_full->size() : 0;
+                    if (!odin_densify_ok && odin_map_full &&
+                        !odin_map_full->empty() && ((map_ins_ok % 50) == 1))
+                    {
+                        std::cout << "[pv-map] odin_skip_global s2="
+                                  << odin_s2_accepted
+                                  << " clip_r=" << odin_s2_clip_ratio
+                                  << " req_s2=" << odin_global_require_s2
+                                  << std::endl;
+                    }
                     body_f->points.reserve(body_src->size() + odin_extra);
                     const float r2max = map_max_range * map_max_range;
                     for (const auto &pt : body_src->points)
