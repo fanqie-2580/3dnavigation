@@ -189,7 +189,8 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 4. **IEKF voxel 匹配面只写 Mid**；**Global = Mid + 全量 Odin**。
 5. **防消失**：`drop_stale_mid` + Global 只体素化 pending；`point_filter=2`。
 6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。
-7. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.099]**，yaml RowMajor。
+7. 外参：**Ry≈-13.8° / T≈[0.132,-0.010,0.078]**，yaml RowMajor。  
+   验证（2026-11-17）：Global Mid 地面≈−0.25m（相对安装偏高约5–10cm）；Odin 近处 body≈−0.29m；相对 Δz 约 +2cm 已用 Tz↓ 补偿。
 
 `skip=unpaired` 仍长期出现时看是否在 `drop_stale_mid`；异常则重启建图。
 

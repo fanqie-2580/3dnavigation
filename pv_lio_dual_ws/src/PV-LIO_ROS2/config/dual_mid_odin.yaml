@@ -44,9 +44,10 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Ground calib: after Tz 0.129 still +6.7cm @2–4m → Tz↓3cm more.
+      # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
+      # Absolute Mid ground still ~-0.25m (body Odin near floor ~-0.29m); Mid pitch TBD.
       # Ry -13.8°. Yaml R row-major.
-      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.0987]
+      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.078]
       extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
