@@ -10,24 +10,24 @@ TUNE = {
     "odin_body_z_max": 3.5,
     "odin_static_gyro": 0.05,      # rad/s; quasi-static (skip deskew)
 
-    # --- Stage-2 soft Odin IEKF ---
+    # --- Stage-2 soft Odin IEKF (true tight couple while walking) ---
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 400,
-    "odin_iekf_max_end_dt": 0.05,  # s; else Mid-only / Global densify path
-    "odin_info_weight": 0.15,
+    # Was 0.05 → most walk frames fell to ok_map (end_dt>50ms). Widen for S2.
+    "odin_iekf_max_end_dt": 0.12,
+    "odin_info_weight": 0.20,
     "odin_range_ref": 6.0,         # m; range² cov growth
-    "odin_max_residual": 0.05,     # m; residual clip
-    "odin_s2_gyr_gate": 0.12,      # rad/s; skip S2 when moving
-    # Live: accept_s2 clip_r mean~0.82 → Odin≠Mid map but still densified (ghost walls).
-    # FAST_LIO_MULTI / residual-outlier: reject S2 + skip Global Odin when clip high.
-    # Live later: reject_s2 clip_r~0.85; early accept~0.45 still painted Odin layers.
-    "odin_s2_max_clip_ratio": 0.55,
+    "odin_max_residual": 0.08,     # m; slightly looser so walk clip_r can accept
+    # Was 0.12 → ok_map_gyr dominated (~260/frame), S2 never ran while walking.
+    "odin_s2_gyr_gate": 2.0,       # rad/s; allow S2 during corridor walk
+    # Walk reject was clip~0.8 with max=0.55; raise so soft S2 can stick.
+    "odin_s2_max_clip_ratio": 0.90,
 
     # --- IEKF jump reject ---
     "iekf_max_upd": 0.08,          # m, Mid stage-1
     "iekf_max_rot": 0.08,          # rad
-    "iekf_s2_max_upd": 0.015,      # m, S2 vs Mid-locked
-    "iekf_s2_max_rot": 0.025,      # rad
+    "iekf_s2_max_upd": 0.03,       # m, S2 vs Mid-locked (walk needs a bit more)
+    "iekf_s2_max_rot": 0.04,       # rad
     "consec_bad_freeze": 2,        # Mid-fail frames → freeze last good pose
 
     # --- Global display map ---
@@ -40,10 +40,9 @@ TUNE = {
     "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
     # False: still frames use dense; moving frames use downs (code path).
     "map_use_downsample": False,
-    # Live 18:07 run: req_s2=1 → accept_s2 1/312 (clip~0.84>0.55) → Global几乎无Odin。
-    # False: ok_map* 可进图；C++ 仍在本帧 reject_s2 后禁 densify。
+    # Tight-couple map: densify Odin only after accept_s2 (S2 now runs while walking).
     "odin_global_insert_en": True,
-    "odin_global_require_s2": False,
+    "odin_global_require_s2": True,
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
 }
