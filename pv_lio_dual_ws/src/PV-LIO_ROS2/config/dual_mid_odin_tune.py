@@ -38,10 +38,12 @@ TUNE = {
     "map_require_still": True,
     "map_still_gyr": 0.12,         # rad/s; same order as S2 gyr gate
     "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
-    "odin_global_insert_en": False,  # Mid-only Global until Mid↔Odin clip stays low
+    # Global densify still gated (require_s2 + clip). Keep False until clip stays low,
+    # or set True to densify only on good S2.
+    "odin_global_insert_en": False,
     "odin_global_require_s2": True,
-    # Body+misaligned Odin looked like drift even when Global Odin was gated.
-    "odin_body_pub_en": False,
+    # Body MUST show Odin for live alignment check (display ≠ Global densify).
+    "odin_body_pub_en": True,
 }
 
 
