@@ -39,9 +39,10 @@ TUNE = {
     "map_require_still": False,
     "map_still_gyr": 0.12,         # rad/s; used only if map_require_still
     "map_use_downsample": True,    # Global uses Mid downs (not dense undistort)
-    # True: Odin enters Global when S2 accepted and clip_r ≤ max (anti dual-wall).
+    # True: Odin enters Global with Mid inserts.
+    # require_s2=True blocked all walk densify (S2 skipped when |ω|≥gyr_gate).
     "odin_global_insert_en": True,
-    "odin_global_require_s2": True,
+    "odin_global_require_s2": False,
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
 }
