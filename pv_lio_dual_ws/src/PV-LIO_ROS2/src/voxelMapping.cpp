@@ -213,7 +213,7 @@ std::vector<double> layer_point_size;
 bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
-double global_map_leaf_size = 0.05; // finer leaf: far single-pass ground denser (FAST_LIO-like)
+double global_map_leaf_size = 0.08; // denser far ground without Odin overload
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -1730,9 +1730,9 @@ int main(int argc, char** argv)
 
             auto iekf_jump_metrics = [&](const state_ikfom &a, const state_ikfom &b,
                                          double &d_upd, double &d_rot, bool &bad) {
-                bad = std::isnan(b.pos(0)) || std::isnan(b.pos(1)) || std::isnan(b.pos(2));
+                bad = !std::isfinite(b.pos(0)) || !std::isfinite(b.pos(1)) || !std::isfinite(b.pos(2));
                 const double pos_norm = b.pos.norm();
-                if (pos_norm > 1e4) bad = true;
+                if (!std::isfinite(pos_norm) || pos_norm > 1e4) bad = true;
                 auto rc = b.rot.coeffs();
                 double rn = 0;
                 for (int i = 0; i < 4; i++) rn += rc[i] * rc[i];
