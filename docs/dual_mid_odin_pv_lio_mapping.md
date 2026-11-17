@@ -185,7 +185,7 @@ env -i HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/usr/local/bin" \
 
 1. Odin deskew：**静止且 `|end_dt|≤30ms` 可不去畸变；否则 gyro-only chase Mid-end**（禁 accel）。
 2. **真紧耦合**：配对成功 → Odin 进 IEKF 残差 + **Global**（intensity≈200）。
-3. **防漂（仍紧耦合）**：`|end_dt|≤50ms` 时 Odin 进 IEKF（子样 ≤1200，`cov`×32 再按 end_dt² 抬，上限×128）；更大 skew → **`ok_maponly`（全量仍进 Global/显示）**；单帧 `|Δp|>8cm` / `|Δθ|>~4.6°` 回滚。
+3. **两段式紧耦合（参考 MA-LIO / 约束级融合）**：① Mid-only IEKF 锁位姿；② `|end_dt|≤50ms` 时软 Odin 二段（≤400 点；`cov×48`，再×`1/info_weight`，再×范围²）；二段相对 Mid `|Δp|>3cm` / `|Δθ|>~2°` 回滚。更大 skew → `ok_*_map`（Odin 仍全量进 Global）。
 4. **IEKF voxel 匹配面只写 Mid**；**Global = Mid + 全量 Odin**。
 5. **防消失**：`drop_stale_mid` + Global 只体素化 pending；`point_filter=2`。
 6. **防拖影**：运动禁止 hold 进 IEKF/地图；仅静止 display-hold≤1s。

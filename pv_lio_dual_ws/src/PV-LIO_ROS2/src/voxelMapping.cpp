@@ -117,13 +117,20 @@ constexpr float kOdinBodyZMin = -2.0f;
 constexpr float kOdinBodyZMax = 3.5f;
 // Quasi-static if mean |gyro| below this (rad/s); skip Odin deskew (noisy az).
 constexpr double kOdinStaticGyro = 0.05;
-// Tight-couple safety: Odin enters IEKF only when Mid↔Odin end-time is close.
-// Large end_dt still densifies Global/publish (map-only) — keeps couple without yank.
-// Full Odin (~18k) vs Mid (~6k) previously yanked pose → km-scale divergence.
-constexpr size_t kOdinIekfMaxPts = 1200;
-constexpr double kOdinIekfMaxEndDt = 0.05;  // s; beyond → Global only
-constexpr double kIekfMaxUpd = 0.08;   // m, reject IEKF step (keep prior)
-constexpr double kIekfMaxRot = 0.08;   // rad ≈4.6°, reject IEKF step
+// Two-stage tight couple (MA-LIO / constraint-fusion inspired):
+// (1) Mid-only IEKF locks pose; (2) soft Odin with point-wise range uncertainty
+// + secondary-lidar info downweight; reject S2 if it yanks Mid. Odin → Global always.
+constexpr size_t kOdinIekfMaxPts = 400;
+constexpr double kOdinIekfMaxEndDt = 0.05;  // s; else Global-only (no stage-2)
+constexpr bool kOdinIekfEnable = true;
+constexpr double kOdinInfoWeight = 0.25;    // like Hb*W: info↓ → cov×(1/W)
+constexpr double kOdinRangeRef = 6.0;       // m; MA-LIO-like range growth
+constexpr double kIekfMaxUpd = 0.08;        // m, stage-1 Mid reject
+constexpr double kIekfMaxRot = 0.08;        // rad
+constexpr double kIekfS2MaxUpd = 0.03;      // m, stage-2 Odin reject vs Mid-locked
+constexpr double kIekfS2MaxRot = 0.035;     // rad ≈2°
+int iekf_reject_s2 = 0;
+int iekf_accept_s2 = 0;
 // Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
 V3D last_global_map_pos = Zero3d;
 bool last_global_map_pose_ok = false;
@@ -1358,8 +1365,9 @@ int main(int argc, char** argv)
             // Display-only Odin (never into IEKF): hold of old body cloud at a
             // new Mid pose is the classic smear. Only allow when still.
             PointCloudXYZI::Ptr odin_display_only(new PointCloudXYZI());
-            // Full gated Odin for Global/publish; IEKF gets a subsample.
+            // Full gated Odin for Global/publish; stage-2 IEKF uses a subsample.
             PointCloudXYZI::Ptr odin_map_full(new PointCloudXYZI());
+            PointCloudXYZI::Ptr odin_iekf_body(new PointCloudXYZI());
             auto subsample_odin_iekf = [&](const PointCloudXYZI &src) -> PointCloudXYZI {
                 PointCloudXYZI out;
                 if (src.empty()) return out;
@@ -1376,14 +1384,6 @@ int main(int argc, char** argv)
                 out.width = out.points.size();
                 out.height = 1;
                 return out;
-            };
-            auto append_odin_iekf = [&](PointCloudXYZI &odin_cloud, const char *tag) {
-                feats_undistort->points.insert(feats_undistort->points.end(),
-                                               odin_cloud.points.begin(), odin_cloud.points.end());
-                feats_undistort->width = feats_undistort->size();
-                feats_undistort->height = 1;
-                odin_iekf_n = odin_cloud.size();
-                odin_skip = tag;
             };
             auto hold_odin_display = [&](const char *tag) -> bool {
                 if (!frame_quasi_static) return false;
@@ -1444,25 +1444,28 @@ int main(int argc, char** argv)
                 *odin_map_full = gated;
                 odin_used_now = gated.size();
                 const double edt = std::abs(bundle_end_dt);
-                // Soften when admitted; large skew → map-only (still fused into Global).
                 {
                     const double ratio = edt / 0.025;
                     double soft = std::max(1.0, ratio * ratio);
                     if (!frame_quasi_static) soft *= 2.5;
-                    odin_frame_cov_scale = std::min(128.0, lidar2_cov_scale * soft);
+                    // Stage-2 is soft on purpose (on top of yaml lidar2_cov_scale).
+                    odin_frame_cov_scale = std::min(128.0, lidar2_cov_scale * soft * 2.0);
                 }
-                if (edt > kOdinIekfMaxEndDt)
+                const std::string tag_s = tag ? tag : "ok";
+                const bool nodeskew = tag_s.find("nodeskew") != std::string::npos;
+                // Never merge Odin into Mid feats_undistort (that was single-shot yank).
+                if (kOdinIekfEnable && edt <= kOdinIekfMaxEndDt)
                 {
-                    // Deskewed Odin keeps Global dense; skip IEKF to stop pose yank.
-                    odin_iekf_n = 0;
-                    const std::string tag_s = tag ? tag : "ok";
-                    odin_skip = (tag_s.find("nodeskew") != std::string::npos)
-                                   ? "ok_nodeskew_maponly"
-                                   : "ok_maponly";
-                    return true;
+                    *odin_iekf_body = subsample_odin_iekf(gated);
+                    odin_iekf_n = odin_iekf_body->size();
+                    odin_skip = nodeskew ? "ok_nodeskew_s2" : "ok_s2";
                 }
-                PointCloudXYZI iekf_cloud = subsample_odin_iekf(gated);
-                append_odin_iekf(iekf_cloud, tag);
+                else
+                {
+                    odin_iekf_body->clear();
+                    odin_iekf_n = 0;
+                    odin_skip = nodeskew ? "ok_nodeskew_map" : "ok_map";
+                }
                 return true;
             };
 
@@ -1632,7 +1635,7 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            /*** downsample the feature points in a scan ***/
+            /*** downsample Mid features (Odin stays out of feats_undistort) ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
 
@@ -1644,42 +1647,46 @@ int main(int argc, char** argv)
             for (auto & pt:feats_down_body->points) {
                 V3D point_this(pt.x, pt.y, pt.z);
                 M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                if (pt.intensity >= 200.0f) cov_lidar *= odin_frame_cov_scale;
                 var_down_body.push_back(cov_lidar);
             }
 
-            /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
                 RCLCPP_WARN(node->get_logger(), "No point, skip this scan!");
                 continue;
             }
 
-            /*** iterated state estimation ***/
+            auto iekf_jump_metrics = [&](const state_ikfom &a, const state_ikfom &b,
+                                         double &d_upd, double &d_rot, bool &bad) {
+                bad = std::isnan(b.pos(0)) || std::isnan(b.pos(1)) || std::isnan(b.pos(2));
+                const double pos_norm = b.pos.norm();
+                if (pos_norm > 1e4) bad = true;
+                auto rc = b.rot.coeffs();
+                double rn = 0;
+                for (int i = 0; i < 4; i++) rn += rc[i] * rc[i];
+                if (std::isnan(rn) || std::fabs(rn - 1.0) > 0.1) bad = true;
+                d_upd = (b.pos - a.pos).norm();
+                Eigen::Quaterniond qa(a.rot.coeffs()[3], a.rot.coeffs()[0],
+                                      a.rot.coeffs()[1], a.rot.coeffs()[2]);
+                Eigen::Quaterniond qb(b.rot.coeffs()[3], b.rot.coeffs()[0],
+                                      b.rot.coeffs()[1], b.rot.coeffs()[2]);
+                d_rot = qa.angularDistance(qb);
+            };
+
+            /*** Stage-1: Mid-only IEKF (lock pose) ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             state_ikfom state_before_update = kf.get_x();
+            PointCloudXYZI::Ptr mid_down_body(new PointCloudXYZI(*feats_down_body));
+            std::vector<M3D> mid_var_down = var_down_body;
             kf.update_iterated_dyn_share_diagonal();
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
 
-            // Guard against divergence / Odin residual yank: restore prior state.
             state_point = kf.get_x();
-            bool state_bad = std::isnan(state_point.pos(0)) || std::isnan(state_point.pos(1)) || std::isnan(state_point.pos(2));
-            double pos_norm = state_point.pos.norm();
-            if (pos_norm > 1e4) state_bad = true;
-            auto rot_coeffs = state_point.rot.coeffs();
-            double rot_norm = 0;
-            for (int i = 0; i < 4; i++) rot_norm += rot_coeffs[i] * rot_coeffs[i];
-            if (std::isnan(rot_norm) || std::fabs(rot_norm - 1.0) > 0.1) state_bad = true;
-            const double d_upd_chk = (state_point.pos - state_before_update.pos).norm();
-            Eigen::Quaterniond q_before(
-                state_before_update.rot.coeffs()[3], state_before_update.rot.coeffs()[0],
-                state_before_update.rot.coeffs()[1], state_before_update.rot.coeffs()[2]);
-            Eigen::Quaterniond q_after(
-                state_point.rot.coeffs()[3], state_point.rot.coeffs()[0],
-                state_point.rot.coeffs()[1], state_point.rot.coeffs()[2]);
-            const double d_rot_chk = q_before.angularDistance(q_after);
+            bool state_bad = false;
+            double d_upd_chk = 0.0, d_rot_chk = 0.0;
+            iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
             bool jump_reject = (!state_bad) &&
                 (d_upd_chk > kIekfMaxUpd || d_rot_chk > kIekfMaxRot);
             if (state_bad || jump_reject)
@@ -1688,22 +1695,86 @@ int main(int argc, char** argv)
                 {
                     ++iekf_reject_jump;
                     if ((iekf_reject_jump % 10) == 1)
-                        std::cout << "[pv-iekf] reject_jump d_upd=" << d_upd_chk
+                        std::cout << "[pv-iekf] reject_s1 d_upd=" << d_upd_chk
                                   << " d_rot=" << d_rot_chk
-                                  << " odin_iekf=" << odin_iekf_n
-                                  << " cov=" << odin_frame_cov_scale
                                   << " n=" << iekf_reject_jump << std::endl;
                 }
                 else
                 {
                     RCLCPP_ERROR(node->get_logger(),
-                        "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.",
-                        pos_norm, rot_norm);
+                        "Divergence detected (pos_norm=%.1f)! Restoring previous state.",
+                        state_point.pos.norm());
                 }
                 kf.change_x(state_before_update);
                 state_point = kf.get_x();
-                state_bad = true;  // skip Global/voxel insert this frame
+                state_bad = true;
             }
+
+            /*** Stage-2: soft Odin IEKF from Mid-locked state (true tight couple) ***/
+            state_ikfom state_after_mid = kf.get_x();
+            if (!state_bad && odin_iekf_body && !odin_iekf_body->empty())
+            {
+                *feats_down_body = *odin_iekf_body;
+                sort(feats_down_body->points.begin(), feats_down_body->points.end(), time_list);
+                feats_down_size = feats_down_body->points.size();
+                var_down_body.clear();
+                for (auto &pt : feats_down_body->points)
+                {
+                    V3D point_this(pt.x, pt.y, pt.z);
+                    M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
+                    // Secondary-lidar info weight (constraint-fusion Hb*W).
+                    double s = odin_frame_cov_scale / std::max(1e-3, kOdinInfoWeight);
+                    // MA-LIO-like point-wise: farther points → larger uncertainty.
+                    const double r = point_this.norm();
+                    const double rr = r / kOdinRangeRef;
+                    s *= (1.0 + rr * rr);
+                    if (s > 256.0) s = 256.0;
+                    cov_lidar *= s;
+                    var_down_body.push_back(cov_lidar);
+                }
+                if (feats_down_size >= 5)
+                {
+                    t_update_start = omp_get_wtime();
+                    kf.update_iterated_dyn_share_diagonal();
+                    t_update_end = omp_get_wtime();
+                    sum_optimize_time += t_update_end - t_update_start;
+
+                    state_ikfom state_s2 = kf.get_x();
+                    bool s2_bad = false;
+                    double s2_du = 0.0, s2_dr = 0.0;
+                    iekf_jump_metrics(state_after_mid, state_s2, s2_du, s2_dr, s2_bad);
+                    const bool s2_reject = s2_bad ||
+                        (s2_du > kIekfS2MaxUpd) || (s2_dr > kIekfS2MaxRot);
+                    if (s2_reject)
+                    {
+                        ++iekf_reject_s2;
+                        if ((iekf_reject_s2 % 10) == 1)
+                            std::cout << "[pv-iekf] reject_s2 d_upd=" << s2_du
+                                      << " d_rot=" << s2_dr
+                                      << " odin_iekf=" << odin_iekf_n
+                                      << " cov=" << odin_frame_cov_scale
+                                      << " n=" << iekf_reject_s2 << std::endl;
+                        kf.change_x(state_after_mid);
+                        state_point = state_after_mid;
+                    }
+                    else
+                    {
+                        ++iekf_accept_s2;
+                        state_point = state_s2;
+                        if ((iekf_accept_s2 % 50) == 1)
+                            std::cout << "[pv-iekf] accept_s2 d_upd=" << s2_du
+                                      << " d_rot=" << s2_dr
+                                      << " odin_iekf=" << odin_iekf_n
+                                      << " acc=" << iekf_accept_s2
+                                      << " rej=" << iekf_reject_s2 << std::endl;
+                    }
+                }
+            }
+
+            // Voxel/map insert must use Mid downs, not stage-2 Odin cloud.
+            *feats_down_body = *mid_down_body;
+            var_down_body = mid_var_down;
+            feats_down_size = feats_down_body->points.size();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];

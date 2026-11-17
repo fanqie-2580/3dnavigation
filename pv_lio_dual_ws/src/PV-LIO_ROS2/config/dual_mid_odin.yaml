@@ -51,8 +51,8 @@
       extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
       extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # Soft Odin residuals when |end_dt|≤50ms (else Global-only). Runtime × end_dt^2.
-      lidar2_cov_scale: 32.0
+      # Stage-2 soft Odin (|end_dt|≤50ms): base×info_weight×range² (MA-LIO-like).
+      lidar2_cov_scale: 48.0
     noise_model:
       ranging_cov: 0.04
       angle_cov: 0.1
