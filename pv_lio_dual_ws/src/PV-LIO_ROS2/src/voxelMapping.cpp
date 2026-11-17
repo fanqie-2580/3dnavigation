@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <atomic>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -135,6 +136,7 @@ int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
 int iekf_odin_res_clip = 0;
 bool iekf_odin_stage = false;              // observation_model: clip Odin residuals
+int last_mid_effct_feat_num = 0;           // Mid stage effective residuals
 double frame_gyr_mean = 0.0;
 // Global display-map insert gate (hold/jump left permanent ~1m colored ghosts).
 V3D last_global_map_pos = Zero3d;
@@ -211,11 +213,12 @@ std::vector<double> layer_point_size;
 bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
-double global_map_leaf_size = 0.1;  // closer to official dense scans.pcd; timer has empty-filter fallback
+double global_map_leaf_size = 0.05; // finer leaf: far single-pass ground denser (FAST_LIO-like)
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
 std::string pcd_save_path;
+std::atomic<bool> save_map_busy{false};
 
 std::unordered_map<VOXEL_LOC, OctoTree *> voxel_map;
 std::mutex global_cloud_map_mtx;
@@ -961,6 +964,8 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
     double match_end = omp_get_wtime();
 
     effct_feat_num = ptpl_list.size();
+    if (!iekf_odin_stage)
+        last_mid_effct_feat_num = effct_feat_num;
     if (effct_feat_num < 1){
         ekfom_data.valid = false;
         RCLCPP_WARN(rclcpp::get_logger("pv_lio"), "No Effective Points!");
@@ -1064,16 +1069,52 @@ bool saveMapToFile(const std::string &dir) {
     }
 }
 
+// Async save (FAST_LIO-like): snapshot under lock, write PCD off the mapping thread
+// so SingleThreadedExecutor is not blocked by ~90MB disk IO → IMU backlog/divergence.
 void saveMapCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
     has_save_opt = true;
-    if (saveMapToFile(pcd_save_path)) {
-        res->success = true;
-        res->message = "Map saved successfully.";
-    } else {
+    if (save_map_busy.exchange(true)) {
         res->success = false;
-        res->message = "Failed to save map.";
+        res->message = "Save already in progress.";
+        return;
     }
+
+    mkdir(pcd_save_path.c_str(), 0775);
+    time_t now = time(nullptr);
+    struct tm *t = localtime(&now);
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s/map_%04d%02d%02d_%02d%02d%02d.pcd",
+             pcd_save_path.c_str(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+    const std::string path(filename);
+
+    PointCloudXYZI::Ptr map_copy(new PointCloudXYZI());
+    {
+        std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+        *map_copy = *global_cloud_map;
+    }
+    if (map_copy->empty()) {
+        save_map_busy.store(false);
+        res->success = false;
+        res->message = "Map is empty, nothing to save.";
+        return;
+    }
+
+    std::thread([map_copy, path]() {
+        const int ret = pcl::io::savePCDFileBinary(path, *map_copy);
+        if (ret == 0) {
+            RCLCPP_INFO(rclcpp::get_logger("pv_lio"),
+                        "Map saved (async) to %s (%zu points)", path.c_str(), map_copy->size());
+        } else {
+            RCLCPP_ERROR(rclcpp::get_logger("pv_lio"),
+                         "Async map save failed: %s", path.c_str());
+        }
+        save_map_busy.store(false);
+    }).detach();
+
+    res->success = true;
+    res->message = std::string("Async map save started: ") + path;
 }
 
 
@@ -1184,12 +1225,13 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.pub_voxel_map", false);
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
-    node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
+    node->declare_parameter<double>("publish.global_map_leaf_size", 0.05);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
-    if (global_map_leaf_size < 0.05) global_map_leaf_size = 0.05;
+    // Allow 0.05 for denser far ground; clamp extremes for PCL VoxelGrid safety.
+    if (global_map_leaf_size < 0.03) global_map_leaf_size = 0.03;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
 
     node->declare_parameter<double>("preprocess.blind", 0.01);
@@ -1709,6 +1751,7 @@ int main(int argc, char** argv)
             state_ikfom state_before_update = kf.get_x();
             PointCloudXYZI::Ptr mid_down_body(new PointCloudXYZI(*feats_down_body));
             std::vector<M3D> mid_var_down = var_down_body;
+            last_mid_effct_feat_num = 0;
             kf.update_iterated_dyn_share_diagonal();
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
@@ -1717,9 +1760,11 @@ int main(int argc, char** argv)
             bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
             iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
+            // Mid match failed → restore & skip S2 (prevents IMU-only flyaway + soft Odin yank).
+            const bool mid_no_eff = (last_mid_effct_feat_num < 1);
             bool jump_reject = (!state_bad) &&
                 (d_upd_chk > kIekfMaxUpd || d_rot_chk > kIekfMaxRot);
-            if (state_bad || jump_reject)
+            if (state_bad || jump_reject || mid_no_eff)
             {
                 if (jump_reject)
                 {
@@ -1729,11 +1774,15 @@ int main(int argc, char** argv)
                                   << " d_rot=" << d_rot_chk
                                   << " n=" << iekf_reject_jump << std::endl;
                 }
-                else
+                else if (state_bad)
                 {
                     RCLCPP_ERROR(node->get_logger(),
                         "Divergence detected (pos_norm=%.1f)! Restoring previous state.",
                         state_point.pos.norm());
+                }
+                else if ((iekf_reject_jump % 20) == 1)
+                {
+                    std::cout << "[pv-iekf] skip_s2 mid_no_eff" << std::endl;
                 }
                 kf.change_x(state_before_update);
                 state_point = kf.get_x();

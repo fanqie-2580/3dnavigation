@@ -25,10 +25,11 @@
       max_range: 25.0
       feature_extract_enable: false
       lidar_type2: 6
-      point_filter_num2: 2
+      # Keep denser Odin for far ground (FAST_LIO PCD accumulates denser scans).
+      point_filter_num2: 1
       blind2: 0.3
       min_range2: 0.3
-      max_range2: 20.0
+      max_range2: 25.0
       min_confidence2: 40.0
     mapping:
       down_sample_size: 0.20
@@ -64,8 +65,8 @@
       pub_voxel_map: false
       publish_global_cloud_map: true
       publish_max_voxel_layer: 1
-      # Official has no Global leaf; 0.2 looked sparse. 0.1 ≈ dense indoor scans.pcd.
-      global_map_leaf_size: 0.1
+      # Finer leaf: start densifies via revisits; far is single-pass — 0.05 keeps more ground.
+      global_map_leaf_size: 0.05
       path_en: true
       scan_publish_en: true
       dense_publish_en: true
