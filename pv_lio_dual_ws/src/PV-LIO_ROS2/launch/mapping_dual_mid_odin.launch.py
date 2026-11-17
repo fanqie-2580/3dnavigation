@@ -23,12 +23,17 @@ def generate_launch_description():
     tune_params = _load_tune_params(pkg_dir)
     return LaunchDescription([
         DeclareLaunchArgument('rviz', default_value='false'),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
         Node(
             package='pv_lio',
             executable='pv_lio_node',
             name='pv_lio_dual',
             output='screen',
-            parameters=[yaml_path, tune_params],
+            parameters=[
+                yaml_path,
+                tune_params,
+                {'use_sim_time': LaunchConfiguration('use_sim_time')},
+            ],
         ),
         Node(
             package='rviz2',
@@ -36,5 +41,6 @@ def generate_launch_description():
             name='rviz2_dual',
             arguments=['-d', os.path.join(pkg_dir, 'config', 'rviz_cfg', 'voxel_mapping.rviz')],
             condition=IfCondition(LaunchConfiguration('rviz')),
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
         ),
     ])
