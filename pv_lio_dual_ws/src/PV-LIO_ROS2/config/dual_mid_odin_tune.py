@@ -9,15 +9,16 @@ TUNE = {
     "odin_body_z_max": 3.5,
     "odin_static_gyro": 0.05,
 
-    # --- Stage-2 soft Odin IEKF ---
+    # --- Stage-2 soft Odin IEKF (stronger tight-couple than prior 0.20/400) ---
+    # Raise Odin voice in IEKF while keeping Mid S1 lock + jump/vel safety.
     "odin_s2_enable": True,
-    "odin_iekf_max_pts": 400,
-    "odin_iekf_max_end_dt": 0.12,
-    "odin_info_weight": 0.20,
+    "odin_iekf_max_pts": 800,
+    "odin_iekf_max_end_dt": 0.15,
+    "odin_info_weight": 0.40,
     "odin_range_ref": 6.0,
-    "odin_max_residual": 0.08,
-    "odin_s2_gyr_gate": 2.0,
-    "odin_s2_max_clip_ratio": 0.90,
+    "odin_max_residual": 0.10,
+    "odin_s2_gyr_gate": 2.5,
+    "odin_s2_max_clip_ratio": 0.92,
 
     # --- IEKF jump / velocity reject ---
     # Return root cause: corridor along-track degeneracy silently inflates |v|
@@ -25,8 +26,8 @@ TUNE = {
     "iekf_max_upd": 0.08,
     "iekf_max_rot": 0.08,
     "iekf_max_vel": 1.3,
-    "iekf_s2_max_upd": 0.03,
-    "iekf_s2_max_rot": 0.04,
+    "iekf_s2_max_upd": 0.045,
+    "iekf_s2_max_rot": 0.055,
     "consec_bad_freeze": 2,
 
     # --- Global display map ---
