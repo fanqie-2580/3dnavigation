@@ -162,7 +162,13 @@ bool odin_z_factor_en = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
-double odin_z_factor_max_innov = 0.05;  // small steps — large clips broke Mid match/XY
+double odin_z_factor_max_innov = 0.05;  // cruise step — large fixed clips broke Mid/XY
+// When |err| exceeds catch_err, open step up to catch_max (fraction of err).
+double odin_z_factor_catch_err = 0.10;
+double odin_z_factor_catch_frac = 0.35;
+double odin_z_factor_catch_max = 0.12;
+double odin_z_factor_catch_alpha = 0.85;
+int odin_z_factor_catch_min_feat = 10;  // relax Mid gate while catching up
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 double odin_odom_z = 0.0;
@@ -310,9 +316,6 @@ void apply_odin_z_factor(double mid_stamp)
 {
     if (!odin_z_factor_en)
         return;
-    // Do not yank Z when Mid match is already thin — that caused XY reject storms.
-    if (last_mid_effct_feat_num < 30)
-        return;
     double t_o = -1.0, z_o = 0.0;
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
@@ -340,11 +343,29 @@ void apply_odin_z_factor(double mid_stamp)
     // cannot unwind accumulated corridor sink.
     const double target_z =
         odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
-    double innov = target_z - s.pos(2);
-    if (odin_z_factor_max_innov > 0.0 &&
-        std::fabs(innov) > odin_z_factor_max_innov)
-        innov = std::copysign(odin_z_factor_max_innov, innov);
-    const double a = std::max(0.0, std::min(1.0, odin_z_factor_alpha));
+    const double raw = target_z - s.pos(2);
+    const double abs_err = std::fabs(raw);
+    const bool catching =
+        odin_z_factor_catch_err > 0.0 && abs_err > odin_z_factor_catch_err;
+    // Cruise: require healthy Mid match. Catch-up: Mid is often already thin
+    // because bad Z poisoned planes — still pull Z or XY never recovers.
+    const int min_feat = catching ? odin_z_factor_catch_min_feat : 30;
+    if (last_mid_effct_feat_num < min_feat)
+        return;
+
+    double max_step = odin_z_factor_max_innov;
+    double a = odin_z_factor_alpha;
+    if (catching)
+    {
+        const double open = std::min(odin_z_factor_catch_max,
+                                     odin_z_factor_catch_frac * abs_err);
+        max_step = std::max(max_step, open);
+        a = std::max(a, odin_z_factor_catch_alpha);
+    }
+    double innov = raw;
+    if (max_step > 0.0 && abs_err > max_step)
+        innov = std::copysign(max_step, raw);
+    a = std::max(0.0, std::min(1.0, a));
     s.pos(2) += a * innov;
     s.vel(2) = 0.0;
     kf.change_x(s);
@@ -354,6 +375,7 @@ void apply_odin_z_factor(double mid_stamp)
     if ((n_odin_z_factor % 50) == 1)
         std::cout << "[pv-z] odin_z_factor innov=" << innov
                   << " tgt=" << target_z << " z=" << s.pos(2)
+                  << " raw=" << raw << " catch=" << (catching ? 1 : 0)
                   << " n=" << n_odin_z_factor << std::endl;
 }
 
@@ -1379,6 +1401,11 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_catch_err", odin_z_factor_catch_err);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_catch_frac", odin_z_factor_catch_frac);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
+    node->declare_parameter<int>("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
     node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
     node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
     {
@@ -1429,6 +1456,11 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->get_parameter("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->get_parameter("dual_tune.odin_z_factor_catch_err", odin_z_factor_catch_err);
+    node->get_parameter("dual_tune.odin_z_factor_catch_frac", odin_z_factor_catch_frac);
+    node->get_parameter("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
+    node->get_parameter("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
+    node->get_parameter("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
               << " gyr=" << odin_s2_gyr_gate
@@ -1441,6 +1473,8 @@ int main(int argc, char** argv)
               << " odin_body=" << odin_body_pub_en
               << " residual_z=" << residual_z_en
               << " odin_z_factor=" << odin_z_factor_en
+              << " catch_err=" << odin_z_factor_catch_err
+              << " catch_max=" << odin_z_factor_catch_max
               << std::endl;
 
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);

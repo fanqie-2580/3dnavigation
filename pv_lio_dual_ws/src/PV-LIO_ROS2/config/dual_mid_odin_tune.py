@@ -53,6 +53,13 @@ TUNE = {
     "odin_z_factor_alpha": 0.50,
     "odin_z_factor_max_dt": 0.30,
     "odin_z_factor_max_innov": 0.05,
+    # Return corridor: Mid can sink faster than 5cm soft step; open only when
+    # |z-tgt| > catch_err so outbound cruise stays soft.
+    "odin_z_factor_catch_err": 0.10,
+    "odin_z_factor_catch_frac": 0.35,
+    "odin_z_factor_catch_max": 0.12,
+    "odin_z_factor_catch_alpha": 0.85,
+    "odin_z_factor_catch_min_feat": 10,
 }
 
 
