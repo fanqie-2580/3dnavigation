@@ -46,16 +46,21 @@ TUNE = {
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
 
-    # --- Corridor Z (disabled: did not stop late-stage Mid reject/drift) ---
+    # --- Corridor Z (OFF: H_z damp + flat/odin pos yank broke Mid match) ---
+    # Symptom: No Effective Points flood → reject_s1 meter jumps → immediate RViz drift.
     "residual_z_en": False,
-    "residual_z_flat_z_alpha": 0.12,
+    "residual_z_flat_z_alpha": 0.08,
     "residual_z_flat_vz_alpha": 1.0,
-    "residual_z_flat_ba_z_alpha": 0.06,
+    "residual_z_flat_ba_z_alpha": 0.08,
+    "residual_z_floor_nz_thr": 0.85,
+    "residual_z_h_dampen": 0.12,
+    "residual_z_dz_tol": 0.06,
+    "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": False,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.35,
-    "odin_z_factor_max_dt": 0.25,
-    "odin_z_factor_max_innov": 0.15,
+    "odin_z_factor_alpha": 0.55,
+    "odin_z_factor_max_dt": 0.30,
+    "odin_z_factor_max_innov": 0.20,
 }
 
 
