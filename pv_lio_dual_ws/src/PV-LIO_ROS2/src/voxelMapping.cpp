@@ -164,11 +164,13 @@ double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
 double odin_z_factor_max_innov = 0.05;  // cruise step — large fixed clips broke Mid/XY
 // When |err| exceeds catch_err, open step up to catch_max (fraction of err).
-double odin_z_factor_catch_err = 0.10;
-double odin_z_factor_catch_frac = 0.35;
-double odin_z_factor_catch_max = 0.12;
-double odin_z_factor_catch_alpha = 0.85;
+double odin_z_factor_catch_err = 0.06;
+double odin_z_factor_catch_frac = 1.0;   // unused when catch opens to catch_max
+double odin_z_factor_catch_max = 0.10;
+double odin_z_factor_catch_alpha = 0.90;
 int odin_z_factor_catch_min_feat = 10;  // relax Mid gate while catching up
+// While |z-tgt| large, soften Mid floor info so IEKF stops winning vs soft Z.
+double odin_z_factor_floor_scale = 0.25;
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 double odin_odom_z = 0.0;
@@ -311,6 +313,23 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
+// |fusion_z - Odin-anchor target|; 0 if factor inactive / no odom.
+double odin_z_abs_err(const state_ikfom &s)
+{
+    if (!odin_z_factor_en || !last_pf_z_valid)
+        return 0.0;
+    double z_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return 0.0;
+        z_o = odin_odom_z;
+    }
+    const double target_z =
+        odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    return std::fabs(target_z - s.pos(2));
+}
+
 // Soft Z pull from Odin onboard odometry (relative Δz).
 void apply_odin_z_factor(double mid_stamp)
 {
@@ -353,13 +372,13 @@ void apply_odin_z_factor(double mid_stamp)
     if (last_mid_effct_feat_num < min_feat)
         return;
 
+    // Bugfix: catch_frac*err was often < cruise max_innov, so catch=1
+    // still stepped only 5cm and Mid kept winning. Open fully to catch_max.
     double max_step = odin_z_factor_max_innov;
     double a = odin_z_factor_alpha;
     if (catching)
     {
-        const double open = std::min(odin_z_factor_catch_max,
-                                     odin_z_factor_catch_frac * abs_err);
-        max_step = std::max(max_step, open);
+        max_step = std::max(max_step, odin_z_factor_catch_max);
         a = std::max(a, odin_z_factor_catch_alpha);
     }
     double innov = raw;
@@ -1188,10 +1207,18 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
 
         // Mid only: corridor floors push a biased Z — soften their information
         // instead of zeroing H_z (which previously caused match collapse).
+        // When already disagreeing with Odin Z anchor, soften floors harder so
+        // Mid IEKF cannot keep sinking against the soft post-update factor.
         if (residual_z_en && !iekf_odin_stage &&
             std::fabs(norm_vec.z()) > residual_z_floor_nz_thr)
         {
-            const double sc = std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
+            double sc = std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
+            if (odin_z_factor_en && last_pf_z_valid &&
+                odin_z_factor_catch_err > 0.0 &&
+                odin_z_abs_err(s) > odin_z_factor_catch_err)
+            {
+                sc = std::min(sc, std::max(0.05, odin_z_factor_floor_scale));
+            }
             R_inv *= sc;
         }
 
@@ -1406,6 +1433,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->declare_parameter<int>("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_floor_scale", odin_z_factor_floor_scale);
     node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
     node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
     {
@@ -1461,6 +1489,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
     node->get_parameter("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->get_parameter("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
+    node->get_parameter("dual_tune.odin_z_factor_floor_scale", odin_z_factor_floor_scale);
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
               << " gyr=" << odin_s2_gyr_gate
@@ -1475,6 +1504,7 @@ int main(int argc, char** argv)
               << " odin_z_factor=" << odin_z_factor_en
               << " catch_err=" << odin_z_factor_catch_err
               << " catch_max=" << odin_z_factor_catch_max
+              << " floor_sc=" << odin_z_factor_floor_scale
               << std::endl;
 
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);

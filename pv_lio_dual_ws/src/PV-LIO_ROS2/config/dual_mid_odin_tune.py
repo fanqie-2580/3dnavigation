@@ -50,16 +50,16 @@ TUNE = {
     "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": True,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.50,
+    "odin_z_factor_alpha": 0.55,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.05,
-    # Return corridor: Mid can sink faster than 5cm soft step; open only when
-    # |z-tgt| > catch_err so outbound cruise stays soft.
-    "odin_z_factor_catch_err": 0.10,
-    "odin_z_factor_catch_frac": 0.35,
-    "odin_z_factor_catch_max": 0.12,
-    "odin_z_factor_catch_alpha": 0.85,
+    "odin_z_factor_max_innov": 0.06,
+    # Return: open full catch_max when |err|>catch_err; also soften Mid floors.
+    "odin_z_factor_catch_err": 0.06,
+    "odin_z_factor_catch_frac": 1.0,
+    "odin_z_factor_catch_max": 0.10,
+    "odin_z_factor_catch_alpha": 0.90,
     "odin_z_factor_catch_min_feat": 10,
+    "odin_z_factor_floor_scale": 0.25,
 }
 
 
