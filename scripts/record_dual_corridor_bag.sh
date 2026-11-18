@@ -17,12 +17,13 @@ export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 source /opt/ros/humble/setup.bash
 
 echo "[bag] out: $OUT_DIR"
-echo "[bag] topics: Mid /livox/* + Odin /odin1/cloud_raw,/odin1/imu (raw only, no live map)"
-echo "[bag] walk the corridor, then Ctrl-C to stop"
+echo "[bag] topics: Mid /livox/* + Odin cloud_raw/imu/odometry (no live map)"
+echo "[bag] walk the corridor; tell agent to stop when done"
 
-# Raw sensors only — replay can re-run PV-LIO / other algos cleanly.
+# Sensors + Odin onboard odom (for offline Z pose-factor). No live map topics.
 exec ros2 bag record -o "$OUT_DIR" --compression-mode file --compression-format zstd \
   /livox/lidar \
   /livox/imu \
   /odin1/cloud_raw \
-  /odin1/imu
+  /odin1/imu \
+  /odin1/odometry
