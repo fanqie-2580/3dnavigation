@@ -160,9 +160,9 @@ int last_floor_n = 0;
 double last_floor_ratio = 0.0;
 bool odin_z_factor_en = true;
 std::string odin_odom_topic = "/odin1/odometry";
-double odin_z_factor_alpha = 0.85;
+double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
-double odin_z_factor_max_innov = 0.20;
+double odin_z_factor_max_innov = 0.05;  // small steps — large clips broke Mid match/XY
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 double odin_odom_z = 0.0;
@@ -309,6 +309,9 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
 void apply_odin_z_factor(double mid_stamp)
 {
     if (!odin_z_factor_en)
+        return;
+    // Do not yank Z when Mid match is already thin — that caused XY reject storms.
+    if (last_mid_effct_feat_num < 30)
         return;
     double t_o = -1.0, z_o = 0.0;
     {

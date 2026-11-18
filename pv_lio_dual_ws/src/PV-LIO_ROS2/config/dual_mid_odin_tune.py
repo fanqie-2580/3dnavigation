@@ -50,9 +50,9 @@ TUNE = {
     "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": True,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.85,
+    "odin_z_factor_alpha": 0.50,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.20,
+    "odin_z_factor_max_innov": 0.05,
 }
 
 
