@@ -140,16 +140,20 @@ bool odin_global_insert_en = false;
 bool odin_global_require_s2 = true;   // densify Odin only after good S2
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
-// Corridor Z (safe path): Mid floor planes weakly observable → down-weight their
-// information in Mid IEKF (do NOT zero H_z / hard-yank pos — that broke matching).
-// After update: kill vz/ba.z only; soft Odin relative Δz with small alpha.
+// Corridor Z root cause:
+// - Mid floors bias Z; soft post-update that *fully follows Odin Δz* inherits
+//   Odin drift (outbound ≈+12cm, return ≈−14cm). One-sided only made outbound
+//   climb. Aggressive catch yanks broke Mid match (No Effective Points).
+// Fix: target = flat_ref + clip(OdinΔz, ±band); mild floor soften + H_z damp;
+//      small soft steps only (no catch open).
 bool residual_z_en = true;
-double residual_z_flat_z_alpha = 0.12;  // light hold to init z (flat corridor)
+double residual_z_flat_z_alpha = 0.22;
 double residual_z_flat_vz_alpha = 1.0;
-double residual_z_flat_ba_z_alpha = 0.10;
+double residual_z_flat_ba_z_alpha = 0.25;
+double residual_z_flat_max_step = 0.015;
 double residual_z_floor_nz_thr = 0.85;
-double residual_z_floor_info_scale = 1.0;  // 1.0 = do not down-weight floors
-double residual_z_h_dampen = 1.0;       // 1.0 = disable Jacobian H_z damp
+double residual_z_floor_info_scale = 0.45; // mild always (Point-LIO-like)
+double residual_z_h_dampen = 0.50;         // scale h_x Z on floors; 1=off
 double residual_z_dz_tol = 0.06;
 double residual_z_floor_ratio_thr = 0.03;
 bool residual_z_flat_ref_init = false;
@@ -162,18 +166,15 @@ bool odin_z_factor_en = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
-double odin_z_factor_max_innov = 0.05;  // cruise step — large fixed clips broke Mid/XY
-// When |err| exceeds catch_err, open step up to catch_max (fraction of err).
-double odin_z_factor_catch_err = 0.06;
-double odin_z_factor_catch_frac = 1.0;   // unused when catch opens to catch_max
-double odin_z_factor_catch_max = 0.10;
-double odin_z_factor_catch_alpha = 0.90;
-int odin_z_factor_catch_min_feat = 10;  // relax Mid gate while catching up
-// Only raise fusion when below Odin target (anti Mid-sink). Do NOT follow
-// Odin's own corridor sink downward — that looked like "漂了" on flat floors.
-bool odin_z_factor_one_sided = true;
-// Soften Mid floors only when fusion is below Odin (same one-sided sense).
-double odin_z_factor_floor_scale = 0.40;
+double odin_z_factor_max_innov = 0.05;  // keep soft — large steps broke Mid/XY
+double odin_z_factor_band = 0.04;     // |Odin Δz| allowed around flat_ref
+double odin_z_factor_catch_err = 0.0; // 0 = disable catch open
+double odin_z_factor_catch_frac = 1.0;
+double odin_z_factor_catch_max = 0.05;
+double odin_z_factor_catch_alpha = 0.50;
+int odin_z_factor_catch_min_feat = 30;
+bool odin_z_factor_one_sided = false; // two-sided soft (outbound-safe)
+double odin_z_factor_floor_scale = 0.30;
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 double odin_odom_z = 0.0;
@@ -333,7 +334,7 @@ double odin_z_signed_err(const state_ikfom &s)
     return target_z - s.pos(2);
 }
 
-// Soft Z pull from Odin onboard odometry (relative Δz).
+// Soft Z: flat_ref + band-limited Odin Δz (do not inherit full Odin drift).
 void apply_odin_z_factor(double mid_stamp)
 {
     if (!odin_z_factor_en)
@@ -360,13 +361,20 @@ void apply_odin_z_factor(double mid_stamp)
         last_pf_z_valid = true;
         return;
     }
-    // Anchor-relative: target fusion z follows Odin Δz from init (not
-    // frame-to-frame). Frame-relative only fights the latest Mid step and
-    // cannot unwind accumulated corridor sink.
-    const double target_z =
-        odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+
+    double odin_dz = z_o - odin_z_anchor_odin;
+    if (odin_z_factor_band > 0.0)
+    {
+        if (odin_dz > odin_z_factor_band)
+            odin_dz = odin_z_factor_band;
+        else if (odin_dz < -odin_z_factor_band)
+            odin_dz = -odin_z_factor_band;
+    }
+    // Prefer flat world height; allow only ±band of Odin Δz as Mid anti-bias.
+    const double base_z =
+        residual_z_flat_ref_init ? residual_z_flat_z_ref : odin_z_anchor_mid;
+    const double target_z = base_z + odin_dz;
     double raw = target_z - s.pos(2);
-    // One-sided: ignore downward pulls (Odin self-sink on flat return).
     if (odin_z_factor_one_sided && raw < 0.0)
         raw = 0.0;
     const double abs_err = std::fabs(raw);
@@ -374,13 +382,10 @@ void apply_odin_z_factor(double mid_stamp)
         return;
     const bool catching =
         odin_z_factor_catch_err > 0.0 && abs_err > odin_z_factor_catch_err;
-    // Cruise: require healthy Mid match. Catch-up: Mid is often already thin
-    // because bad Z poisoned planes — still pull Z or XY never recovers.
     const int min_feat = catching ? odin_z_factor_catch_min_feat : 30;
     if (last_mid_effct_feat_num < min_feat)
         return;
 
-    // Open fully to catch_max when lagging Odin upward.
     double max_step = odin_z_factor_max_innov;
     double a = odin_z_factor_alpha;
     if (catching)
@@ -401,11 +406,11 @@ void apply_odin_z_factor(double mid_stamp)
     if ((n_odin_z_factor % 50) == 1)
         std::cout << "[pv-z] odin_z_factor innov=" << innov
                   << " tgt=" << target_z << " z=" << s.pos(2)
-                  << " raw=" << raw << " catch=" << (catching ? 1 : 0)
+                  << " raw=" << raw << " odin_dz=" << odin_dz
                   << " n=" << n_odin_z_factor << std::endl;
 }
 
-// go2 residual_z_v6.3 single-level: soft flat z_ref + damp vz/ba.z.
+// go2 residual_z: soft flat z_ref + damp vz/ba.z (clipped step).
 void apply_residual_z_flat()
 {
     if (!residual_z_en)
@@ -423,7 +428,11 @@ void apply_residual_z_flat()
     const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
     s.vel(2) *= (1.0 - av);
     s.ba(2) *= (1.0 - ab);
-    s.pos(2) += az * (residual_z_flat_z_ref - s.pos(2));
+    double step = az * (residual_z_flat_z_ref - s.pos(2));
+    if (residual_z_flat_max_step > 0.0 &&
+        std::fabs(step) > residual_z_flat_max_step)
+        step = std::copysign(residual_z_flat_max_step, step);
+    s.pos(2) += step;
     kf.change_x(s);
 }
 
@@ -1168,17 +1177,23 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         point_crossmat<<SKEW_SYM_MATRX(point_this);
 
         V3D norm_vec(ptpl_list[i].normal);
+        const bool is_floor =
+            residual_z_en && !iekf_odin_stage &&
+            std::fabs(norm_vec.z()) > residual_z_floor_nz_thr;
+        V3D norm_jac = norm_vec;
+        if (is_floor && residual_z_h_dampen < 1.0)
+            norm_jac.z() *= std::max(0.0, std::min(1.0, residual_z_h_dampen));
 
         V3D C(s.rot.conjugate() *norm_vec);
         V3D A(point_crossmat * C);
         if (extrinsic_est_en)
         {
             V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_vec.x(), norm_vec.y(), norm_vec.z(), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_jac.x(), norm_jac.y(), norm_jac.z(), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
         }
         else
         {
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_vec.x(), norm_vec.y(), norm_vec.z(), VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_jac.x(), norm_jac.y(), norm_jac.z(), VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
         }
 
         float pd2 = norm_vec.x() * ptpl_list[i].point_world.x()
@@ -1212,19 +1227,11 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D R_cov_Rt = s.rot * s.offset_R_L_I * cov_lidar * s.offset_R_L_I.conjugate() * s.rot.conjugate();
         double R_inv = 1.0 / (sigma_l + norm_vec.transpose() * R_cov_Rt * norm_vec);
 
-        // Mid only: corridor floors push a biased Z — soften their information
-        // instead of zeroing H_z (which previously caused match collapse).
-        // Soften floors only when fusion is below Odin target (Mid sinking).
-        if (residual_z_en && !iekf_odin_stage &&
-            std::fabs(norm_vec.z()) > residual_z_floor_nz_thr)
+        // Always mildly soften Mid floors (do not fully trust biased Z planes).
+        if (is_floor)
         {
-            double sc = std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
-            if (odin_z_factor_en && last_pf_z_valid &&
-                odin_z_factor_catch_err > 0.0 &&
-                odin_z_signed_err(s) > odin_z_factor_catch_err)
-            {
-                sc = std::min(sc, std::max(0.05, odin_z_factor_floor_scale));
-            }
+            const double sc =
+                std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
             R_inv *= sc;
         }
 
@@ -1424,6 +1431,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
+    node->declare_parameter<double>("dual_tune.residual_z_flat_max_step", residual_z_flat_max_step);
     node->declare_parameter<double>("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
     node->declare_parameter<double>("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->declare_parameter<double>("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
@@ -1434,6 +1442,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_band", odin_z_factor_band);
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_err", odin_z_factor_catch_err);
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_frac", odin_z_factor_catch_frac);
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
@@ -1481,6 +1490,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->get_parameter("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
+    node->get_parameter("dual_tune.residual_z_flat_max_step", residual_z_flat_max_step);
     node->get_parameter("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
     node->get_parameter("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->get_parameter("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
@@ -1491,6 +1501,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->get_parameter("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->get_parameter("dual_tune.odin_z_factor_band", odin_z_factor_band);
     node->get_parameter("dual_tune.odin_z_factor_catch_err", odin_z_factor_catch_err);
     node->get_parameter("dual_tune.odin_z_factor_catch_frac", odin_z_factor_catch_frac);
     node->get_parameter("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
@@ -1510,11 +1521,13 @@ int main(int argc, char** argv)
               << " odin_body=" << odin_body_pub_en
               << " residual_z=" << residual_z_en
               << " flat_z_a=" << residual_z_flat_z_alpha
+              << " flat_step=" << residual_z_flat_max_step
+              << " floor_info=" << residual_z_floor_info_scale
+              << " h_damp=" << residual_z_h_dampen
               << " odin_z_factor=" << odin_z_factor_en
+              << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err
-              << " catch_max=" << odin_z_factor_catch_max
-              << " floor_sc=" << odin_z_factor_floor_scale
               << std::endl;
 
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);

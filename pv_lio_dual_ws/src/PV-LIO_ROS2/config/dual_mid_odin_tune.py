@@ -37,29 +37,32 @@ TUNE = {
     "odin_global_require_s2": True,
     "odin_body_pub_en": True,
 
-    # --- Corridor Z: light flat hold + one-sided Odin anti-sink ---
-    # Return Odin self-sinks ~15cm; following it looked like drift on flat floor.
+    # --- Corridor Z ---
+    # Do NOT fully follow Odin Δz (outbound +12cm / return -14cm). Target =
+    # flat_ref + clip(OdinΔz, ±band). Mild Mid floor soften; soft 5cm steps.
     "residual_z_en": True,
-    "residual_z_flat_z_alpha": 0.12,
+    "residual_z_flat_z_alpha": 0.22,
     "residual_z_flat_vz_alpha": 1.0,
-    "residual_z_flat_ba_z_alpha": 0.10,
+    "residual_z_flat_ba_z_alpha": 0.25,
+    "residual_z_flat_max_step": 0.015,
     "residual_z_floor_nz_thr": 0.85,
-    "residual_z_floor_info_scale": 1.0,
-    "residual_z_h_dampen": 1.0,
+    "residual_z_floor_info_scale": 0.45,
+    "residual_z_h_dampen": 0.50,
     "residual_z_dz_tol": 0.06,
     "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": True,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.55,
+    "odin_z_factor_alpha": 0.50,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.06,
-    "odin_z_factor_catch_err": 0.06,
+    "odin_z_factor_max_innov": 0.05,
+    "odin_z_factor_band": 0.04,
+    "odin_z_factor_catch_err": 0.0,
     "odin_z_factor_catch_frac": 1.0,
-    "odin_z_factor_catch_max": 0.10,
-    "odin_z_factor_catch_alpha": 0.90,
-    "odin_z_factor_catch_min_feat": 10,
-    "odin_z_factor_one_sided": True,
-    "odin_z_factor_floor_scale": 0.40,
+    "odin_z_factor_catch_max": 0.05,
+    "odin_z_factor_catch_alpha": 0.50,
+    "odin_z_factor_catch_min_feat": 30,
+    "odin_z_factor_one_sided": False,
+    "odin_z_factor_floor_scale": 0.30,
 }
 
 
