@@ -140,17 +140,16 @@ bool odin_global_insert_en = false;
 bool odin_global_require_s2 = true;   // densify Odin only after good S2
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
-// Corridor Z: Mid floor Jacobians are weakly observable → H_z damp (go2 v6.3)
-// + vz/ba.z kill + soft flat; Odin onboard relative Δz is the absolute anchor
-// (bag A/B: fusion −2.16 cm/m vs Odin +0.11 cm/m with S2 accept but no Z gate).
-// Default OFF: post-IEKF Z pos yank + Mid H_z damp caused No Effective Points
-// and reject_s1 meter jumps (immediate map drift). Keep code for later retune.
-bool residual_z_en = false;
-double residual_z_flat_z_alpha = 0.08;
+// Corridor Z (safe path): Mid floor planes weakly observable → down-weight their
+// information in Mid IEKF (do NOT zero H_z / hard-yank pos — that broke matching).
+// After update: kill vz/ba.z only; soft Odin relative Δz with small alpha.
+bool residual_z_en = true;
+double residual_z_flat_z_alpha = 0.0;   // no flat pos yank
 double residual_z_flat_vz_alpha = 1.0;
-double residual_z_flat_ba_z_alpha = 0.08;
+double residual_z_flat_ba_z_alpha = 0.10;
 double residual_z_floor_nz_thr = 0.85;
-double residual_z_h_dampen = 0.12;
+double residual_z_floor_info_scale = 1.0;  // 1.0 = do not down-weight floors
+double residual_z_h_dampen = 1.0;       // 1.0 = disable Jacobian H_z damp
 double residual_z_dz_tol = 0.06;
 double residual_z_floor_ratio_thr = 0.03;
 bool residual_z_flat_ref_init = false;
@@ -159,9 +158,9 @@ bool last_floor_valid = false;
 double last_floor_z = 0.0;
 int last_floor_n = 0;
 double last_floor_ratio = 0.0;
-bool odin_z_factor_en = false;
+bool odin_z_factor_en = true;
 std::string odin_odom_topic = "/odin1/odometry";
-double odin_z_factor_alpha = 0.55;
+double odin_z_factor_alpha = 0.85;
 double odin_z_factor_max_dt = 0.30;
 double odin_z_factor_max_innov = 0.20;
 std::mutex mtx_odin_odom;
@@ -171,6 +170,8 @@ bool odin_odom_have = false;
 double last_pf_mid_z = 0.0;
 double last_pf_odin_z = 0.0;
 bool last_pf_z_valid = false;
+double odin_z_anchor_mid = 0.0;   // fusion z at factor init
+double odin_z_anchor_odin = 0.0;  // odin z at factor init
 long long n_odin_z_factor = 0;
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
@@ -326,21 +327,22 @@ void apply_odin_z_factor(double mid_stamp)
     {
         last_pf_mid_z = s.pos(2);
         last_pf_odin_z = z_o;
+        odin_z_anchor_mid = s.pos(2);
+        odin_z_anchor_odin = z_o;
         last_pf_z_valid = true;
         return;
     }
-    const double dz_m = s.pos(2) - last_pf_mid_z;
-    const double dz_o = z_o - last_pf_odin_z;
-    const double innov = dz_o - dz_m;
-    if (std::fabs(innov) > odin_z_factor_max_innov)
-    {
-        last_pf_mid_z = s.pos(2);
-        last_pf_odin_z = z_o;
-        return;
-    }
+    // Anchor-relative: target fusion z follows Odin Δz from init (not
+    // frame-to-frame). Frame-relative only fights the latest Mid step and
+    // cannot unwind accumulated corridor sink.
+    const double target_z =
+        odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    double innov = target_z - s.pos(2);
+    if (odin_z_factor_max_innov > 0.0 &&
+        std::fabs(innov) > odin_z_factor_max_innov)
+        innov = std::copysign(odin_z_factor_max_innov, innov);
     const double a = std::max(0.0, std::min(1.0, odin_z_factor_alpha));
     s.pos(2) += a * innov;
-    // Kill vertical speed so Mid IMU prop does not re-sink before next factor.
     s.vel(2) = 0.0;
     kf.change_x(s);
     ++n_odin_z_factor;
@@ -348,7 +350,8 @@ void apply_odin_z_factor(double mid_stamp)
     last_pf_odin_z = z_o;
     if ((n_odin_z_factor % 50) == 1)
         std::cout << "[pv-z] odin_z_factor innov=" << innov
-                  << " z=" << s.pos(2) << " n=" << n_odin_z_factor << std::endl;
+                  << " tgt=" << target_z << " z=" << s.pos(2)
+                  << " n=" << n_odin_z_factor << std::endl;
 }
 
 // go2 residual_z_v6.3 single-level: soft flat z_ref + damp vz/ba.z.
@@ -1158,61 +1161,16 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D R_cov_Rt = s.rot * s.offset_R_L_I * cov_lidar * s.offset_R_L_I.conjugate() * s.rot.conjugate();
         double R_inv = 1.0 / (sigma_l + norm_vec.transpose() * R_cov_Rt * norm_vec);
 
-        ekfom_data.R(i) = R_inv;
-    }
+        // Mid only: corridor floors push a biased Z — soften their information
+        // instead of zeroing H_z (which previously caused match collapse).
+        if (residual_z_en && !iekf_odin_stage &&
+            std::fabs(norm_vec.z()) > residual_z_floor_nz_thr)
+        {
+            const double sc = std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
+            R_inv *= sc;
+        }
 
-    // go2 residual_z_v6: on Mid stage, damp H_z when floor planes are stable so
-    // corridor wall/floor degeneracy cannot keep integrating a Z sink.
-    last_floor_valid = false;
-    last_floor_n = 0;
-    last_floor_ratio = 0.0;
-    if (residual_z_en && !iekf_odin_stage && effct_feat_num > 0 &&
-        ekfom_data.h_x.cols() > 2)
-    {
-        double z_sum = 0.0;
-        int n_floor = 0;
-        for (int i = 0; i < effct_feat_num; ++i)
-        {
-            const double nz = ptpl_list[i].normal.z();
-            if (std::fabs(nz) <= residual_z_floor_nz_thr)
-                continue;
-            const double z_map =
-                -(ptpl_list[i].d + ptpl_list[i].normal.x() * s.pos(0) +
-                  ptpl_list[i].normal.y() * s.pos(1)) /
-                nz;
-            if (z_map > s.pos(2) - 0.15)
-                continue;
-            if (z_map < s.pos(2) - 2.5)
-                continue;
-            z_sum += z_map;
-            ++n_floor;
-        }
-        last_floor_n = n_floor;
-        last_floor_ratio =
-            static_cast<double>(n_floor) / static_cast<double>(effct_feat_num);
-        last_floor_valid = (n_floor >= 12);
-        if (last_floor_valid)
-        {
-            last_floor_z = z_sum / static_cast<double>(n_floor);
-            static double floor_z_ema_h = 0.0;
-            static bool floor_z_ema_h_init = false;
-            if (!floor_z_ema_h_init)
-            {
-                floor_z_ema_h = last_floor_z;
-                floor_z_ema_h_init = true;
-            }
-            const double dz_floor = last_floor_z - floor_z_ema_h;
-            floor_z_ema_h = 0.90 * floor_z_ema_h + 0.10 * last_floor_z;
-            const double tol = std::max(1e-3, residual_z_dz_tol);
-            const double move = std::fabs(dz_floor);
-            const double stable =
-                std::exp(-0.5 * (move / tol) * (move / tol));
-            const double zmin =
-                std::max(0.0, std::min(1.0, residual_z_h_dampen));
-            const double zdamp = zmin + (1.0 - zmin) * (1.0 - stable);
-            if (zdamp < 0.999)
-                ekfom_data.h_x.col(2) *= zdamp;
-        }
+        ekfom_data.R(i) = R_inv;
     }
 
     res_mean_last = (effct_feat_num > 0) ? (total_residual / effct_feat_num) : 0.0;
@@ -1409,6 +1367,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
+    node->declare_parameter<double>("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->declare_parameter<double>("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
     node->declare_parameter<double>("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->declare_parameter<double>("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
@@ -1458,6 +1417,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->get_parameter("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
     node->get_parameter("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
+    node->get_parameter("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->get_parameter("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
     node->get_parameter("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->get_parameter("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
