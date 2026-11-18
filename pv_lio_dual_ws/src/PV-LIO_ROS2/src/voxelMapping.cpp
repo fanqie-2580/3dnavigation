@@ -144,7 +144,7 @@ bool odin_body_pub_en = false;
 // information in Mid IEKF (do NOT zero H_z / hard-yank pos — that broke matching).
 // After update: kill vz/ba.z only; soft Odin relative Δz with small alpha.
 bool residual_z_en = true;
-double residual_z_flat_z_alpha = 0.0;   // no flat pos yank
+double residual_z_flat_z_alpha = 0.12;  // light hold to init z (flat corridor)
 double residual_z_flat_vz_alpha = 1.0;
 double residual_z_flat_ba_z_alpha = 0.10;
 double residual_z_floor_nz_thr = 0.85;
@@ -169,8 +169,11 @@ double odin_z_factor_catch_frac = 1.0;   // unused when catch opens to catch_max
 double odin_z_factor_catch_max = 0.10;
 double odin_z_factor_catch_alpha = 0.90;
 int odin_z_factor_catch_min_feat = 10;  // relax Mid gate while catching up
-// While |z-tgt| large, soften Mid floor info so IEKF stops winning vs soft Z.
-double odin_z_factor_floor_scale = 0.25;
+// Only raise fusion when below Odin target (anti Mid-sink). Do NOT follow
+// Odin's own corridor sink downward — that looked like "漂了" on flat floors.
+bool odin_z_factor_one_sided = true;
+// Soften Mid floors only when fusion is below Odin (same one-sided sense).
+double odin_z_factor_floor_scale = 0.40;
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
 double odin_odom_z = 0.0;
@@ -313,8 +316,8 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
-// |fusion_z - Odin-anchor target|; 0 if factor inactive / no odom.
-double odin_z_abs_err(const state_ikfom &s)
+// Signed (target - fusion_z): >0 means fusion below Odin (needs raise).
+double odin_z_signed_err(const state_ikfom &s)
 {
     if (!odin_z_factor_en || !last_pf_z_valid)
         return 0.0;
@@ -327,7 +330,7 @@ double odin_z_abs_err(const state_ikfom &s)
     }
     const double target_z =
         odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
-    return std::fabs(target_z - s.pos(2));
+    return target_z - s.pos(2);
 }
 
 // Soft Z pull from Odin onboard odometry (relative Δz).
@@ -362,8 +365,13 @@ void apply_odin_z_factor(double mid_stamp)
     // cannot unwind accumulated corridor sink.
     const double target_z =
         odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
-    const double raw = target_z - s.pos(2);
+    double raw = target_z - s.pos(2);
+    // One-sided: ignore downward pulls (Odin self-sink on flat return).
+    if (odin_z_factor_one_sided && raw < 0.0)
+        raw = 0.0;
     const double abs_err = std::fabs(raw);
+    if (abs_err < 1e-6)
+        return;
     const bool catching =
         odin_z_factor_catch_err > 0.0 && abs_err > odin_z_factor_catch_err;
     // Cruise: require healthy Mid match. Catch-up: Mid is often already thin
@@ -372,8 +380,7 @@ void apply_odin_z_factor(double mid_stamp)
     if (last_mid_effct_feat_num < min_feat)
         return;
 
-    // Bugfix: catch_frac*err was often < cruise max_innov, so catch=1
-    // still stepped only 5cm and Mid kept winning. Open fully to catch_max.
+    // Open fully to catch_max when lagging Odin upward.
     double max_step = odin_z_factor_max_innov;
     double a = odin_z_factor_alpha;
     if (catching)
@@ -1207,15 +1214,14 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
 
         // Mid only: corridor floors push a biased Z — soften their information
         // instead of zeroing H_z (which previously caused match collapse).
-        // When already disagreeing with Odin Z anchor, soften floors harder so
-        // Mid IEKF cannot keep sinking against the soft post-update factor.
+        // Soften floors only when fusion is below Odin target (Mid sinking).
         if (residual_z_en && !iekf_odin_stage &&
             std::fabs(norm_vec.z()) > residual_z_floor_nz_thr)
         {
             double sc = std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
             if (odin_z_factor_en && last_pf_z_valid &&
                 odin_z_factor_catch_err > 0.0 &&
-                odin_z_abs_err(s) > odin_z_factor_catch_err)
+                odin_z_signed_err(s) > odin_z_factor_catch_err)
             {
                 sc = std::min(sc, std::max(0.05, odin_z_factor_floor_scale));
             }
@@ -1433,6 +1439,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
     node->declare_parameter<double>("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->declare_parameter<int>("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
+    node->declare_parameter<bool>("dual_tune.odin_z_factor_one_sided", odin_z_factor_one_sided);
     node->declare_parameter<double>("dual_tune.odin_z_factor_floor_scale", odin_z_factor_floor_scale);
     node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
     node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
@@ -1489,6 +1496,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_catch_max", odin_z_factor_catch_max);
     node->get_parameter("dual_tune.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->get_parameter("dual_tune.odin_z_factor_catch_min_feat", odin_z_factor_catch_min_feat);
+    node->get_parameter("dual_tune.odin_z_factor_one_sided", odin_z_factor_one_sided);
     node->get_parameter("dual_tune.odin_z_factor_floor_scale", odin_z_factor_floor_scale);
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
@@ -1501,7 +1509,9 @@ int main(int argc, char** argv)
               << " req_s2=" << odin_global_require_s2
               << " odin_body=" << odin_body_pub_en
               << " residual_z=" << residual_z_en
+              << " flat_z_a=" << residual_z_flat_z_alpha
               << " odin_z_factor=" << odin_z_factor_en
+              << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err
               << " catch_max=" << odin_z_factor_catch_max
               << " floor_sc=" << odin_z_factor_floor_scale

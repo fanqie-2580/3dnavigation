@@ -37,10 +37,10 @@ TUNE = {
     "odin_global_require_s2": True,
     "odin_body_pub_en": True,
 
-    # --- Corridor Z: vz/ba damp + Odin relative Δz (clip innov, no skip) ---
-    # No H_z zero / flat pos yank / floor down-weight (those hurt).
+    # --- Corridor Z: light flat hold + one-sided Odin anti-sink ---
+    # Return Odin self-sinks ~15cm; following it looked like drift on flat floor.
     "residual_z_en": True,
-    "residual_z_flat_z_alpha": 0.0,
+    "residual_z_flat_z_alpha": 0.12,
     "residual_z_flat_vz_alpha": 1.0,
     "residual_z_flat_ba_z_alpha": 0.10,
     "residual_z_floor_nz_thr": 0.85,
@@ -53,13 +53,13 @@ TUNE = {
     "odin_z_factor_alpha": 0.55,
     "odin_z_factor_max_dt": 0.30,
     "odin_z_factor_max_innov": 0.06,
-    # Return: open full catch_max when |err|>catch_err; also soften Mid floors.
     "odin_z_factor_catch_err": 0.06,
     "odin_z_factor_catch_frac": 1.0,
     "odin_z_factor_catch_max": 0.10,
     "odin_z_factor_catch_alpha": 0.90,
     "odin_z_factor_catch_min_feat": 10,
-    "odin_z_factor_floor_scale": 0.25,
+    "odin_z_factor_one_sided": True,
+    "odin_z_factor_floor_scale": 0.40,
 }
 
 
