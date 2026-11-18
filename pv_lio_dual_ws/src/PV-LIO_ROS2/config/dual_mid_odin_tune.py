@@ -46,12 +46,12 @@ TUNE = {
     # Body MUST show Odin for live alignment check (display ≠ Global densify).
     "odin_body_pub_en": True,
 
-    # --- Corridor Z (go2 residual_z_v6.3 + Odin onboard odom) ---
-    "residual_z_en": True,
+    # --- Corridor Z (disabled: did not stop late-stage Mid reject/drift) ---
+    "residual_z_en": False,
     "residual_z_flat_z_alpha": 0.12,
     "residual_z_flat_vz_alpha": 1.0,
     "residual_z_flat_ba_z_alpha": 0.06,
-    "odin_z_factor_en": True,
+    "odin_z_factor_en": False,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.35,
     "odin_z_factor_max_dt": 0.25,

@@ -141,13 +141,14 @@ bool odin_global_require_s2 = true;   // densify Odin only after good S2
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
 // Corridor Z drift (go2 residual_z_v6.3 + Odin onboard odom soft Z).
-bool residual_z_en = true;
+// Default off: late Mid reject/drift not fixed by these soft Z pulls.
+bool residual_z_en = false;
 double residual_z_flat_z_alpha = 0.12;
 double residual_z_flat_vz_alpha = 1.0;
 double residual_z_flat_ba_z_alpha = 0.06;
 bool residual_z_flat_ref_init = false;
 double residual_z_flat_z_ref = 0.0;
-bool odin_z_factor_en = true;
+bool odin_z_factor_en = false;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.35;
 double odin_z_factor_max_dt = 0.25;
