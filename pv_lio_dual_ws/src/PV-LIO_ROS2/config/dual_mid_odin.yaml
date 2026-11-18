@@ -69,10 +69,15 @@
       # 0.08 + periodic full remap → uniform Mid360 fill (was 0.1 pending-only clumps).
       # Do not go <<0.05 with huge pose span (PCL VoxelGrid int overflow).
       global_map_leaf_size: 0.08
+      # RViz-only: coarser / slower / capped so Jetson CPU stays with IEKF.
+      # Full-res Global (leaf 0.08) is still kept for /save_map PCD.
+      global_map_pub_leaf_size: 0.20
+      global_map_pub_period: 2.0
+      global_map_pub_max_pts: 350000
       path_en: true
       scan_publish_en: true
-      # Classic: dense undistort for Body/World publish (not sparse downs).
-      dense_publish_en: true
+      # Downs (not dense undistort) for live Body/World — big RViz/CPU win.
+      dense_publish_en: false
       scan_bodyframe_pub_en: true
     pcd_save:
       pcd_save_en: false

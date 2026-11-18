@@ -35,6 +35,7 @@
 #include <omp.h>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -139,6 +140,26 @@ bool odin_global_insert_en = false;
 bool odin_global_require_s2 = true;   // densify Odin only after good S2
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
+// Corridor Z drift (go2 residual_z_v6.3 + Odin onboard odom soft Z).
+bool residual_z_en = true;
+double residual_z_flat_z_alpha = 0.12;
+double residual_z_flat_vz_alpha = 1.0;
+double residual_z_flat_ba_z_alpha = 0.06;
+bool residual_z_flat_ref_init = false;
+double residual_z_flat_z_ref = 0.0;
+bool odin_z_factor_en = true;
+std::string odin_odom_topic = "/odin1/odometry";
+double odin_z_factor_alpha = 0.35;
+double odin_z_factor_max_dt = 0.25;
+double odin_z_factor_max_innov = 0.15;
+std::mutex mtx_odin_odom;
+double odin_odom_stamp = -1.0;
+double odin_odom_z = 0.0;
+bool odin_odom_have = false;
+double last_pf_mid_z = 0.0;
+double last_pf_odin_z = 0.0;
+bool last_pf_z_valid = false;
+long long n_odin_z_factor = 0;
 int iekf_reject_s2 = 0;
 int iekf_accept_s2 = 0;
 int iekf_odin_res_clip = 0;
@@ -224,6 +245,10 @@ bool publish_voxel_map = false;
 bool publish_global_cloud_map = false;
 int publish_max_voxel_layer = 0;
 double global_map_leaf_size = 0.1; // 0.08+huge span triggered PCL VoxelGrid overflow
+// RViz-only Global publish (full-res map kept for /save_map).
+double global_map_pub_leaf_size = 0.20;
+double global_map_pub_period = 2.0;   // wall seconds between /Global_cloud_map pubs
+int global_map_pub_max_pts = 350000;
 
 bool has_save_opt = false;
 bool pcd_save_en = false;
@@ -257,6 +282,81 @@ void SigHandle(int sig)
     flg_exit = true;
     RCLCPP_WARN(rclcpp::get_logger("pv_lio"), "catch sig %d", sig);
     sig_buffer.notify_all();
+}
+
+void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lk(mtx_odin_odom);
+    odin_odom_stamp = rclcpp::Time(msg->header.stamp).seconds();
+    odin_odom_z = msg->pose.pose.position.z;
+    odin_odom_have = true;
+}
+
+// Soft Z pull from Odin onboard odometry (relative Δz).
+void apply_odin_z_factor(double mid_stamp)
+{
+    if (!odin_z_factor_en)
+        return;
+    double t_o = -1.0, z_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        t_o = odin_odom_stamp;
+        z_o = odin_odom_z;
+    }
+    if (odin_z_factor_max_dt > 0.0 &&
+        std::fabs(t_o - mid_stamp) > odin_z_factor_max_dt)
+        return;
+
+    state_ikfom s = kf.get_x();
+    if (!last_pf_z_valid)
+    {
+        last_pf_mid_z = s.pos(2);
+        last_pf_odin_z = z_o;
+        last_pf_z_valid = true;
+        return;
+    }
+    const double dz_m = s.pos(2) - last_pf_mid_z;
+    const double dz_o = z_o - last_pf_odin_z;
+    const double innov = dz_o - dz_m;
+    if (std::fabs(innov) > odin_z_factor_max_innov)
+    {
+        last_pf_mid_z = s.pos(2);
+        last_pf_odin_z = z_o;
+        return;
+    }
+    const double a = std::max(0.0, std::min(1.0, odin_z_factor_alpha));
+    s.pos(2) += a * innov;
+    kf.change_x(s);
+    ++n_odin_z_factor;
+    last_pf_mid_z = s.pos(2);
+    last_pf_odin_z = z_o;
+    if ((n_odin_z_factor % 50) == 1)
+        std::cout << "[pv-z] odin_z_factor innov=" << innov
+                  << " z=" << s.pos(2) << " n=" << n_odin_z_factor << std::endl;
+}
+
+// go2 residual_z_v6.3 single-level: soft flat z_ref + damp vz/ba.z.
+void apply_residual_z_flat()
+{
+    if (!residual_z_en)
+        return;
+    state_ikfom s = kf.get_x();
+    if (!residual_z_flat_ref_init)
+    {
+        residual_z_flat_z_ref = s.pos(2);
+        residual_z_flat_ref_init = true;
+        std::cout << "[pv-z] residual_z flat_z_ref=" << residual_z_flat_z_ref
+                  << std::endl;
+    }
+    const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
+    const double az = std::max(0.0, std::min(1.0, residual_z_flat_z_alpha));
+    const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
+    s.vel(2) *= (1.0 - av);
+    s.ba(2) *= (1.0 - ab);
+    s.pos(2) += az * (residual_z_flat_z_ref - s.pos(2));
+    kf.change_x(s);
 }
 
 const bool var_contrast(pointWithCov &x, pointWithCov &y) {
@@ -1236,6 +1336,15 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->declare_parameter<double>("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->declare_parameter<bool>("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    node->declare_parameter<bool>("dual_tune.residual_z_en", residual_z_en);
+    node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
+    node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
+    node->declare_parameter<double>("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
+    node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
+    node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
+    node->declare_parameter<double>("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
     node->get_parameter("dual_tune.odin_min_pts", odin_min_pts);
     node->get_parameter("dual_tune.odin_min_frac", odin_min_frac);
     {
@@ -1272,6 +1381,15 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->get_parameter("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->get_parameter("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    node->get_parameter("dual_tune.residual_z_en", residual_z_en);
+    node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
+    node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
+    node->get_parameter("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
+    node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
+    node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
+    node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
+    node->get_parameter("dual_tune.odin_z_factor_max_innov", odin_z_factor_max_innov);
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
               << " gyr=" << odin_s2_gyr_gate
@@ -1282,6 +1400,8 @@ int main(int argc, char** argv)
               << " odin_global=" << odin_global_insert_en
               << " req_s2=" << odin_global_require_s2
               << " odin_body=" << odin_body_pub_en
+              << " residual_z=" << residual_z_en
+              << " odin_z_factor=" << odin_z_factor_en
               << std::endl;
 
     if(extrinT_l2.size()==3) LiDAR2_T_wrt_LiDAR1<<VEC_FROM_ARRAY(extrinT_l2);
@@ -1314,13 +1434,27 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("publish.publish_global_cloud_map", false);
     node->declare_parameter<int>("publish.publish_max_voxel_layer", 0);
     node->declare_parameter<double>("publish.global_map_leaf_size", 0.1);
+    node->declare_parameter<double>("publish.global_map_pub_leaf_size", global_map_pub_leaf_size);
+    node->declare_parameter<double>("publish.global_map_pub_period", global_map_pub_period);
+    node->declare_parameter<int>("publish.global_map_pub_max_pts", global_map_pub_max_pts);
     node->get_parameter("publish.pub_voxel_map", publish_voxel_map);
     node->get_parameter("publish.publish_global_cloud_map", publish_global_cloud_map);
     node->get_parameter("publish.publish_max_voxel_layer", publish_max_voxel_layer);
     node->get_parameter("publish.global_map_leaf_size", global_map_leaf_size);
+    node->get_parameter("publish.global_map_pub_leaf_size", global_map_pub_leaf_size);
+    node->get_parameter("publish.global_map_pub_period", global_map_pub_period);
+    node->get_parameter("publish.global_map_pub_max_pts", global_map_pub_max_pts);
     // Allow 0.05 for denser far ground; clamp extremes for PCL VoxelGrid safety.
     if (global_map_leaf_size < 0.03) global_map_leaf_size = 0.03;
     if (global_map_leaf_size > 1.0) global_map_leaf_size = 1.0;
+    if (global_map_pub_leaf_size < global_map_leaf_size)
+        global_map_pub_leaf_size = global_map_leaf_size;
+    if (global_map_pub_leaf_size > 1.0) global_map_pub_leaf_size = 1.0;
+    if (global_map_pub_period < 0.5) global_map_pub_period = 0.5;
+    if (global_map_pub_max_pts < 50000) global_map_pub_max_pts = 50000;
+    std::cout << "global_map_pub: leaf=" << global_map_pub_leaf_size
+              << " period=" << global_map_pub_period
+              << "s max_pts=" << global_map_pub_max_pts << std::endl;
 
     node->declare_parameter<double>("preprocess.blind", 0.01);
     node->declare_parameter<int>("preprocess.lidar_type", AVIA);
@@ -1415,6 +1549,7 @@ int main(int argc, char** argv)
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl2;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu2;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odin_odom;
     if (multi_lidar_en)
     {
         auto odin_cloud_qos = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
@@ -1423,6 +1558,13 @@ int main(int argc, char** argv)
             lid_topic2, odin_cloud_qos, standard_pcl_cbk2);
         sub_imu2 = node->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic2, odin_imu_qos, imu2_cbk);
+        if (odin_z_factor_en)
+        {
+            auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
+            sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
+                odin_odom_topic, odin_odom_qos, odin_odom_cbk);
+            std::cout << "[pv-z] subscribe " << odin_odom_topic << std::endl;
+        }
     }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -1448,10 +1590,14 @@ int main(int argc, char** argv)
     // Timer: voxelize new points each 1s. Periodically re-VoxelGrid the FULL
     // Global map async — pending-only left Mid360 non-repetitive scans as
     // independent centroid lattices ("一团一团") and wavy floors.
+    // RViz gets a coarser, rate-limited copy so Jetson CPU is not stolen from IEKF.
     auto timer = node->create_wall_timer(1s,
         [&]()
         {
             static int global_remap_tick = 0;
+            static auto last_global_pub_tp =
+                std::chrono::steady_clock::now() -
+                std::chrono::milliseconds(static_cast<int>(global_map_pub_period * 2000));
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 if (global_cloud_map_pending->empty() && global_cloud_map->empty())
@@ -1495,11 +1641,50 @@ int main(int argc, char** argv)
                     global_remap_busy.store(false);
                 }).detach();
             }
+            if (!publish_global_cloud_map || global_pub_t->empty())
+                return;
+            const auto now_tp = std::chrono::steady_clock::now();
+            const double since_pub =
+                std::chrono::duration<double>(now_tp - last_global_pub_tp).count();
+            if (since_pub < global_map_pub_period)
+                return;
+
+            PointCloudXYZI::Ptr viz(new PointCloudXYZI());
+            if (global_map_pub_leaf_size > global_map_leaf_size + 1e-6)
+            {
+                pcl::VoxelGrid<PointType> vg_pub;
+                const float leaf = static_cast<float>(global_map_pub_leaf_size);
+                vg_pub.setLeafSize(leaf, leaf, leaf);
+                vg_pub.setInputCloud(global_pub_t);
+                vg_pub.filter(*viz);
+                if (viz->empty())
+                    *viz = *global_pub_t;
+            }
+            else
+            {
+                *viz = *global_pub_t;
+            }
+            if (static_cast<int>(viz->size()) > global_map_pub_max_pts &&
+                global_map_pub_max_pts > 0)
+            {
+                const int stride =
+                    (static_cast<int>(viz->size()) + global_map_pub_max_pts - 1) /
+                    global_map_pub_max_pts;
+                PointCloudXYZI::Ptr capped(new PointCloudXYZI());
+                capped->points.reserve(static_cast<size_t>(global_map_pub_max_pts));
+                for (size_t i = 0; i < viz->size(); i += static_cast<size_t>(stride))
+                    capped->points.push_back(viz->points[i]);
+                capped->width = capped->points.size();
+                capped->height = 1;
+                viz.swap(capped);
+            }
+
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
-            pcl::toROSMsg(*global_pub_t, laserCloudmsg);
+            pcl::toROSMsg(*viz, laserCloudmsg);
             laserCloudmsg.header.stamp = sec_to_stamp(lidar_end_time);
             laserCloudmsg.header.frame_id = "camera_init";
             pubGlobalCloudMap->publish(laserCloudmsg);
+            last_global_pub_tp = now_tp;
         }
     );
 //------------------------------------------------------------------------------------------------------
@@ -1986,6 +2171,10 @@ int main(int argc, char** argv)
             // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
             if (!state_bad)
             {
+                // Corridor Z: go2 flat residual_z, then soft Odin onboard Δz.
+                apply_residual_z_flat();
+                apply_odin_z_factor(lidar_end_time);
+                state_point = kf.get_x();
                 last_good_lidar_state = state_point;
                 have_last_good_lidar = true;
                 consec_iekf_bad = 0;
