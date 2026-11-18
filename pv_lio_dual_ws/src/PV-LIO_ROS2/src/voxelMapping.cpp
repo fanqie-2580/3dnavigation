@@ -127,6 +127,7 @@ double odin_max_residual = 0.05;
 double odin_s2_gyr_gate = 0.12;
 double iekf_max_upd = 0.08;
 double iekf_max_rot = 0.08;
+double iekf_max_vel = 1.3;   // corridor return root: along-track |v| runaway
 double iekf_s2_max_upd = 0.015;
 double iekf_s2_max_rot = 0.025;
 double map_jump_upd = 0.05;
@@ -199,8 +200,11 @@ int iekf_reject_jump = 0;
 // After Mid match fails, IMU-only prop pollutes voxel map → reject_s1 cascade.
 // Freeze to last good lidar pose (FAST_LIO-like: no map update without valid residual).
 state_ikfom last_good_lidar_state;
+esekfom::esekf<state_ikfom, 12, input_ikfom>::cov last_good_P;
 bool have_last_good_lidar = false;
+bool have_last_good_P = false;
 int consec_iekf_bad = 0;
+int iekf_reject_vel = 0;
 // Per-frame Odin residual inflation (set when fusing).
 double odin_frame_cov_scale = 4.0;
 
@@ -1414,6 +1418,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_s2_gyr_gate", odin_s2_gyr_gate);
     node->declare_parameter<double>("dual_tune.iekf_max_upd", iekf_max_upd);
     node->declare_parameter<double>("dual_tune.iekf_max_rot", iekf_max_rot);
+    node->declare_parameter<double>("dual_tune.iekf_max_vel", iekf_max_vel);
     node->declare_parameter<double>("dual_tune.iekf_s2_max_upd", iekf_s2_max_upd);
     node->declare_parameter<double>("dual_tune.iekf_s2_max_rot", iekf_s2_max_rot);
     node->declare_parameter<int>("dual_tune.consec_bad_freeze", consec_bad_freeze);
@@ -1469,6 +1474,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_s2_gyr_gate", odin_s2_gyr_gate);
     node->get_parameter("dual_tune.iekf_max_upd", iekf_max_upd);
     node->get_parameter("dual_tune.iekf_max_rot", iekf_max_rot);
+    node->get_parameter("dual_tune.iekf_max_vel", iekf_max_vel);
     node->get_parameter("dual_tune.iekf_s2_max_upd", iekf_s2_max_upd);
     node->get_parameter("dual_tune.iekf_s2_max_rot", iekf_s2_max_rot);
     node->get_parameter("dual_tune.consec_bad_freeze", consec_bad_freeze);
@@ -2174,6 +2180,7 @@ int main(int argc, char** argv)
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             state_ikfom state_before_update = kf.get_x();
+            esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_before = kf.get_P();
             PointCloudXYZI::Ptr mid_down_body(new PointCloudXYZI(*feats_down_body));
             std::vector<M3D> mid_var_down = var_down_body;
             last_mid_effct_feat_num = 0;
@@ -2185,11 +2192,15 @@ int main(int argc, char** argv)
             bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
             iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
-            // Mid match failed → restore & skip S2 (prevents IMU-only flyaway + soft Odin yank).
+            // Return XY root cause (not jump_reject itself):
+            // corridor along-track Mid match is weak → |v| silently climbs
+            // 0.9→20m/s with d_upd still < iekf_max_upd; residual_z keeps Z OK.
+            // Hard-reject on |v| froze pose (~60m path). Clamp |v| instead and
+            // only full-reject on mid_no_eff / jump / divergence (+ restore P).
             const bool mid_no_eff = (last_mid_effct_feat_num < 1);
-            bool jump_reject = (!state_bad) &&
+            bool jump_reject = (!state_bad) && !mid_no_eff &&
                 (d_upd_chk > iekf_max_upd || d_rot_chk > iekf_max_rot);
-            if (state_bad || jump_reject || mid_no_eff)
+            if (state_bad || mid_no_eff || jump_reject)
             {
                 if (jump_reject)
                 {
@@ -2210,8 +2221,26 @@ int main(int argc, char** argv)
                     std::cout << "[pv-iekf] skip_s2 mid_no_eff" << std::endl;
                 }
                 kf.change_x(state_before_update);
+                kf.change_P(P_before);
                 state_point = kf.get_x();
                 state_bad = true;
+            }
+            else if (iekf_max_vel > 0.0)
+            {
+                const double vel_n = state_point.vel.norm();
+                if (vel_n > iekf_max_vel)
+                {
+                    ++iekf_reject_vel;
+                    state_ikfom s = state_point;
+                    s.vel *= (iekf_max_vel / vel_n);
+                    kf.change_x(s);
+                    state_point = s;
+                    if ((iekf_reject_vel % 10) == 1)
+                        std::cout << "[pv-iekf] clamp_vel |v|=" << vel_n
+                                  << " -> " << iekf_max_vel
+                                  << " d_upd=" << d_upd_chk
+                                  << " n=" << iekf_reject_vel << std::endl;
+                }
             }
 
             /*** Stage-2: soft Odin IEKF from Mid-locked state (true tight couple) ***/
@@ -2301,8 +2330,26 @@ int main(int argc, char** argv)
                 apply_residual_z_flat();
                 apply_odin_z_factor(lidar_end_time);
                 state_point = kf.get_x();
+                if (iekf_max_vel > 0.0)
+                {
+                    const double vel_n = state_point.vel.norm();
+                    if (vel_n > iekf_max_vel)
+                    {
+                        ++iekf_reject_vel;
+                        state_ikfom s = state_point;
+                        s.vel *= (iekf_max_vel / vel_n);
+                        kf.change_x(s);
+                        state_point = s;
+                        if ((iekf_reject_vel % 20) == 1)
+                            std::cout << "[pv-iekf] clamp_vel_post |v|=" << vel_n
+                                      << " -> " << iekf_max_vel
+                                      << " n=" << iekf_reject_vel << std::endl;
+                    }
+                }
                 last_good_lidar_state = state_point;
+                last_good_P = kf.get_P();
                 have_last_good_lidar = true;
+                have_last_good_P = true;
                 consec_iekf_bad = 0;
             }
             else
@@ -2311,6 +2358,7 @@ int main(int argc, char** argv)
                 if (have_last_good_lidar && consec_iekf_bad >= consec_bad_freeze)
                 {
                     kf.change_x(last_good_lidar_state);
+                    if (have_last_good_P) kf.change_P(last_good_P);
                     state_point = last_good_lidar_state;
                     if ((consec_iekf_bad % 20) == 0)
                         std::cout << "[pv-iekf] freeze_pose consec_bad="

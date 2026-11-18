@@ -19,9 +19,12 @@ TUNE = {
     "odin_s2_gyr_gate": 2.0,
     "odin_s2_max_clip_ratio": 0.90,
 
-    # --- IEKF jump reject ---
+    # --- IEKF jump / velocity reject ---
+    # Return root cause: corridor along-track degeneracy silently inflates |v|
+    # (0.9→20m/s) below iekf_max_upd; residual_z keeps Z looking OK.
     "iekf_max_upd": 0.08,
     "iekf_max_rot": 0.08,
+    "iekf_max_vel": 1.3,
     "iekf_s2_max_upd": 0.03,
     "iekf_s2_max_rot": 0.04,
     "consec_bad_freeze": 2,
