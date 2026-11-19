@@ -1,6 +1,5 @@
 # Odin-primary dual: Odin L1 + Mid L2.
-# L1-only Z hacks (hard_band / drop_iekf_z) made XY path 108→500m+ — not usable.
-# Use Mid as L2 for XY lock; same corridor Z recipe as Mid-primary dual.
+# Z: use /odin1/odometry height directly (init-aligned). No residual_z / hard_band.
 
 TUNE = {
     "odin_min_pts": 4000,
@@ -9,7 +8,6 @@ TUNE = {
     "odin_body_z_max": 3.5,
     "odin_static_gyro": 0.05,
 
-    # L2=Mid joint S2 (variable names still say odin_* = secondary)
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 1200,
     "odin_iekf_max_end_dt": 0.18,
@@ -32,8 +30,6 @@ TUNE = {
     "odin_voxel_body_z_min": 0.15,
     "odin_voxel_cov_scale": 8.0,
 
-    # Odin S1 often jumps; S2 Mid must be allowed a larger correction
-    # (prev s2_max_upd=0.06 → accept_s2=1/43, path 197m≈2×).
     "iekf_max_upd": 0.08,
     "iekf_max_rot": 0.08,
     "iekf_max_vel": 1.5,
@@ -51,27 +47,31 @@ TUNE = {
     "odin_global_require_s2": True,
     "odin_body_pub_en": True,
 
-    "residual_z_en": True,
-    "residual_z_flat_z_alpha": 0.32,
-    "residual_z_flat_vz_alpha": 1.0,
-    "residual_z_flat_ba_z_alpha": 0.30,
-    "residual_z_flat_max_step": 0.020,
-    "residual_z_hard_band": 0.025,
+    # Off: no algorithmic flat / hard Z.
+    "residual_z_en": False,
+    "residual_z_flat_z_alpha": 0.0,
+    "residual_z_flat_vz_alpha": 0.0,
+    "residual_z_flat_ba_z_alpha": 0.0,
+    "residual_z_flat_max_step": 0.0,
+    "residual_z_hard_band": 0.0,
     "residual_z_floor_nz_thr": 0.85,
-    "residual_z_floor_info_scale": 0.42,
-    "residual_z_h_dampen": 0.48,
+    "residual_z_floor_info_scale": 1.0,
+    "residual_z_h_dampen": 1.0,
     "residual_z_dz_tol": 0.05,
     "residual_z_floor_ratio_thr": 0.03,
-    "odin_z_factor_en": True,
+
+    # Soft factor off; hard replace from Odin odom Z.
+    "odin_z_factor_en": False,
+    "odin_z_replace_en": True,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.60,
+    "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.025,
-    "odin_z_factor_band": 0.020,
+    "odin_z_factor_max_innov": 0.0,
+    "odin_z_factor_band": 0.0,
     "odin_z_factor_catch_err": 0.0,
     "odin_z_factor_catch_frac": 1.0,
-    "odin_z_factor_catch_max": 0.05,
-    "odin_z_factor_catch_alpha": 0.50,
+    "odin_z_factor_catch_max": 0.0,
+    "odin_z_factor_catch_alpha": 0.0,
     "odin_z_factor_catch_min_feat": 30,
     "odin_z_factor_one_sided": False,
     "odin_z_factor_floor_scale": 0.30,

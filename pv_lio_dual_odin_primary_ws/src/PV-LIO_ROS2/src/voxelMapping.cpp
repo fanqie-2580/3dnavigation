@@ -182,6 +182,7 @@ double last_floor_z = 0.0;
 int last_floor_n = 0;
 double last_floor_ratio = 0.0;
 bool odin_z_factor_en = true;
+bool odin_z_replace_en = false; // true: pose Z := Odin odom Z (init-aligned), no algo Z
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
@@ -354,6 +355,45 @@ double odin_z_signed_err(const state_ikfom &s)
     const double target_z =
         odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     return target_z - s.pos(2);
+}
+
+// Hard replace fusion Z with Odin onboard odom Z (only an initial offset).
+// z_fusion = z_fusion0 + (z_odin - z_odin0). No residual_z / IEKF Z.
+void apply_odin_z_replace(double /*stamp*/)
+{
+    if (!odin_z_replace_en)
+        return;
+    double z_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        z_o = odin_odom_z;
+    }
+    state_ikfom s = kf.get_x();
+    if (!last_pf_z_valid)
+    {
+        odin_z_anchor_mid = s.pos(2);
+        odin_z_anchor_odin = z_o;
+        last_pf_z_valid = true;
+        last_pf_mid_z = s.pos(2);
+        last_pf_odin_z = z_o;
+        std::cout << "[pv-z] odin_z_replace init fusion_z=" << odin_z_anchor_mid
+                  << " odin_z=" << odin_z_anchor_odin << std::endl;
+        return;
+    }
+    const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    s.pos(2) = z_new;
+    s.vel(2) = 0.0;
+    kf.change_x(s);
+    ++n_odin_z_factor;
+    last_pf_mid_z = z_new;
+    last_pf_odin_z = z_o;
+    if ((n_odin_z_factor % 50) == 1)
+        std::cout << "[pv-z] odin_z_replace z=" << z_new
+                  << " odin_z=" << z_o
+                  << " dz_odin=" << (z_o - odin_z_anchor_odin)
+                  << " n=" << n_odin_z_factor << std::endl;
 }
 
 // Soft Z: flat_ref + band-limited Odin Δz (do not inherit full Odin drift).
@@ -1556,6 +1596,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->declare_parameter<double>("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
     node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
+    node->declare_parameter<bool>("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1635,6 +1676,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->get_parameter("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
     node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
+    node->get_parameter("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1671,6 +1713,7 @@ int main(int argc, char** argv)
               << " floor_info=" << residual_z_floor_info_scale
               << " h_damp=" << residual_z_h_dampen
               << " odin_z_factor=" << odin_z_factor_en
+              << " odin_z_replace=" << odin_z_replace_en
               << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err
@@ -1868,13 +1911,15 @@ int main(int argc, char** argv)
                   << " type=" << p_pre->lidar_type
                   << " imu=" << imu_topic << std::endl;
     }
-    // Odin Z factor works for L1-only too (bag /odin1/odometry as height prior).
-    if (odin_z_factor_en)
+    // Odin odom Z (soft factor and/or hard replace).
+    if (odin_z_factor_en || odin_z_replace_en)
     {
         auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
         sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
             odin_odom_topic, odin_odom_qos, odin_odom_cbk);
-        std::cout << "[pv-z] subscribe " << odin_odom_topic << std::endl;
+        std::cout << "[pv-z] subscribe " << odin_odom_topic
+                  << " replace=" << odin_z_replace_en
+                  << " factor=" << odin_z_factor_en << std::endl;
     }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -2565,10 +2610,8 @@ int main(int argc, char** argv)
             // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
             if (!state_bad)
             {
-                // L1-only: IEKF floor planes couple Δz into XY. Keeping that Δz
-                // then hard-clamping Z left XY polluted → no-eff / freeze / RViz drift.
-                // Discard IEKF Z (and vz); Z comes only from soft prior + Odin factor.
-                if (!multi_lidar_en)
+                // Drop IEKF Δz when Z is taken from Odin odom (or L1-only soft path).
+                if (odin_z_replace_en || !multi_lidar_en)
                 {
                     state_ikfom s = kf.get_x();
                     const double dz_iekf = s.pos(2) - state_before_update.pos(2);
@@ -2577,13 +2620,22 @@ int main(int argc, char** argv)
                     kf.change_x(s);
                     static int n_l1_drop_z = 0;
                     if ((++n_l1_drop_z % 50) == 1)
-                        std::cout << "[pv-z] l1_drop_iekf_z dz=" << dz_iekf
+                        std::cout << "[pv-z] drop_iekf_z dz=" << dz_iekf
+                                  << " replace=" << odin_z_replace_en
                                   << " n=" << n_l1_drop_z << std::endl;
                 }
-                // Corridor Z: go2 flat residual_z, then soft Odin onboard Δz.
-                apply_residual_z_flat();
-                apply_odin_z_factor(lidar_end_time);
-                apply_residual_z_hard_clamp();
+                if (odin_z_replace_en)
+                {
+                    // Pose Z := Odin /odin1/odometry Z (init-aligned only).
+                    apply_odin_z_replace(lidar_end_time);
+                }
+                else
+                {
+                    // Corridor Z: go2 flat residual_z, then soft Odin onboard Δz.
+                    apply_residual_z_flat();
+                    apply_odin_z_factor(lidar_end_time);
+                    apply_residual_z_hard_clamp();
+                }
                 state_point = kf.get_x();
                 if (iekf_max_vel > 0.0)
                 {
