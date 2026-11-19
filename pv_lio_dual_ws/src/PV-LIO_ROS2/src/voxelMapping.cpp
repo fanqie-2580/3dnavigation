@@ -1145,6 +1145,8 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
         pv.cov = cov_world;
         pv.cov_lidar = cov_lidar;
+        // Odin body points are tagged intensity=200 in commit_odin_body.
+        pv.lidar_src = (feats_down_body->points[i].intensity >= 150.0f) ? 1 : 0;
         pv_list[i] = pv;
     }
 
@@ -1181,8 +1183,10 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         point_crossmat<<SKEW_SYM_MATRX(point_this);
 
         V3D norm_vec(ptpl_list[i].normal);
+        const bool is_odin_pt = (ptpl_list[i].lidar_src == 1);
+        // Mid floor damp applies to Mid rows even during joint S2.
         const bool is_floor =
-            residual_z_en && !iekf_odin_stage &&
+            residual_z_en && !is_odin_pt &&
             std::fabs(norm_vec.z()) > residual_z_floor_nz_thr;
         V3D norm_jac = norm_vec;
         if (is_floor && residual_z_h_dampen < 1.0)
@@ -1205,8 +1209,8 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + norm_vec.z() * ptpl_list[i].point_world.z()
                 + ptpl_list[i].d;
 
-        // FAST_LIO_MULTI: clip large Odin point-to-plane residuals in stage-2.
-        if (iekf_odin_stage && std::fabs(pd2) > odin_max_residual)
+        // Joint S2: clip large residuals on Odin rows only (never Mid).
+        if (iekf_odin_stage && is_odin_pt && std::fabs(pd2) > odin_max_residual)
         {
             ekfom_data.h(i) = 0.0;
             ekfom_data.h_x.row(i).setZero();
@@ -2243,28 +2247,44 @@ int main(int argc, char** argv)
                 }
             }
 
-            /*** Stage-2: soft Odin IEKF from Mid-locked state (true tight couple) ***/
+            /*** Stage-2: joint Mid+Odin IEKF (same H, soft Odin rows) ***/
+            // Unlike prior Odin-only replace, Mid downs stay in the residual so
+            // Odin cannot fully override the Mid lock inside one update.
             state_ikfom state_after_mid = kf.get_x();
             bool odin_s2_accepted = false;
             double odin_s2_clip_ratio = 1.0;
-            if (!state_bad && odin_iekf_body && !odin_iekf_body->empty())
+            const size_t joint_mid_n = mid_down_body ? mid_down_body->size() : 0;
+            if (!state_bad && odin_iekf_body && !odin_iekf_body->empty() &&
+                mid_down_body && !mid_down_body->empty())
             {
-                *feats_down_body = *odin_iekf_body;
+                feats_down_body->points.clear();
+                feats_down_body->points.reserve(joint_mid_n + odin_iekf_body->size());
+                feats_down_body->points.insert(feats_down_body->points.end(),
+                                              mid_down_body->points.begin(),
+                                              mid_down_body->points.end());
+                feats_down_body->points.insert(feats_down_body->points.end(),
+                                              odin_iekf_body->points.begin(),
+                                              odin_iekf_body->points.end());
+                feats_down_body->width = feats_down_body->points.size();
+                feats_down_body->height = 1;
                 sort(feats_down_body->points.begin(), feats_down_body->points.end(), time_list);
                 feats_down_size = feats_down_body->points.size();
                 var_down_body.clear();
+                var_down_body.reserve(feats_down_size);
                 for (auto &pt : feats_down_body->points)
                 {
                     V3D point_this(pt.x, pt.y, pt.z);
                     M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                    // Secondary-lidar info weight (constraint-fusion Hb*W).
-                    double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
-                    // MA-LIO-like point-wise: farther points → larger uncertainty.
-                    const double r = point_this.norm();
-                    const double rr = r / odin_range_ref;
-                    s *= (1.0 + rr * rr);
-                    if (s > 256.0) s = 256.0;
-                    cov_lidar *= s;
+                    if (pt.intensity >= 150.0f)
+                    {
+                        // Soft Odin info weight (constraint-fusion Hb*W).
+                        double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
+                        const double r = point_this.norm();
+                        const double rr = r / odin_range_ref;
+                        s *= (1.0 + rr * rr);
+                        if (s > 256.0) s = 256.0;
+                        cov_lidar *= s;
+                    }
                     var_down_body.push_back(cov_lidar);
                 }
                 if (feats_down_size >= 5)
@@ -2297,7 +2317,8 @@ int main(int argc, char** argv)
                         if ((iekf_reject_s2 % 10) == 1)
                             std::cout << "[pv-iekf] reject_s2 d_upd=" << s2_du
                                       << " d_rot=" << s2_dr
-                                      << " odin_iekf=" << odin_iekf_n
+                                      << " joint_mid=" << joint_mid_n
+                                      << " odin=" << odin_iekf_n
                                       << " clip=" << clipped
                                       << " clip_r=" << odin_s2_clip_ratio
                                       << " cov=" << odin_frame_cov_scale
@@ -2313,7 +2334,8 @@ int main(int argc, char** argv)
                         if ((iekf_accept_s2 % 50) == 1)
                             std::cout << "[pv-iekf] accept_s2 d_upd=" << s2_du
                                       << " d_rot=" << s2_dr
-                                      << " odin_iekf=" << odin_iekf_n
+                                      << " joint_mid=" << joint_mid_n
+                                      << " odin=" << odin_iekf_n
                                       << " clip=" << clipped
                                       << " clip_r=" << odin_s2_clip_ratio
                                       << " acc=" << iekf_accept_s2

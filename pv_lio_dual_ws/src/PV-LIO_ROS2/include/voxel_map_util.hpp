@@ -9,6 +9,7 @@
 #include <openssl/md5.h>
 #include <pcl/common/io.h>
 #include <rclcpp/rclcpp.hpp>
+#include <cstdint>
 #include <stdio.h>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,7 @@ typedef struct ptpl {
   double d;
   int layer;
   Eigen::Matrix3d cov_lidar;
+  uint8_t lidar_src = 0;  // 0=Mid, 1=Odin (joint S2 residual tag)
 } ptpl;
 
 // 3D point with covariance
@@ -38,6 +40,7 @@ typedef struct pointWithCov {
   Eigen::Vector3d point_world;
   Eigen::Matrix3d cov;
   Eigen::Matrix3d cov_lidar;
+  uint8_t lidar_src = 0;  // 0=Mid, 1=Odin
 } pointWithCov;
 
 typedef struct Plane {
@@ -744,6 +747,7 @@ void build_single_residual(const pointWithCov &pv, const OctoTree *current_octo,
           single_ptpl.d = plane.d;
           single_ptpl.layer = current_layer;
           single_ptpl.cov_lidar = pv.cov_lidar;
+          single_ptpl.lidar_src = pv.lidar_src;
         }
         return;
       } else {

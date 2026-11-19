@@ -9,8 +9,9 @@ TUNE = {
     "odin_body_z_max": 3.5,
     "odin_static_gyro": 0.05,
 
-    # --- Stage-2 soft Odin IEKF (tighter than prior 0.40/800) ---
-    # Push Odin harder into IEKF; keep Mid S1 lock + residual_z band + vel clamp.
+    # --- Stage-2 joint Mid+Odin IEKF (same H; not Odin-only replace) ---
+    # S2 concatenates Mid downs + soft Odin subsample. residual clip is Odin-only.
+    # Keep Mid S1 lock + residual_z band + vel clamp.
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 1200,
     "odin_iekf_max_end_dt": 0.18,
