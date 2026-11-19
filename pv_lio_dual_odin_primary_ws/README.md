@@ -39,3 +39,11 @@ ros2 launch pv_lio_odin_pri mapping_dual_odin_primary.launch.py rviz:=true
 ## 包名
 
 `pv_lio_odin_pri`（可执行文件仍为 `pv_lio_node`）。
+
+## 验证结论（2026-11-19 走廊去程 bag）
+
+当前 Odin 主雷达分叉**不稳定，不建议日常使用**：
+
+- 即便关闭 Mid S2（等价单 Odin LIO），约 45 s 内净高度已约 **+22 cm**，峰峰值约 **38 cm**，且频繁 `reject_s1`。
+- 根因主要是 **Odin IMU 做主状态传播**（加速度噪声极大），外加 Mid↔Odin 末端时刻系统性偏置约 **150–200 ms**。
+- 日常请继续用 Mid 主树 `/home/ll/pv_lio_dual_ws`；爬楼应在 Mid 主树上做「平地锁高度 / 爬楼放宽」自适应，而不是换主雷达。

@@ -1,16 +1,7 @@
-# 双雷达 PV-LIO：Odin1 主雷达分叉（新建目录）
+# 双雷达 PV-LIO：Odin1 主雷达分叉（实验，当前不推荐）
 
-原 Mid 主树 `/home/ll/pv_lio_dual_ws` **未改**。Odin 主雷达实验在：
+目录：`/home/ll/pv_lio_dual_odin_primary_ws`（包名 `pv_lio_odin_pri`）。**未改**原 Mid 主树 `pv_lio_dual_ws`。
 
-```text
-/home/ll/pv_lio_dual_odin_primary_ws
-```
+走廊去程 bag 验证（2026-11-19）：即便关闭 Mid 第二段，约 45 s 净高度约 +22 cm、峰峰值约 38 cm，频繁 reject_s1。主因是 Odin IMU 做主传播噪声过大，以及 Mid↔Odin 末端时刻偏置约 150–200 ms。
 
-包名 `pv_lio_odin_pri`。思路对齐官方 FAST-LIO-MULTI：以 L1 为时间轴与主更新，L2 末端时刻配对后降权进入联合更新。
-
-- L1：Odin1 点云 + Odin IMU（S1 锁定、默认写入匹配地图）
-- L2：Mid360 + Mid IMU（软等待配对、S2 联合、强度标记为副雷达）
-- 外参：Odin↔IMU 写入 `extrinsic_T/R`；Mid 相对 Odin 为原「Odin 相对 Mid」的逆
-- 高度：默认关掉平坦硬顶与 `odin_z_factor`，减轻爬楼被压死；走廊需再锁高度时只改本分叉的 `dual_odin_mid_tune.py`
-
-编译与启动见该目录 `README.md`。与 Mid 主树不要在同一 shell 同时 `source` 两套 `install`。
+日常请用 Mid 主树；爬楼应在 Mid 主方案上做高度约束自适应，而不是换主雷达。
