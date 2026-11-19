@@ -161,6 +161,8 @@ int iekf_odin_voxel_ins = 0;
 // Official MULTI Bundle: one joint Mid+Odin IEKF (no Mid-only S1 then S2).
 bool odin_joint_only_en = false;
 int iekf_joint_only_n = 0;
+// Official-like equal weight: no time/motion/range soft on Odin cov; looser IEKF entry.
+bool odin_equal_weight_en = false;
 // Corridor Z root cause:
 // - Mid floors bias Z; soft post-update that *fully follows Odin Δz* inherits
 //   Odin drift (outbound ≈+12cm, return ≈−14cm). One-sided only made outbound
@@ -1297,7 +1299,9 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + ptpl_list[i].d;
 
         // Joint S2: clip large residuals on Odin rows only (never Mid).
-        if (iekf_odin_stage && is_odin_pt && std::fabs(pd2) > odin_max_residual)
+        // Equal-weight / official Bundle: keep all residuals (no hetero clip).
+        if (!odin_equal_weight_en && iekf_odin_stage && is_odin_pt &&
+            std::fabs(pd2) > odin_max_residual)
         {
             ekfom_data.h(i) = 0.0;
             ekfom_data.h_x.row(i).setZero();
@@ -1547,6 +1551,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_voxel_body_z_min", odin_voxel_body_z_min);
     node->declare_parameter<double>("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
     node->declare_parameter<bool>("dual_tune.odin_joint_only_en", odin_joint_only_en);
+    node->declare_parameter<bool>("dual_tune.odin_equal_weight_en", odin_equal_weight_en);
     node->declare_parameter<bool>("dual_tune.residual_z_en", residual_z_en);
     node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1629,6 +1634,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
     if (odin_voxel_max_pts < 1) odin_voxel_max_pts = 1;
     node->get_parameter("dual_tune.odin_joint_only_en", odin_joint_only_en);
+    node->get_parameter("dual_tune.odin_equal_weight_en", odin_equal_weight_en);
     node->get_parameter("dual_tune.residual_z_en", residual_z_en);
     node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1665,6 +1671,7 @@ int main(int argc, char** argv)
               << " odin_vox=" << odin_voxel_insert_en
               << " vox_still=" << odin_voxel_require_still
               << " joint_only=" << odin_joint_only_en
+              << " equal_w=" << odin_equal_weight_en
               << " w=" << odin_info_weight
               << " res=" << odin_max_residual
               << " clip_max=" << odin_s2_max_clip_ratio
@@ -2092,8 +2099,14 @@ int main(int argc, char** argv)
                 *odin_map_full = gated;
                 odin_used_now = gated.size();
                 const double edt = std::abs(bundle_end_dt);
+                if (odin_equal_weight_en)
                 {
-                    // Time/motion soft only — do NOT multiply an extra ×2 on top of
+                    // Official co-sensor: same base scale, no Mid+Odin soft inflate.
+                    odin_frame_cov_scale = std::max(1e-3, lidar2_cov_scale);
+                }
+                else
+                {
+                    // Time/motion soft — do NOT multiply an extra ×2 on top of
                     // yaml lidar2_cov_scale (that made Odin ~200× Mid and fake-soft).
                     const double ratio = edt / 0.025;
                     double soft = std::max(1.0, ratio * ratio);
@@ -2103,10 +2116,13 @@ int main(int argc, char** argv)
                 const std::string tag_s = tag ? tag : "ok";
                 const bool nodeskew = tag_s.find("nodeskew") != std::string::npos;
                 // Never merge Odin into Mid feats_undistort (that was single-shot yank).
-                // Gyro gate (FAST_LIO_MULTI): moving → map densify only.
+                // Equal-weight / joint Bundle: enter IEKF whenever dense (official-like).
                 const bool s2_time_ok = edt <= odin_iekf_max_end_dt;
                 const bool s2_motion_ok = frame_gyr_mean < odin_s2_gyr_gate;
-                if (odin_s2_enable && s2_time_ok && s2_motion_ok)
+                const bool s2_enter =
+                    odin_s2_enable &&
+                    (odin_equal_weight_en || (s2_time_ok && s2_motion_ok));
+                if (s2_enter)
                 {
                     *odin_iekf_body = subsample_odin_iekf(gated);
                     odin_iekf_n = odin_iekf_body->size();
@@ -2370,16 +2386,19 @@ int main(int argc, char** argv)
                     V3D point_this(pt.x, pt.y, pt.z);
                     M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
                     double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
-                    const double r = point_this.norm();
-                    const double rr = r / odin_range_ref;
-                    s *= (1.0 + rr * rr);
-                    const double dt_s =
-                        std::fabs(static_cast<double>(pt.curvature)) / 1000.0;
-                    const double lever =
-                        std::max(0.15, static_cast<double>(std::hypot(pt.x, pt.y)));
-                    const double tang = frame_gyr_mean * dt_s * lever;
-                    s *= (1.0 + (tang / 0.05) * (tang / 0.05));
-                    if (s > 128.0) s = 128.0;
+                    if (!odin_equal_weight_en)
+                    {
+                        const double r = point_this.norm();
+                        const double rr = r / odin_range_ref;
+                        s *= (1.0 + rr * rr);
+                        const double dt_s =
+                            std::fabs(static_cast<double>(pt.curvature)) / 1000.0;
+                        const double lever =
+                            std::max(0.15, static_cast<double>(std::hypot(pt.x, pt.y)));
+                        const double tang = frame_gyr_mean * dt_s * lever;
+                        s *= (1.0 + (tang / 0.05) * (tang / 0.05));
+                        if (s > 128.0) s = 128.0;
+                    }
                     cov_lidar *= s;
                     var_down_body.push_back(cov_lidar);
                 }
