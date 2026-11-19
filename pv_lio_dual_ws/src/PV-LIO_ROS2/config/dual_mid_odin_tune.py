@@ -1,63 +1,62 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
+#
+# Bias: closer to official MULTI (same IEKF, less post-reject / Z hacks).
+# Keep Mid-first + Odin S2 (hetero still needs it); turn off corridor defenses.
 
 TUNE = {
-    # --- Odin cloud quality / hold ---
-    "odin_min_pts": 4000,
-    "odin_min_frac": 0.35,
-    "odin_body_z_min": -2.0,
-    "odin_body_z_max": 3.5,
-    "odin_static_gyro": 0.05,
+    # --- Odin cloud quality (mild; official has none) ---
+    "odin_min_pts": 2000,
+    "odin_min_frac": 0.20,
+    "odin_body_z_min": -3.0,
+    "odin_body_z_max": 4.0,
+    "odin_static_gyro": 0.08,
 
-    # --- Stage-2 joint Mid+Odin IEKF (same H; Mid S1 lock first) ---
-    # yaml lidar2_cov_scale=12; S2 restores P; Mid mid_var_down + time/lever soft.
-    # Shallow S1 (2 iters) when end_dt+gyro look Bundle-safe → joint S2 dominates.
+    # --- Stage-2 joint Mid+Odin IEKF ---
+    # Loose gates so S2 usually runs; clip_ratio=1 never reject on clip alone.
     "odin_s2_enable": True,
-    "odin_iekf_max_pts": 1200,
-    "odin_iekf_max_end_dt": 0.18,
-    "odin_info_weight": 0.65,
-    "odin_range_ref": 6.0,
-    "odin_max_residual": 0.12,
-    "odin_s2_gyr_gate": 3.0,
-    "odin_s2_max_clip_ratio": 0.95,
+    "odin_iekf_max_pts": 1600,
+    "odin_iekf_max_end_dt": 0.25,
+    "odin_info_weight": 0.85,
+    "odin_range_ref": 8.0,
+    "odin_max_residual": 0.50,
+    "odin_s2_gyr_gate": 5.0,
+    "odin_s2_max_clip_ratio": 1.0,
     "shallow_s1_en": True,
-    "shallow_s1_end_dt": 0.10,
-    "shallow_s1_gyr": 0.15,
+    "shallow_s1_end_dt": 0.12,
+    "shallow_s1_gyr": 0.20,
     "shallow_s1_iters": 2,
 
-    # --- Closer-to-official: Odin walls in IEKF; voxel insert OFF (sank Z ~2m) ---
+    # --- Odin in IEKF like co-sensor; voxel insert still OFF (sank Z ~2m) ---
     "odin_wall_nz_thr": 0.40,
-    "odin_wall_info_boost": 1.0,   # no wall boost: tilted walls pulled Z
-    "odin_floor_info_scale": 0.30,
+    "odin_wall_info_boost": 1.0,
+    "odin_floor_info_scale": 1.0,
     "odin_voxel_insert_en": False,
     "odin_voxel_max_clip": 0.20,
     "odin_voxel_max_pts": 100,
     "odin_voxel_body_z_min": 0.15,
     "odin_voxel_cov_scale": 8.0,
 
-    # --- IEKF jump / velocity reject ---
-    # Return root cause: corridor along-track degeneracy silently inflates |v|
-    # (0.9→20m/s) below iekf_max_upd; residual_z keeps Z looking OK.
-    "iekf_max_upd": 0.08,
-    "iekf_max_rot": 0.08,
-    "iekf_max_vel": 1.3,
-    "iekf_s2_max_upd": 0.060,
-    "iekf_s2_max_rot": 0.070,
-    "consec_bad_freeze": 2,
+    # --- Jump / vel / freeze: effectively off (0 vel = no clamp; huge max = no reject) ---
+    "iekf_max_upd": 10.0,
+    "iekf_max_rot": 10.0,
+    "iekf_max_vel": 0.0,
+    "iekf_s2_max_upd": 10.0,
+    "iekf_s2_max_rot": 10.0,
+    "consec_bad_freeze": 100,
 
-    # --- Global display map ---
-    "map_jump_upd": 0.05,
-    "map_jump_frame": 0.12,
-    "map_max_range": 25.0,
+    # --- Global display map: allow Odin without requiring S2 accept ---
+    "map_jump_upd": 10.0,
+    "map_jump_frame": 10.0,
+    "map_max_range": 30.0,
     "map_require_still": False,
     "map_still_gyr": 0.12,
     "map_use_downsample": False,
     "odin_global_insert_en": True,
-    "odin_global_require_s2": True,
+    "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Corridor Z ---
-    # Mid L1 XY unchanged; Z := /odin1/odometry (init-aligned). No residual_z / soft factor.
+    # --- Z: none (official). No residual_z / soft factor / odin_z_replace. ---
     "residual_z_en": False,
     "residual_z_flat_z_alpha": 0.0,
     "residual_z_flat_vz_alpha": 0.0,
@@ -70,7 +69,7 @@ TUNE = {
     "residual_z_dz_tol": 0.05,
     "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": False,
-    "odin_z_replace_en": True,
+    "odin_z_replace_en": False,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,
@@ -82,7 +81,7 @@ TUNE = {
     "odin_z_factor_catch_alpha": 0.0,
     "odin_z_factor_catch_min_feat": 30,
     "odin_z_factor_one_sided": False,
-    "odin_z_factor_floor_scale": 0.30,
+    "odin_z_factor_floor_scale": 1.0,
 }
 
 
