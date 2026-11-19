@@ -11,7 +11,7 @@ TUNE = {
 
     # --- Stage-2 joint Mid+Odin IEKF (same H; Mid S1 lock first) ---
     # yaml lidar2_cov_scale=12; S2 restores P; Mid mid_var_down + time/lever soft.
-    # Shallow S1 (1 iter) when end_dt+gyro look Bundle-safe → joint S2 dominates.
+    # Shallow S1 (2 iters) when end_dt+gyro look Bundle-safe → joint S2 dominates.
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 1200,
     "odin_iekf_max_end_dt": 0.18,
@@ -21,9 +21,19 @@ TUNE = {
     "odin_s2_gyr_gate": 3.0,
     "odin_s2_max_clip_ratio": 0.95,
     "shallow_s1_en": True,
-    "shallow_s1_end_dt": 0.05,
-    "shallow_s1_gyr": 0.08,
-    "shallow_s1_iters": 1,
+    "shallow_s1_end_dt": 0.10,
+    "shallow_s1_gyr": 0.15,
+    "shallow_s1_iters": 2,
+
+    # --- Closer-to-official: Odin walls in IEKF; voxel insert OFF (sank Z ~2m) ---
+    "odin_wall_nz_thr": 0.40,
+    "odin_wall_info_boost": 1.25,
+    "odin_floor_info_scale": 0.35,
+    "odin_voxel_insert_en": False,
+    "odin_voxel_max_clip": 0.20,
+    "odin_voxel_max_pts": 100,
+    "odin_voxel_body_z_min": 0.15,
+    "odin_voxel_cov_scale": 8.0,
 
     # --- IEKF jump / velocity reject ---
     # Return root cause: corridor along-track degeneracy silently inflates |v|

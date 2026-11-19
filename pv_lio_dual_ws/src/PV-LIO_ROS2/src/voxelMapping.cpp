@@ -148,6 +148,15 @@ double shallow_s1_end_dt = 0.05;
 double shallow_s1_gyr = 0.08;
 int shallow_s1_iters = 1;
 int iekf_shallow_s1 = 0;
+double odin_wall_nz_thr = 0.40;      // |nz|<thr → wall-like Odin residual
+double odin_wall_info_boost = 1.8;   // strengthen Odin walls in joint H
+double odin_floor_info_scale = 0.35; // soften Odin floors in joint H
+bool odin_voxel_insert_en = false;
+double odin_voxel_max_clip = 0.35;
+int odin_voxel_max_pts = 200;
+float odin_voxel_body_z_min = -0.05f; // skip near-floor body points
+double odin_voxel_cov_scale = 4.0;
+int iekf_odin_voxel_ins = 0;
 // Corridor Z root cause:
 // - Mid floors bias Z; soft post-update that *fully follows Odin Δz* inherits
 //   Odin drift (outbound ≈+12cm, return ≈−14cm). One-sided only made outbound
@@ -1254,6 +1263,16 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
             R_inv *= sc;
         }
+        // Joint S2: boost Odin near-vertical walls; keep Odin floors soft so
+        // wall normals carry height/lateral info without floor Z bite.
+        if (iekf_odin_stage && is_odin_pt)
+        {
+            const double nz = std::fabs(norm_vec.z());
+            if (nz < odin_wall_nz_thr)
+                R_inv *= std::max(1.0, odin_wall_info_boost);
+            else if (nz > residual_z_floor_nz_thr)
+                R_inv *= std::max(0.05, std::min(1.0, odin_floor_info_scale));
+        }
 
         ekfom_data.R(i) = R_inv;
     }
@@ -1452,6 +1471,14 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.shallow_s1_end_dt", shallow_s1_end_dt);
     node->declare_parameter<double>("dual_tune.shallow_s1_gyr", shallow_s1_gyr);
     node->declare_parameter<int>("dual_tune.shallow_s1_iters", shallow_s1_iters);
+    node->declare_parameter<double>("dual_tune.odin_wall_nz_thr", odin_wall_nz_thr);
+    node->declare_parameter<double>("dual_tune.odin_wall_info_boost", odin_wall_info_boost);
+    node->declare_parameter<double>("dual_tune.odin_floor_info_scale", odin_floor_info_scale);
+    node->declare_parameter<bool>("dual_tune.odin_voxel_insert_en", odin_voxel_insert_en);
+    node->declare_parameter<double>("dual_tune.odin_voxel_max_clip", odin_voxel_max_clip);
+    node->declare_parameter<int>("dual_tune.odin_voxel_max_pts", odin_voxel_max_pts);
+    node->declare_parameter<double>("dual_tune.odin_voxel_body_z_min", odin_voxel_body_z_min);
+    node->declare_parameter<double>("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
     node->declare_parameter<bool>("dual_tune.residual_z_en", residual_z_en);
     node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1517,6 +1544,19 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.shallow_s1_gyr", shallow_s1_gyr);
     node->get_parameter("dual_tune.shallow_s1_iters", shallow_s1_iters);
     if (shallow_s1_iters < 1) shallow_s1_iters = 1;
+    node->get_parameter("dual_tune.odin_wall_nz_thr", odin_wall_nz_thr);
+    node->get_parameter("dual_tune.odin_wall_info_boost", odin_wall_info_boost);
+    node->get_parameter("dual_tune.odin_floor_info_scale", odin_floor_info_scale);
+    node->get_parameter("dual_tune.odin_voxel_insert_en", odin_voxel_insert_en);
+    node->get_parameter("dual_tune.odin_voxel_max_clip", odin_voxel_max_clip);
+    node->get_parameter("dual_tune.odin_voxel_max_pts", odin_voxel_max_pts);
+    {
+        double zmin = odin_voxel_body_z_min;
+        node->get_parameter("dual_tune.odin_voxel_body_z_min", zmin);
+        odin_voxel_body_z_min = static_cast<float>(zmin);
+    }
+    node->get_parameter("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
+    if (odin_voxel_max_pts < 1) odin_voxel_max_pts = 1;
     node->get_parameter("dual_tune.residual_z_en", residual_z_en);
     node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1547,6 +1587,8 @@ int main(int argc, char** argv)
               << "/" << shallow_s1_iters
               << " sh_edt=" << shallow_s1_end_dt
               << " sh_gyr=" << shallow_s1_gyr
+              << " wall_boost=" << odin_wall_info_boost
+              << " odin_vox=" << odin_voxel_insert_en
               << " w=" << odin_info_weight
               << " res=" << odin_max_residual
               << " clip_max=" << odin_s2_max_clip_ratio
@@ -2554,8 +2596,9 @@ int main(int argc, char** argv)
             Eigen::Quaterniond ext_q(ext_q_coeffs[3], ext_q_coeffs[0], ext_q_coeffs[1], ext_q_coeffs[2]);
             Eigen::Matrix3d ext_R = ext_q.toRotationMatrix();
             (void)ext_t; (void)ext_R;
-            // IEKF residual may use Odin; voxel map stays Mid-only to avoid
-            // ~10cm extrinsic residual permanently smearing match surfaces.
+            // Match voxels: Mid always; Odin only when S2 accepted + low clip +
+            // quasi-static (inflated cov, non-floor subsample) — closer to
+            // official MULTI map insert without permanent floor smear.
             // CRITICAL: never insert when Mid match failed — wrong pose pollutes
             // planes → reject_s1 storm → visible drift / Eigen crash.
             if (!state_bad)
@@ -2570,6 +2613,60 @@ int main(int argc, char** argv)
                     pv.cov = cov_world;
                     pv.point << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
                     pv_list.push_back(pv);
+                }
+                const bool odin_vox_ok =
+                    odin_voxel_insert_en && odin_s2_accepted &&
+                    odin_s2_clip_ratio <= odin_voxel_max_clip &&
+                    frame_quasi_static && odin_iekf_body &&
+                    !odin_iekf_body->empty();
+                if (odin_vox_ok)
+                {
+                    PointCloudXYZI::Ptr odin_vox_body(new PointCloudXYZI);
+                    const size_t n_src = odin_iekf_body->size();
+                    const size_t max_n =
+                        static_cast<size_t>(std::max(1, odin_voxel_max_pts));
+                    const size_t stride =
+                        std::max<size_t>(1, (n_src + max_n - 1) / max_n);
+                    odin_vox_body->points.reserve(std::min(n_src, max_n));
+                    for (size_t i = 0; i < n_src; i += stride)
+                    {
+                        const auto &pt = odin_iekf_body->points[i];
+                        if (pt.z < odin_voxel_body_z_min) continue;
+                        odin_vox_body->points.push_back(pt);
+                        if (odin_vox_body->points.size() >= max_n) break;
+                    }
+                    odin_vox_body->width = odin_vox_body->points.size();
+                    odin_vox_body->height = 1;
+                    if (!odin_vox_body->empty())
+                    {
+                        PointCloudXYZI::Ptr odin_vox_world(new PointCloudXYZI);
+                        transformLidar(state_point, odin_vox_body, odin_vox_world);
+                        const double csc =
+                            std::max(1.0, odin_voxel_cov_scale);
+                        for (size_t i = 0; i < odin_vox_body->size(); ++i)
+                        {
+                            const auto &pt = odin_vox_body->points[i];
+                            pointWithCov pv;
+                            pv.point << pt.x, pt.y, pt.z;
+                            M3D cov_lidar =
+                                calcBodyCov(pv.point, ranging_cov, angle_cov);
+                            cov_lidar *= csc;
+                            M3D cov_world =
+                                transformLiDARCovToWorld(pv.point, kf, cov_lidar);
+                            pv.cov = cov_world;
+                            pv.point << odin_vox_world->points[i].x,
+                                odin_vox_world->points[i].y,
+                                odin_vox_world->points[i].z;
+                            pv_list.push_back(pv);
+                        }
+                        ++iekf_odin_voxel_ins;
+                        if ((iekf_odin_voxel_ins % 50) == 1)
+                            std::cout << "[pv-map] odin_voxel_ins n="
+                                      << odin_vox_body->size()
+                                      << " clip_r=" << odin_s2_clip_ratio
+                                      << " total=" << iekf_odin_voxel_ins
+                                      << std::endl;
+                    }
                 }
 
                 t_update_start = omp_get_wtime();
