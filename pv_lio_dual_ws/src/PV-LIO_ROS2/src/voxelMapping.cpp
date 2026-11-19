@@ -1950,11 +1950,12 @@ int main(int argc, char** argv)
                 odin_used_now = gated.size();
                 const double edt = std::abs(bundle_end_dt);
                 {
+                    // Time/motion soft only — do NOT multiply an extra ×2 on top of
+                    // yaml lidar2_cov_scale (that made Odin ~200× Mid and fake-soft).
                     const double ratio = edt / 0.025;
                     double soft = std::max(1.0, ratio * ratio);
-                    if (!frame_quasi_static) soft *= 2.5;
-                    // Stage-2 is soft on purpose (on top of yaml lidar2_cov_scale).
-                    odin_frame_cov_scale = std::min(128.0, lidar2_cov_scale * soft * 2.0);
+                    if (!frame_quasi_static) soft *= 2.0;
+                    odin_frame_cov_scale = std::min(32.0, lidar2_cov_scale * soft);
                 }
                 const std::string tag_s = tag ? tag : "ok";
                 const bool nodeskew = tag_s.find("nodeskew") != std::string::npos;
@@ -2250,12 +2251,16 @@ int main(int argc, char** argv)
 
             /*** Stage-2: joint Mid+Odin IEKF (same H as official Bundle) ***/
             state_ikfom state_after_mid = kf.get_x();
+            esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_after_mid = kf.get_P();
             bool odin_s2_accepted = false;
             double odin_s2_clip_ratio = 1.0;
             const size_t joint_mid_n = mid_down_body ? mid_down_body->size() : 0;
             if (!state_bad && odin_s2_enable && odin_iekf_body &&
-                !odin_iekf_body->empty() && mid_down_body && !mid_down_body->empty())
+                !odin_iekf_body->empty() && mid_down_body && !mid_down_body->empty() &&
+                mid_var_down.size() == joint_mid_n)
             {
+                // Keep Mid block then Odin block (no time-sort) so Mid cov stays
+                // aligned with mid_var_down; diagonal IEKF does not need time order.
                 feats_down_body->points.clear();
                 feats_down_body->points.reserve(joint_mid_n + odin_iekf_body->size());
                 feats_down_body->points.insert(feats_down_body->points.end(),
@@ -2266,24 +2271,30 @@ int main(int argc, char** argv)
                                               odin_iekf_body->points.end());
                 feats_down_body->width = feats_down_body->points.size();
                 feats_down_body->height = 1;
-                sort(feats_down_body->points.begin(), feats_down_body->points.end(),
-                     time_list);
                 feats_down_size = feats_down_body->points.size();
                 var_down_body.clear();
                 var_down_body.reserve(feats_down_size);
-                for (auto &pt : feats_down_body->points)
+                var_down_body.insert(var_down_body.end(),
+                                     mid_var_down.begin(), mid_var_down.end());
+                for (const auto &pt : odin_iekf_body->points)
                 {
                     V3D point_this(pt.x, pt.y, pt.z);
                     M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                    if (pt.intensity >= 150.0f)
-                    {
-                        double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
-                        const double r = point_this.norm();
-                        const double rr = r / odin_range_ref;
-                        s *= (1.0 + rr * rr);
-                        if (s > 256.0) s = 256.0;
-                        cov_lidar *= s;
-                    }
+                    double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
+                    // Range: farther → softer (MA-LIO-like).
+                    const double r = point_this.norm();
+                    const double rr = r / odin_range_ref;
+                    s *= (1.0 + rr * rr);
+                    // Per-point time weight (mid_odin style): curvature is ms.
+                    const double dt_s =
+                        std::fabs(static_cast<double>(pt.curvature)) / 1000.0;
+                    const double lever =
+                        std::max(0.15, static_cast<double>(std::hypot(pt.x, pt.y)));
+                    const double tang =
+                        frame_gyr_mean * dt_s * lever;  // ~m of tangential smear
+                    s *= (1.0 + (tang / 0.05) * (tang / 0.05));
+                    if (s > 128.0) s = 128.0;
+                    cov_lidar *= s;
                     var_down_body.push_back(cov_lidar);
                 }
                 if (feats_down_size >= 5)
@@ -2321,7 +2332,9 @@ int main(int argc, char** argv)
                                       << " clip=" << clipped
                                       << " clip_r=" << odin_s2_clip_ratio
                                       << " n=" << iekf_reject_s2 << std::endl;
+                        // Restore both pose and covariance (was x-only).
                         kf.change_x(state_after_mid);
+                        kf.change_P(P_after_mid);
                         state_point = state_after_mid;
                     }
                     else
@@ -2336,6 +2349,7 @@ int main(int argc, char** argv)
                                       << " odin=" << odin_iekf_n
                                       << " clip=" << clipped
                                       << " clip_r=" << odin_s2_clip_ratio
+                                      << " cov=" << odin_frame_cov_scale
                                       << " acc=" << iekf_accept_s2
                                       << " rej=" << iekf_reject_s2 << std::endl;
                     }

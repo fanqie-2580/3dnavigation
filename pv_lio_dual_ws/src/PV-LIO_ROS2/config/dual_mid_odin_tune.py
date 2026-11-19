@@ -10,8 +10,8 @@ TUNE = {
     "odin_static_gyro": 0.05,
 
     # --- Stage-2 joint Mid+Odin IEKF (same H; Mid S1 lock first) ---
-    # Official Bundle is single-pass; Mid+Odin single-pass sank return Z (~-35cm).
-    # Keep S1 Mid lock + S2 joint Mid+Odin residuals (official same-H + hetero net).
+    # Keep S1 Mid lock + joint H. yaml lidar2_cov_scale=8 (was 100); S2 restores P
+    # on reject; Odin cov uses Mid mid_var_down + per-point time/lever soft.
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 1200,
     "odin_iekf_max_end_dt": 0.18,
