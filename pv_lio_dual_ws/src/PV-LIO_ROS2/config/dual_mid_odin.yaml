@@ -55,7 +55,7 @@
       extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       # Soft Odin base cov scale (was 100 → Odin ~200× Mid, fake-soft).
       # Effective S2 scale ≈ lidar2_cov_scale * time/motion_soft / odin_info_weight.
-      lidar2_cov_scale: 8.0
+      lidar2_cov_scale: 12.0
     noise_model:
       ranging_cov: 0.04
       angle_cov: 0.1

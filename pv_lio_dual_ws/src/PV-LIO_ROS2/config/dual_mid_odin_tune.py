@@ -10,16 +10,20 @@ TUNE = {
     "odin_static_gyro": 0.05,
 
     # --- Stage-2 joint Mid+Odin IEKF (same H; Mid S1 lock first) ---
-    # Keep S1 Mid lock + joint H. yaml lidar2_cov_scale=8 (was 100); S2 restores P
-    # on reject; Odin cov uses Mid mid_var_down + per-point time/lever soft.
+    # yaml lidar2_cov_scale=12; S2 restores P; Mid mid_var_down + time/lever soft.
+    # Shallow S1 (1 iter) when end_dt+gyro look Bundle-safe → joint S2 dominates.
     "odin_s2_enable": True,
     "odin_iekf_max_pts": 1200,
     "odin_iekf_max_end_dt": 0.18,
-    "odin_info_weight": 0.55,
+    "odin_info_weight": 0.65,
     "odin_range_ref": 6.0,
     "odin_max_residual": 0.12,
     "odin_s2_gyr_gate": 3.0,
     "odin_s2_max_clip_ratio": 0.95,
+    "shallow_s1_en": True,
+    "shallow_s1_end_dt": 0.05,
+    "shallow_s1_gyr": 0.08,
+    "shallow_s1_iters": 1,
 
     # --- IEKF jump / velocity reject ---
     # Return root cause: corridor along-track degeneracy silently inflates |v|

@@ -2323,6 +2323,12 @@ public:
 	const cov& get_P() const {
 		return P_;
 	}
+	void set_maximum_iter(int maximum_iteration) {
+		maximum_iter = maximum_iteration;
+	}
+	int get_maximum_iter() const {
+		return maximum_iter;
+	}
 private:
 	state x_;
 	measurement m_;

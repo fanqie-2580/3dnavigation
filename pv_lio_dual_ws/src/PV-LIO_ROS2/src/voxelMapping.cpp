@@ -141,6 +141,13 @@ bool odin_global_insert_en = false;
 bool odin_global_require_s2 = true;   // densify Odin only after good S2
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
+// When end_dt+gyro look Bundle-safe, run a 1-iter Mid S1 then full joint S2
+// (closer to official single update without dropping Mid lock on hard frames).
+bool shallow_s1_en = true;
+double shallow_s1_end_dt = 0.05;
+double shallow_s1_gyr = 0.08;
+int shallow_s1_iters = 1;
+int iekf_shallow_s1 = 0;
 // Corridor Z root cause:
 // - Mid floors bias Z; soft post-update that *fully follows Odin Δz* inherits
 //   Odin drift (outbound ≈+12cm, return ≈−14cm). One-sided only made outbound
@@ -1441,6 +1448,10 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->declare_parameter<double>("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->declare_parameter<bool>("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    node->declare_parameter<bool>("dual_tune.shallow_s1_en", shallow_s1_en);
+    node->declare_parameter<double>("dual_tune.shallow_s1_end_dt", shallow_s1_end_dt);
+    node->declare_parameter<double>("dual_tune.shallow_s1_gyr", shallow_s1_gyr);
+    node->declare_parameter<int>("dual_tune.shallow_s1_iters", shallow_s1_iters);
     node->declare_parameter<bool>("dual_tune.residual_z_en", residual_z_en);
     node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1501,6 +1512,11 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_global_require_s2", odin_global_require_s2);
     node->get_parameter("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->get_parameter("dual_tune.odin_body_pub_en", odin_body_pub_en);
+    node->get_parameter("dual_tune.shallow_s1_en", shallow_s1_en);
+    node->get_parameter("dual_tune.shallow_s1_end_dt", shallow_s1_end_dt);
+    node->get_parameter("dual_tune.shallow_s1_gyr", shallow_s1_gyr);
+    node->get_parameter("dual_tune.shallow_s1_iters", shallow_s1_iters);
+    if (shallow_s1_iters < 1) shallow_s1_iters = 1;
     node->get_parameter("dual_tune.residual_z_en", residual_z_en);
     node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1527,6 +1543,11 @@ int main(int argc, char** argv)
     std::cout << "[dual_tune] s2=" << odin_s2_enable
               << " end_dt=" << odin_iekf_max_end_dt
               << " gyr=" << odin_s2_gyr_gate
+              << " shallow_s1=" << shallow_s1_en
+              << "/" << shallow_s1_iters
+              << " sh_edt=" << shallow_s1_end_dt
+              << " sh_gyr=" << shallow_s1_gyr
+              << " w=" << odin_info_weight
               << " res=" << odin_max_residual
               << " clip_max=" << odin_s2_max_clip_ratio
               << " still=" << map_require_still
@@ -2187,9 +2208,9 @@ int main(int argc, char** argv)
             };
 
             /*** Stage-1: Mid-only IEKF (lock pose) ***/
-            // Official FAST-LIO-MULTI Bundle is a single joint update. On Mid+Odin
-            // that single-pass Bundle sank return Z (~-35cm). Keep Mid lock first,
-            // then joint Mid+Odin H (official same-H idea + hetero safety).
+            // Official Bundle is one joint update; always-on single-pass sank return
+            // Z. Keep Mid lock, but when end_dt+gyro look safe use a 1-iter S1
+            // (shallow) so the following joint S2 dominates — closer to Bundle.
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             (void)solve_H_time;
@@ -2199,7 +2220,24 @@ int main(int argc, char** argv)
             std::vector<M3D> mid_var_down = var_down_body;
             last_mid_effct_feat_num = 0;
             iekf_odin_stage = false;
+            const bool shallow_s1 =
+                shallow_s1_en && odin_s2_enable && odin_iekf_n > 0 &&
+                (std::abs(bundle_end_dt) <= shallow_s1_end_dt) &&
+                (frame_gyr_mean < shallow_s1_gyr);
+            const int s1_iters =
+                shallow_s1 ? shallow_s1_iters : NUM_MAX_ITERATIONS;
+            kf.set_maximum_iter(s1_iters);
+            if (shallow_s1)
+            {
+                ++iekf_shallow_s1;
+                if ((iekf_shallow_s1 % 50) == 1)
+                    std::cout << "[pv-iekf] shallow_s1 iters=" << s1_iters
+                              << " end_dt_ms=" << bundle_end_dt * 1000.0
+                              << " gyr=" << frame_gyr_mean
+                              << " n=" << iekf_shallow_s1 << std::endl;
+            }
             kf.update_iterated_dyn_share_diagonal();
+            kf.set_maximum_iter(NUM_MAX_ITERATIONS);  // full iters for S2
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
 
