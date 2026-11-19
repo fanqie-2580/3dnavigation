@@ -1,8 +1,8 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Experiment: official MULTI-like Bundle — one joint Mid+Odin IEKF,
-# Odin points enter matching voxels, no Z post-process / jump gates.
+# Joint Bundle IEKF + Odin into voxels, but pose Z := /odin1/odometry
+# (init-aligned). Corridor IEKF Z sinks meters without this.
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -57,7 +57,7 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Z: none ---
+    # --- Z: hard replace from Odin odom (no residual_z flat/hard) ---
     "residual_z_en": False,
     "residual_z_flat_z_alpha": 0.0,
     "residual_z_flat_vz_alpha": 0.0,
@@ -70,7 +70,7 @@ TUNE = {
     "residual_z_dz_tol": 0.05,
     "residual_z_floor_ratio_thr": 0.03,
     "odin_z_factor_en": False,
-    "odin_z_replace_en": False,
+    "odin_z_replace_en": True,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,
