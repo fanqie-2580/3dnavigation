@@ -1,0 +1,80 @@
+/**:
+  ros__parameters:
+    # Odin1 = L1 (primary time axis, like official FAST-LIO-MULTI lid_topic)
+    # Mid360 = L2 (secondary, attached by end-time window)
+    common:
+      lid_topic: "/odin1/cloud_raw"
+      imu_topic: "/odin1/imu"
+      time_sync_en: false
+      multi_lidar_en: true
+      lid_topic2: "/livox/lidar"
+      imu_topic2: "/livox/imu"
+      lidar2_stamp_bias_sec: 0.0
+      lidar2_max_sync_dt: 0.20
+      lidar2_soft_wait_sec: 0.18
+      lidar2_bias_ema: 0.0
+    preprocess:
+      # Primary: Odin1 PointCloud2
+      lidar_type: 6
+      scan_line: 16
+      scan_rate: 10
+      blind: 0.3
+      point_filter_num: 2
+      min_range: 0.3
+      max_range: 20.0
+      feature_extract_enable: false
+      min_confidence: 40.0
+      # Secondary: Mid360 Livox CustomMsg
+      lidar_type2: 1
+      point_filter_num2: 2
+      blind2: 0.5
+      min_range2: 0.5
+      max_range2: 25.0
+      min_confidence2: 0.0
+    mapping:
+      down_sample_size: 0.20
+      max_iteration: 4
+      voxel_size: 0.5
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.01
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 30.0
+      extrinsic_est_en: false
+      # L1 = Odin lidar wrt Odin IMU
+      extrinsic_T: [-0.02663, 0.03447, 0.02174]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # L2 = Mid wrt Odin = inv(Odin wrt Mid from dual_mid_odin.yaml)
+      extrinsic_T_L2_wrt_L1: [-0.1472341, 0.0103959, -0.0441543]
+      extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, 0.2385335, 0.0000000, 1.0000000, 0.0000000, -0.2385335, 0.0000000, 0.9711343]
+      # Secondary Mid lidar ↔ Mid IMU ≈ identity (used by secondary deskew)
+      extrinsic_T_L2_wrt_odin_imu: [0.0, 0.0, 0.0]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # Soft Mid secondary cov (was soft Odin when Mid-primary)
+      lidar2_cov_scale: 12.0
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      # Odin IMU noisier than Mid — slightly larger acc cov
+      acc_cov: 0.5
+      gyr_cov: 0.08
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+    publish:
+      pub_voxel_map: false
+      publish_global_cloud_map: true
+      publish_max_voxel_layer: 1
+      global_map_leaf_size: 0.08
+      global_map_pub_leaf_size: 0.20
+      global_map_pub_period: 2.0
+      global_map_pub_max_pts: 350000
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+    pcd_save:
+      pcd_save_en: false
+      save_path: "/home/ll/pv_lio_dual_odin_primary_ws/maps"
+      interval: -1

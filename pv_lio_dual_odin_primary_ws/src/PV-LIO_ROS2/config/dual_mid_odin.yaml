@@ -1,0 +1,86 @@
+/**:
+  ros__parameters:
+    common:
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      time_sync_en: false
+      multi_lidar_en: true
+      lid_topic2: "/odin1/cloud_raw"
+      imu_topic2: "/odin1/imu"
+      lidar2_stamp_bias_sec: 0.0
+      # Stationary “jitter” was Mid↔Odin composition flicker: ~30% unpaired when
+      # end-time phase drifted past 100ms. Widen window so soft-wait can catch Odin.
+      lidar2_max_sync_dt: 0.20
+      lidar2_soft_wait_sec: 0.18
+      lidar2_bias_ema: 0.0
+    preprocess:
+      lidar_type: 1
+      scan_line: 6
+      scan_rate: 10
+      blind: 0.5
+      # Match official indoor (avia_indoor): keep every point for denser map.
+      # filter=2 cuts Mid CPU so Odin pairing stays realtime (anti unpaired vanish).
+      point_filter_num: 2
+      min_range: 0.5
+      max_range: 25.0
+      feature_extract_enable: false
+      lidar_type2: 6
+      # filter=1 + range25 doubled Odin (~41k) → Mid lag / No Effective / NaN crash.
+      # Keep filter=2 / 20m for realtime; far density via leaf only.
+      point_filter_num2: 2
+      blind2: 0.3
+      min_range2: 0.3
+      max_range2: 20.0
+      min_confidence2: 40.0
+    mapping:
+      down_sample_size: 0.20
+      max_iteration: 4
+      voxel_size: 0.5
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.01
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 30.0
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
+      # Absolute Mid ground still ~-0.25m (body Odin near floor ~-0.29m); Mid pitch TBD.
+      # Ry -13.8°. Yaml R row-major.
+      extrinsic_T_L2_wrt_L1: [0.1324518, -0.0103959, 0.078]
+      extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335, 0.0000000, 1.0000000, 0.0000000, 0.2385335, 0.0000000, 0.9711343]
+      extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # Soft Odin base cov scale (was 100 → Odin ~200× Mid, fake-soft).
+      # Effective S2 scale ≈ lidar2_cov_scale * time/motion_soft / odin_info_weight.
+      lidar2_cov_scale: 12.0
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      acc_cov: 0.2
+      gyr_cov: 0.05
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+    publish:
+      pub_voxel_map: false
+      publish_global_cloud_map: true
+      publish_max_voxel_layer: 1
+      # 0.08 + periodic full remap → uniform Mid360 fill (was 0.1 pending-only clumps).
+      # Do not go <<0.05 with huge pose span (PCL VoxelGrid int overflow).
+      global_map_leaf_size: 0.08
+      # RViz-only: coarser / slower / capped so Jetson CPU stays with IEKF.
+      # Full-res Global (leaf 0.08) is still kept for /save_map PCD.
+      global_map_pub_leaf_size: 0.20
+      global_map_pub_period: 2.0
+      global_map_pub_max_pts: 350000
+      path_en: true
+      scan_publish_en: true
+      # Downs (not dense undistort) for live Body/World — big RViz/CPU win.
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+    pcd_save:
+      pcd_save_en: false
+      save_path: "/home/ll/pv_lio_dual_ws/maps"
+      interval: -1
