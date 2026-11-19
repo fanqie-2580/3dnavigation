@@ -175,6 +175,8 @@ double residual_z_dz_tol = 0.06;
 double residual_z_floor_ratio_thr = 0.03;
 bool residual_z_flat_ref_init = false;
 double residual_z_flat_z_ref = 0.0;
+double residual_z_hard_band = 0.0; // 0=off; clamp |z-flat_ref| after soft Z
+int n_residual_z_hard = 0;
 bool last_floor_valid = false;
 double last_floor_z = 0.0;
 int last_floor_n = 0;
@@ -454,6 +456,26 @@ void apply_residual_z_flat()
         step = std::copysign(residual_z_flat_max_step, step);
     s.pos(2) += step;
     kf.change_x(s);
+}
+
+// Hard ceiling on |z - flat_ref| after soft pulls (caps peak-to-peak drift).
+void apply_residual_z_hard_clamp()
+{
+    if (!residual_z_en || !residual_z_flat_ref_init || residual_z_hard_band <= 0.0)
+        return;
+    state_ikfom s = kf.get_x();
+    const double dz = s.pos(2) - residual_z_flat_z_ref;
+    if (std::fabs(dz) <= residual_z_hard_band)
+        return;
+    s.pos(2) = residual_z_flat_z_ref + std::copysign(residual_z_hard_band, dz);
+    s.vel(2) = 0.0;
+    kf.change_x(s);
+    ++n_residual_z_hard;
+    if ((n_residual_z_hard % 50) == 1)
+        std::cout << "[pv-z] hard_clamp dz_was=" << dz
+                  << " band=" << residual_z_hard_band
+                  << " z=" << s.pos(2)
+                  << " n=" << n_residual_z_hard << std::endl;
 }
 
 const bool var_contrast(pointWithCov &x, pointWithCov &y) {
@@ -1484,6 +1506,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_max_step", residual_z_flat_max_step);
+    node->declare_parameter<double>("dual_tune.residual_z_hard_band", residual_z_hard_band);
     node->declare_parameter<double>("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
     node->declare_parameter<double>("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->declare_parameter<double>("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
@@ -1562,6 +1585,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
     node->get_parameter("dual_tune.residual_z_flat_ba_z_alpha", residual_z_flat_ba_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_max_step", residual_z_flat_max_step);
+    node->get_parameter("dual_tune.residual_z_hard_band", residual_z_hard_band);
     node->get_parameter("dual_tune.residual_z_floor_nz_thr", residual_z_floor_nz_thr);
     node->get_parameter("dual_tune.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->get_parameter("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
@@ -1600,6 +1624,7 @@ int main(int argc, char** argv)
               << " residual_z=" << residual_z_en
               << " flat_z_a=" << residual_z_flat_z_alpha
               << " flat_step=" << residual_z_flat_max_step
+              << " hard_z=" << residual_z_hard_band
               << " floor_info=" << residual_z_floor_info_scale
               << " h_damp=" << residual_z_h_dampen
               << " odin_z_factor=" << odin_z_factor_en
@@ -2443,6 +2468,7 @@ int main(int argc, char** argv)
                 // Corridor Z: go2 flat residual_z, then soft Odin onboard Δz.
                 apply_residual_z_flat();
                 apply_odin_z_factor(lidar_end_time);
+                apply_residual_z_hard_clamp();
                 state_point = kf.get_x();
                 if (iekf_max_vel > 0.0)
                 {
