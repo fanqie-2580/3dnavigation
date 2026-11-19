@@ -20,9 +20,26 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('pv_lio_odin_pri')
     yaml_path = os.path.join(pkg_dir, 'config', 'dual_odin_mid.yaml')
     tune_params = _load_tune_params(pkg_dir)
+    script = os.path.join(pkg_dir, 'scripts', 'odin_cloud_to_pvlio')
     return LaunchDescription([
         DeclareLaunchArgument('rviz', default_value='false'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        # Same converter as ws_odin_pvlio single-Odin mapping.
+        Node(
+            package='pv_lio_odin_pri',
+            executable='odin_cloud_to_pvlio',
+            name='odin_cloud_to_pvlio',
+            output='screen',
+            parameters=[
+                {
+                    'input_topic': '/odin1/cloud_raw',
+                    'output_topic': '/odin1/points_pvlio',
+                    'min_confidence': 30,
+                    'blind': 0.2,
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
+            ],
+        ),
         Node(
             package='pv_lio_odin_pri',
             executable='pv_lio_node',

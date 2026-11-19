@@ -210,24 +210,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
     N ++;
   }
+  // Match ws_odin_pvlio stock PV-LIO IMU_init (NOT Mid dual gravity-align).
+  // Mid-style FromTwoVectors on noisy Odin accel skewed the whole trajectory.
   state_ikfom init_state = kf_state.get_x();
-  // Gravity-align Mid360/IMU world so CloudMap is level vs RViz Grid.
-  // Mid is pitched ~8–13° on the robot; leaving rot=I makes camera_init look tilted.
-  // Match FAST_LIO_MULTI mid_odin IMU init (not stock PV-LIO).
-  {
-    V3D gz_body = (-mean_acc / mean_acc.norm());
-    Eigen::Quaterniond q_align =
-        Eigen::Quaterniond::FromTwoVectors(gz_body, V3D(0.0, 0.0, -1.0));
-    init_state.rot = SO3(q_align.toRotationMatrix());
-    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
-  }
+  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU; 
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
   kf_state.change_x(init_state);
 
-  // Keep TF world->camera_init identity-ish after rot already gravity-aligned.
-  Initial_R_wrt_G = SO3(Eye3d);
+  Initial_R_wrt_G = SO3(g2R(mean_acc));
 
   esekfom::esekf<state_ikfom, 12, input_ikfom>::cov init_P = kf_state.get_P();
   init_P.setIdentity();

@@ -369,7 +369,9 @@ void apply_odin_z_factor(double mid_stamp)
         t_o = odin_odom_stamp;
         z_o = odin_odom_z;
     }
-    if (odin_z_factor_max_dt > 0.0 &&
+    // Dual Mid: keep stamp sync. L1-only: bag odom vs lidar_end often >0.3–1s
+    // apart → factor fired once / 150s; skip dt gate when multi is off.
+    if (multi_lidar_en && odin_z_factor_max_dt > 0.0 &&
         std::fabs(t_o - mid_stamp) > odin_z_factor_max_dt)
         return;
 
@@ -404,9 +406,14 @@ void apply_odin_z_factor(double mid_stamp)
         return;
     const bool catching =
         odin_z_factor_catch_err > 0.0 && abs_err > odin_z_factor_catch_err;
-    const int min_feat = catching ? odin_z_factor_catch_min_feat : 30;
-    if (last_mid_effct_feat_num < min_feat)
-        return;
+    // Dual: need enough Mid residuals. L1-only: no Mid feat gate.
+    if (multi_lidar_en)
+    {
+        const int min_feat =
+            catching ? odin_z_factor_catch_min_feat : 30;
+        if (last_mid_effct_feat_num < min_feat)
+            return;
+    }
 
     double max_step = odin_z_factor_max_innov;
     double a = odin_z_factor_alpha;
@@ -1214,8 +1221,13 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
         pv.cov = cov_world;
         pv.cov_lidar = cov_lidar;
-        // Odin body points are tagged intensity=200 in commit_odin_body.
-        pv.lidar_src = (feats_down_body->points[i].intensity >= 150.0f) ? 1 : 0;
+        // Odin L2 body points are tagged intensity=200 in commit_odin_body.
+        // L1-only (multi off): never treat sensor intensity as L2 — Odin raw
+        // intensity often >=150 and would mis-label every primary residual.
+        if (!multi_lidar_en)
+            pv.lidar_src = 0;
+        else
+            pv.lidar_src = (feats_down_body->points[i].intensity >= 150.0f) ? 1 : 0;
         pv_list[i] = pv;
     }
 
@@ -1799,20 +1811,26 @@ int main(int argc, char** argv)
     auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(500)).best_effort().durability_volatile();
     auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(2000)).best_effort().durability_volatile();
 
-    // Odin-primary fork: L1 is usually ODIN1 (PointCloud2), L2 Mid (Livox).
+    // Odin-primary fork: L1 PointCloud2 (VELO16 via converter, or ODIN1 raw), L2 Mid.
+    // Single-Odin (ws_odin_pvlio) uses large best_effort queues for L1. KeepLast(20)
+    // reliable dropped frames under load and tanked Z on bag replay.
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_livox;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl;
     if (p_pre->lidar_type == AVIA) {
         sub_livox = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             lid_topic, lidar_qos, livox_pcl_cbk);
-    } else {
-        // Odin primary: reliable QoS matches driver (same as former L2).
+    } else if (p_pre->lidar_type == ODIN1 && multi_lidar_en) {
+        // Live dual: Odin driver is reliable; keep that when Mid is also on.
         auto primary_cloud_qos = rclcpp::QoS(rclcpp::KeepLast(20)).reliable();
         sub_pcl = node->create_subscription<sensor_msgs::msg::PointCloud2>(
             lid_topic, primary_cloud_qos, standard_pcl_cbk);
+    } else {
+        // VELO16 (points_pvlio) / L1-only: match stock single-Odin QoS.
+        sub_pcl = node->create_subscription<sensor_msgs::msg::PointCloud2>(
+            lid_topic, lidar_qos, standard_pcl_cbk);
     }
     auto primary_imu_qos =
-        (p_pre->lidar_type == ODIN1)
+        (p_pre->lidar_type == ODIN1 && multi_lidar_en)
             ? rclcpp::QoS(rclcpp::KeepLast(4000)).reliable()
             : imu_qos;
     auto sub_imu = node->create_subscription<sensor_msgs::msg::Imu>(
@@ -1843,13 +1861,20 @@ int main(int argc, char** argv)
                   << " type=" << p_pre->lidar_type
                   << " L2=" << lid_topic2
                   << " type2=" << p_pre2->lidar_type << std::endl;
-        if (odin_z_factor_en)
-        {
-            auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
-            sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
-                odin_odom_topic, odin_odom_qos, odin_odom_cbk);
-            std::cout << "[pv-z] subscribe " << odin_odom_topic << std::endl;
-        }
+    }
+    else
+    {
+        std::cout << "[pv-odin-pri] L1-only lid=" << lid_topic
+                  << " type=" << p_pre->lidar_type
+                  << " imu=" << imu_topic << std::endl;
+    }
+    // Odin Z factor works for L1-only too (bag /odin1/odometry as height prior).
+    if (odin_z_factor_en)
+    {
+        auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
+        sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
+            odin_odom_topic, odin_odom_qos, odin_odom_cbk);
+        std::cout << "[pv-z] subscribe " << odin_odom_topic << std::endl;
     }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -2229,13 +2254,14 @@ int main(int argc, char** argv)
                             false : true;
 
             if (flg_EKF_inited && !init_map) {
-                // Bootstrap Global with Mid-only: full fused first frame at a
+                // Bootstrap Global with Mid-only when dual: fused first frame at a
                 // still-settling pose left a permanent colored ghost sheet.
+                // L1-only: keep all points (Odin intensity often >=150).
                 PointCloudXYZI::Ptr boot_body(new PointCloudXYZI);
                 boot_body->points.reserve(feats_undistort->size());
                 for (const auto &pt : feats_undistort->points)
                 {
-                    if (pt.intensity >= 150.0f) continue;
+                    if (multi_lidar_en && pt.intensity >= 150.0f) continue;
                     boot_body->points.push_back(pt);
                 }
                 if (boot_body->empty())
@@ -2368,17 +2394,34 @@ int main(int argc, char** argv)
             bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
             iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
+            // Always restore when match empty / NaN — otherwise IMU-only prop
+            // pollutes voxel map (L1-only + hard Z clamp → km-scale XY runaway).
+            // Jump-size reject stays dual-gated (stock single Odin has none).
             const bool mid_no_eff = (last_mid_effct_feat_num < 1);
-            bool jump_reject = (!state_bad) && !mid_no_eff &&
+            bool jump_reject = multi_lidar_en && (!state_bad) && !mid_no_eff &&
                 (d_upd_chk > iekf_max_upd || d_rot_chk > iekf_max_rot);
+            // Odin-primary: S1 on Odin often jump-rejects in corridors. If we
+            // mark state_bad, S2 Mid fusion is skipped → freeze / 漂. Restore
+            // S1 jump but keep state_bad=false when L2 is ready for S2.
+            const bool s2_can_save =
+                jump_reject && !state_bad && !mid_no_eff &&
+                odin_s2_enable && odin_iekf_body && !odin_iekf_body->empty();
             if (state_bad || mid_no_eff || jump_reject)
             {
+                if (mid_no_eff && !state_bad && !jump_reject)
+                {
+                    static int n_no_eff_restore = 0;
+                    if ((++n_no_eff_restore % 20) == 1)
+                        std::cout << "[pv-iekf] restore_no_eff n="
+                                  << n_no_eff_restore << std::endl;
+                }
                 if (jump_reject)
                 {
                     ++iekf_reject_jump;
                     if ((iekf_reject_jump % 10) == 1)
                         std::cout << "[pv-iekf] reject_s1 d_upd=" << d_upd_chk
                                   << " d_rot=" << d_rot_chk
+                                  << (s2_can_save ? " ->try_s2" : "")
                                   << " n=" << iekf_reject_jump << std::endl;
                 }
                 else if (state_bad)
@@ -2390,7 +2433,8 @@ int main(int argc, char** argv)
                 kf.change_x(state_before_update);
                 kf.change_P(P_before);
                 state_point = kf.get_x();
-                state_bad = true;
+                if (!s2_can_save)
+                    state_bad = true;
             }
             else if (iekf_max_vel > 0.0)
             {
@@ -2521,6 +2565,21 @@ int main(int argc, char** argv)
             // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
             if (!state_bad)
             {
+                // L1-only: IEKF floor planes couple Δz into XY. Keeping that Δz
+                // then hard-clamping Z left XY polluted → no-eff / freeze / RViz drift.
+                // Discard IEKF Z (and vz); Z comes only from soft prior + Odin factor.
+                if (!multi_lidar_en)
+                {
+                    state_ikfom s = kf.get_x();
+                    const double dz_iekf = s.pos(2) - state_before_update.pos(2);
+                    s.pos(2) = state_before_update.pos(2);
+                    s.vel(2) = 0.0;
+                    kf.change_x(s);
+                    static int n_l1_drop_z = 0;
+                    if ((++n_l1_drop_z % 50) == 1)
+                        std::cout << "[pv-z] l1_drop_iekf_z dz=" << dz_iekf
+                                  << " n=" << n_l1_drop_z << std::endl;
+                }
                 // Corridor Z: go2 flat residual_z, then soft Odin onboard Δz.
                 apply_residual_z_flat();
                 apply_odin_z_factor(lidar_end_time);
@@ -2635,8 +2694,9 @@ int main(int argc, char** argv)
                     const float r2max = map_max_range * map_max_range;
                     for (const auto &pt : body_src->points)
                     {
-                        // Drop IEKF-subsampled Odin; re-add full cloud below.
-                        if (pt.intensity >= 150.0f) continue;
+                        // Dual: drop IEKF-subsampled Odin (intensity>=150), re-add full below.
+                        // L1-only: Odin sensor intensity is often >=150 — keep it.
+                        if (multi_lidar_en && pt.intensity >= 150.0f) continue;
                         const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
                         if (r2 > r2max) continue;
                         body_f->points.push_back(pt);
