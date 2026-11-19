@@ -1,23 +1,23 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Bias: closer to official MULTI (same IEKF, less post-reject / Z hacks).
-# Keep Mid-first + Odin S2 (hetero still needs it); turn off corridor defenses.
+# Experiment: official MULTI-like Bundle — one joint Mid+Odin IEKF,
+# Odin points enter matching voxels, no Z post-process / jump gates.
 
 TUNE = {
-    # --- Odin cloud quality (mild; official has none) ---
+    # --- Odin cloud quality (mild) ---
     "odin_min_pts": 2000,
     "odin_min_frac": 0.20,
     "odin_body_z_min": -3.0,
     "odin_body_z_max": 4.0,
     "odin_static_gyro": 0.08,
 
-    # --- Stage-2 joint Mid+Odin IEKF ---
-    # Loose gates so S2 usually runs; clip_ratio=1 never reject on clip alone.
+    # --- Official-like joint Bundle (skip Mid-only S1 when Odin ready) ---
     "odin_s2_enable": True,
-    "odin_iekf_max_pts": 1600,
+    "odin_joint_only_en": True,
+    "odin_iekf_max_pts": 2000,
     "odin_iekf_max_end_dt": 0.25,
-    "odin_info_weight": 0.85,
+    "odin_info_weight": 1.0,
     "odin_range_ref": 8.0,
     "odin_max_residual": 0.50,
     "odin_s2_gyr_gate": 5.0,
@@ -27,17 +27,18 @@ TUNE = {
     "shallow_s1_gyr": 0.20,
     "shallow_s1_iters": 2,
 
-    # --- Odin in IEKF like co-sensor; voxel insert still OFF (sank Z ~2m) ---
+    # --- Odin into matching voxel map (official co-map) ---
     "odin_wall_nz_thr": 0.40,
     "odin_wall_info_boost": 1.0,
     "odin_floor_info_scale": 1.0,
-    "odin_voxel_insert_en": False,
-    "odin_voxel_max_clip": 0.20,
-    "odin_voxel_max_pts": 100,
-    "odin_voxel_body_z_min": 0.15,
-    "odin_voxel_cov_scale": 8.0,
+    "odin_voxel_insert_en": True,
+    "odin_voxel_require_still": False,
+    "odin_voxel_max_clip": 1.0,
+    "odin_voxel_max_pts": 400,
+    "odin_voxel_body_z_min": -0.05,
+    "odin_voxel_cov_scale": 2.0,
 
-    # --- Jump / vel / freeze: effectively off (0 vel = no clamp; huge max = no reject) ---
+    # --- Jump / vel / freeze off ---
     "iekf_max_upd": 10.0,
     "iekf_max_rot": 10.0,
     "iekf_max_vel": 0.0,
@@ -45,7 +46,7 @@ TUNE = {
     "iekf_s2_max_rot": 10.0,
     "consec_bad_freeze": 100,
 
-    # --- Global display map: allow Odin without requiring S2 accept ---
+    # --- Global display map ---
     "map_jump_upd": 10.0,
     "map_jump_frame": 10.0,
     "map_max_range": 30.0,
@@ -56,7 +57,7 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Z: none (official). No residual_z / soft factor / odin_z_replace. ---
+    # --- Z: none ---
     "residual_z_en": False,
     "residual_z_flat_z_alpha": 0.0,
     "residual_z_flat_vz_alpha": 0.0,

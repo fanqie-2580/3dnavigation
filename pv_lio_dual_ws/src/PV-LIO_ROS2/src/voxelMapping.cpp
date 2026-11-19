@@ -152,11 +152,15 @@ double odin_wall_nz_thr = 0.40;      // |nz|<thr → wall-like Odin residual
 double odin_wall_info_boost = 1.8;   // strengthen Odin walls in joint H
 double odin_floor_info_scale = 0.35; // soften Odin floors in joint H
 bool odin_voxel_insert_en = false;
+bool odin_voxel_require_still = true; // official-like: false → insert while walking
 double odin_voxel_max_clip = 0.35;
 int odin_voxel_max_pts = 200;
 float odin_voxel_body_z_min = -0.05f; // skip near-floor body points
 double odin_voxel_cov_scale = 4.0;
 int iekf_odin_voxel_ins = 0;
+// Official MULTI Bundle: one joint Mid+Odin IEKF (no Mid-only S1 then S2).
+bool odin_joint_only_en = false;
+int iekf_joint_only_n = 0;
 // Corridor Z root cause:
 // - Mid floors bias Z; soft post-update that *fully follows Odin Δz* inherits
 //   Odin drift (outbound ≈+12cm, return ≈−14cm). One-sided only made outbound
@@ -1537,10 +1541,12 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.odin_wall_info_boost", odin_wall_info_boost);
     node->declare_parameter<double>("dual_tune.odin_floor_info_scale", odin_floor_info_scale);
     node->declare_parameter<bool>("dual_tune.odin_voxel_insert_en", odin_voxel_insert_en);
+    node->declare_parameter<bool>("dual_tune.odin_voxel_require_still", odin_voxel_require_still);
     node->declare_parameter<double>("dual_tune.odin_voxel_max_clip", odin_voxel_max_clip);
     node->declare_parameter<int>("dual_tune.odin_voxel_max_pts", odin_voxel_max_pts);
     node->declare_parameter<double>("dual_tune.odin_voxel_body_z_min", odin_voxel_body_z_min);
     node->declare_parameter<double>("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
+    node->declare_parameter<bool>("dual_tune.odin_joint_only_en", odin_joint_only_en);
     node->declare_parameter<bool>("dual_tune.residual_z_en", residual_z_en);
     node->declare_parameter<double>("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->declare_parameter<double>("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1612,6 +1618,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_wall_info_boost", odin_wall_info_boost);
     node->get_parameter("dual_tune.odin_floor_info_scale", odin_floor_info_scale);
     node->get_parameter("dual_tune.odin_voxel_insert_en", odin_voxel_insert_en);
+    node->get_parameter("dual_tune.odin_voxel_require_still", odin_voxel_require_still);
     node->get_parameter("dual_tune.odin_voxel_max_clip", odin_voxel_max_clip);
     node->get_parameter("dual_tune.odin_voxel_max_pts", odin_voxel_max_pts);
     {
@@ -1621,6 +1628,7 @@ int main(int argc, char** argv)
     }
     node->get_parameter("dual_tune.odin_voxel_cov_scale", odin_voxel_cov_scale);
     if (odin_voxel_max_pts < 1) odin_voxel_max_pts = 1;
+    node->get_parameter("dual_tune.odin_joint_only_en", odin_joint_only_en);
     node->get_parameter("dual_tune.residual_z_en", residual_z_en);
     node->get_parameter("dual_tune.residual_z_flat_z_alpha", residual_z_flat_z_alpha);
     node->get_parameter("dual_tune.residual_z_flat_vz_alpha", residual_z_flat_vz_alpha);
@@ -1655,6 +1663,8 @@ int main(int argc, char** argv)
               << " sh_gyr=" << shallow_s1_gyr
               << " wall_boost=" << odin_wall_info_boost
               << " odin_vox=" << odin_voxel_insert_en
+              << " vox_still=" << odin_voxel_require_still
+              << " joint_only=" << odin_joint_only_en
               << " w=" << odin_info_weight
               << " res=" << odin_max_residual
               << " clip_max=" << odin_s2_max_clip_ratio
@@ -2319,11 +2329,9 @@ int main(int argc, char** argv)
                 d_rot = qa.angularDistance(qb);
             };
 
-            /*** Stage-1: Mid-only IEKF (lock pose) ***/
-            // Official Bundle is one joint update; always-on single-pass sank return
-            // Z. Keep Mid lock, but when end_dt+gyro look safe use a 1-iter S1
-            // (shallow) so the following joint S2 dominates — closer to Bundle.
+            /*** IEKF: Mid-lock+S2 (default) or official-like joint-only Bundle ***/
             double t_update_start = omp_get_wtime();
+            double t_update_end = t_update_start;
             double solve_H_time = 0;
             (void)solve_H_time;
             state_ikfom state_before_update = kf.get_x();
@@ -2332,6 +2340,126 @@ int main(int argc, char** argv)
             std::vector<M3D> mid_var_down = var_down_body;
             last_mid_effct_feat_num = 0;
             iekf_odin_stage = false;
+            bool state_bad = false;
+            bool odin_s2_accepted = false;
+            double odin_s2_clip_ratio = 1.0;
+            const size_t joint_mid_n = mid_down_body ? mid_down_body->size() : 0;
+
+            auto build_joint_mid_odin = [&]() -> bool {
+                if (!odin_iekf_body || odin_iekf_body->empty() ||
+                    !mid_down_body || mid_down_body->empty() ||
+                    mid_var_down.size() != joint_mid_n)
+                    return false;
+                feats_down_body->points.clear();
+                feats_down_body->points.reserve(joint_mid_n + odin_iekf_body->size());
+                feats_down_body->points.insert(feats_down_body->points.end(),
+                                              mid_down_body->points.begin(),
+                                              mid_down_body->points.end());
+                feats_down_body->points.insert(feats_down_body->points.end(),
+                                              odin_iekf_body->points.begin(),
+                                              odin_iekf_body->points.end());
+                feats_down_body->width = feats_down_body->points.size();
+                feats_down_body->height = 1;
+                feats_down_size = feats_down_body->points.size();
+                var_down_body.clear();
+                var_down_body.reserve(feats_down_size);
+                var_down_body.insert(var_down_body.end(),
+                                     mid_var_down.begin(), mid_var_down.end());
+                for (const auto &pt : odin_iekf_body->points)
+                {
+                    V3D point_this(pt.x, pt.y, pt.z);
+                    M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
+                    double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
+                    const double r = point_this.norm();
+                    const double rr = r / odin_range_ref;
+                    s *= (1.0 + rr * rr);
+                    const double dt_s =
+                        std::fabs(static_cast<double>(pt.curvature)) / 1000.0;
+                    const double lever =
+                        std::max(0.15, static_cast<double>(std::hypot(pt.x, pt.y)));
+                    const double tang = frame_gyr_mean * dt_s * lever;
+                    s *= (1.0 + (tang / 0.05) * (tang / 0.05));
+                    if (s > 128.0) s = 128.0;
+                    cov_lidar *= s;
+                    var_down_body.push_back(cov_lidar);
+                }
+                return feats_down_size >= 5;
+            };
+
+            const bool do_joint_only =
+                odin_joint_only_en && odin_s2_enable && odin_iekf_n > 0 &&
+                build_joint_mid_odin();
+
+            if (do_joint_only)
+            {
+                // Official MULTI-like: one joint Mid+Odin update (no Mid-only S1).
+                ++iekf_joint_only_n;
+                iekf_odin_stage = true;
+                const int clip_before = iekf_odin_res_clip;
+                kf.set_maximum_iter(NUM_MAX_ITERATIONS);
+                kf.update_iterated_dyn_share_diagonal();
+                t_update_end = omp_get_wtime();
+                sum_optimize_time += t_update_end - t_update_start;
+                iekf_odin_stage = false;
+                const int clipped = iekf_odin_res_clip - clip_before;
+                odin_s2_clip_ratio =
+                    (odin_iekf_n > 0)
+                        ? (static_cast<double>(clipped) /
+                           static_cast<double>(odin_iekf_n))
+                        : 1.0;
+                state_point = kf.get_x();
+                double d_upd_chk = 0.0, d_rot_chk = 0.0;
+                iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
+                const bool mid_no_eff = (last_mid_effct_feat_num < 1);
+                bool jump_reject = (!state_bad) && !mid_no_eff &&
+                    (d_upd_chk > iekf_max_upd || d_rot_chk > iekf_max_rot);
+                const bool clip_reject = odin_s2_clip_ratio > odin_s2_max_clip_ratio;
+                if (state_bad || mid_no_eff || jump_reject || clip_reject)
+                {
+                    if (jump_reject || clip_reject)
+                    {
+                        ++iekf_reject_s2;
+                        if ((iekf_reject_s2 % 10) == 1)
+                            std::cout << "[pv-iekf] reject_joint d_upd=" << d_upd_chk
+                                      << " d_rot=" << d_rot_chk
+                                      << " clip_r=" << odin_s2_clip_ratio
+                                      << " n=" << iekf_reject_s2 << std::endl;
+                    }
+                    kf.change_x(state_before_update);
+                    kf.change_P(P_before);
+                    state_point = kf.get_x();
+                    state_bad = true;
+                }
+                else
+                {
+                    ++iekf_accept_s2;
+                    odin_s2_accepted = true;
+                    if (iekf_max_vel > 0.0)
+                    {
+                        const double vel_n = state_point.vel.norm();
+                        if (vel_n > iekf_max_vel)
+                        {
+                            ++iekf_reject_vel;
+                            state_ikfom s = state_point;
+                            s.vel *= (iekf_max_vel / vel_n);
+                            kf.change_x(s);
+                            state_point = s;
+                        }
+                    }
+                    if ((iekf_joint_only_n % 50) == 1)
+                        std::cout << "[pv-iekf] joint_only mid=" << joint_mid_n
+                                  << " odin=" << odin_iekf_n
+                                  << " clip_r=" << odin_s2_clip_ratio
+                                  << " n=" << iekf_joint_only_n << std::endl;
+                }
+                // Restore Mid-only cloud for voxel Mid insert path below.
+                *feats_down_body = *mid_down_body;
+                var_down_body = mid_var_down;
+                feats_down_size = feats_down_body->points.size();
+            }
+            else
+            {
+            // Mid-only S1 lock, then optional joint S2 (legacy dual path).
             const bool shallow_s1 =
                 shallow_s1_en && odin_s2_enable && odin_iekf_n > 0 &&
                 (std::abs(bundle_end_dt) <= shallow_s1_end_dt) &&
@@ -2350,11 +2478,10 @@ int main(int argc, char** argv)
             }
             kf.update_iterated_dyn_share_diagonal();
             kf.set_maximum_iter(NUM_MAX_ITERATIONS);  // full iters for S2
-            double t_update_end = omp_get_wtime();
+            t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
 
             state_point = kf.get_x();
-            bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
             iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
             const bool mid_no_eff = (last_mid_effct_feat_num < 1);
@@ -2402,52 +2529,10 @@ int main(int argc, char** argv)
             /*** Stage-2: joint Mid+Odin IEKF (same H as official Bundle) ***/
             state_ikfom state_after_mid = kf.get_x();
             esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_after_mid = kf.get_P();
-            bool odin_s2_accepted = false;
-            double odin_s2_clip_ratio = 1.0;
-            const size_t joint_mid_n = mid_down_body ? mid_down_body->size() : 0;
             if (!state_bad && odin_s2_enable && odin_iekf_body &&
                 !odin_iekf_body->empty() && mid_down_body && !mid_down_body->empty() &&
-                mid_var_down.size() == joint_mid_n)
+                mid_var_down.size() == joint_mid_n && build_joint_mid_odin())
             {
-                // Keep Mid block then Odin block (no time-sort) so Mid cov stays
-                // aligned with mid_var_down; diagonal IEKF does not need time order.
-                feats_down_body->points.clear();
-                feats_down_body->points.reserve(joint_mid_n + odin_iekf_body->size());
-                feats_down_body->points.insert(feats_down_body->points.end(),
-                                              mid_down_body->points.begin(),
-                                              mid_down_body->points.end());
-                feats_down_body->points.insert(feats_down_body->points.end(),
-                                              odin_iekf_body->points.begin(),
-                                              odin_iekf_body->points.end());
-                feats_down_body->width = feats_down_body->points.size();
-                feats_down_body->height = 1;
-                feats_down_size = feats_down_body->points.size();
-                var_down_body.clear();
-                var_down_body.reserve(feats_down_size);
-                var_down_body.insert(var_down_body.end(),
-                                     mid_var_down.begin(), mid_var_down.end());
-                for (const auto &pt : odin_iekf_body->points)
-                {
-                    V3D point_this(pt.x, pt.y, pt.z);
-                    M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
-                    double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
-                    // Range: farther → softer (MA-LIO-like).
-                    const double r = point_this.norm();
-                    const double rr = r / odin_range_ref;
-                    s *= (1.0 + rr * rr);
-                    // Per-point time weight (mid_odin style): curvature is ms.
-                    const double dt_s =
-                        std::fabs(static_cast<double>(pt.curvature)) / 1000.0;
-                    const double lever =
-                        std::max(0.15, static_cast<double>(std::hypot(pt.x, pt.y)));
-                    const double tang =
-                        frame_gyr_mean * dt_s * lever;  // ~m of tangential smear
-                    s *= (1.0 + (tang / 0.05) * (tang / 0.05));
-                    if (s > 128.0) s = 128.0;
-                    cov_lidar *= s;
-                    var_down_body.push_back(cov_lidar);
-                }
-                if (feats_down_size >= 5)
                 {
                     iekf_odin_stage = true;
                     const int clip_before = iekf_odin_res_clip;
@@ -2504,7 +2589,12 @@ int main(int argc, char** argv)
                                       << " rej=" << iekf_reject_s2 << std::endl;
                     }
                 }
+                // Mid cloud for voxel Mid insert (Odin via odin_voxel_insert).
+                *feats_down_body = *mid_down_body;
+                var_down_body = mid_var_down;
+                feats_down_size = feats_down_body->points.size();
             }
+            } // end Mid-lock+S2 path (not joint_only)
 
             // Mid/S2 failed: do not keep integrating IMU into a wrong pose —
             // that wrote corrupt Mid planes into voxel_map and caused drift cascades.
@@ -2717,8 +2807,8 @@ int main(int argc, char** argv)
                 const bool odin_vox_ok =
                     odin_voxel_insert_en && odin_s2_accepted &&
                     odin_s2_clip_ratio <= odin_voxel_max_clip &&
-                    frame_quasi_static && odin_iekf_body &&
-                    !odin_iekf_body->empty();
+                    (!odin_voxel_require_still || frame_quasi_static) &&
+                    odin_iekf_body && !odin_iekf_body->empty();
                 if (odin_vox_ok)
                 {
                     PointCloudXYZI::Ptr odin_vox_body(new PointCloudXYZI);
