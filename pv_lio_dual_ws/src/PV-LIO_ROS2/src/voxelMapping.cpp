@@ -1158,8 +1158,13 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
     double match_end = omp_get_wtime();
 
     effct_feat_num = ptpl_list.size();
-    if (!iekf_odin_stage)
-        last_mid_effct_feat_num = effct_feat_num;
+    {
+        int mid_eff = 0;
+        for (const auto &p : ptpl_list)
+            if (p.lidar_src == 0) ++mid_eff;
+        // Bundle/joint: Mid match count (not total, which includes soft Odin).
+        last_mid_effct_feat_num = mid_eff > 0 ? mid_eff : (!iekf_odin_stage ? effct_feat_num : 0);
+    }
     if (effct_feat_num < 1){
         ekfom_data.valid = false;
         RCLCPP_WARN(rclcpp::get_logger("pv_lio"), "No Effective Points!");
@@ -2181,13 +2186,18 @@ int main(int argc, char** argv)
             };
 
             /*** Stage-1: Mid-only IEKF (lock pose) ***/
+            // Official FAST-LIO-MULTI Bundle is a single joint update. On Mid+Odin
+            // that single-pass Bundle sank return Z (~-35cm). Keep Mid lock first,
+            // then joint Mid+Odin H (official same-H idea + hetero safety).
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+            (void)solve_H_time;
             state_ikfom state_before_update = kf.get_x();
             esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P_before = kf.get_P();
             PointCloudXYZI::Ptr mid_down_body(new PointCloudXYZI(*feats_down_body));
             std::vector<M3D> mid_var_down = var_down_body;
             last_mid_effct_feat_num = 0;
+            iekf_odin_stage = false;
             kf.update_iterated_dyn_share_diagonal();
             double t_update_end = omp_get_wtime();
             sum_optimize_time += t_update_end - t_update_start;
@@ -2196,11 +2206,6 @@ int main(int argc, char** argv)
             bool state_bad = false;
             double d_upd_chk = 0.0, d_rot_chk = 0.0;
             iekf_jump_metrics(state_before_update, state_point, d_upd_chk, d_rot_chk, state_bad);
-            // Return XY root cause (not jump_reject itself):
-            // corridor along-track Mid match is weak → |v| silently climbs
-            // 0.9→20m/s with d_upd still < iekf_max_upd; residual_z keeps Z OK.
-            // Hard-reject on |v| froze pose (~60m path). Clamp |v| instead and
-            // only full-reject on mid_no_eff / jump / divergence (+ restore P).
             const bool mid_no_eff = (last_mid_effct_feat_num < 1);
             bool jump_reject = (!state_bad) && !mid_no_eff &&
                 (d_upd_chk > iekf_max_upd || d_rot_chk > iekf_max_rot);
@@ -2219,10 +2224,6 @@ int main(int argc, char** argv)
                     RCLCPP_ERROR(node->get_logger(),
                         "Divergence detected (pos_norm=%.1f)! Restoring previous state.",
                         state_point.pos.norm());
-                }
-                else if ((iekf_reject_jump % 20) == 1)
-                {
-                    std::cout << "[pv-iekf] skip_s2 mid_no_eff" << std::endl;
                 }
                 kf.change_x(state_before_update);
                 kf.change_P(P_before);
@@ -2247,15 +2248,13 @@ int main(int argc, char** argv)
                 }
             }
 
-            /*** Stage-2: joint Mid+Odin IEKF (same H, soft Odin rows) ***/
-            // Unlike prior Odin-only replace, Mid downs stay in the residual so
-            // Odin cannot fully override the Mid lock inside one update.
+            /*** Stage-2: joint Mid+Odin IEKF (same H as official Bundle) ***/
             state_ikfom state_after_mid = kf.get_x();
             bool odin_s2_accepted = false;
             double odin_s2_clip_ratio = 1.0;
             const size_t joint_mid_n = mid_down_body ? mid_down_body->size() : 0;
-            if (!state_bad && odin_iekf_body && !odin_iekf_body->empty() &&
-                mid_down_body && !mid_down_body->empty())
+            if (!state_bad && odin_s2_enable && odin_iekf_body &&
+                !odin_iekf_body->empty() && mid_down_body && !mid_down_body->empty())
             {
                 feats_down_body->points.clear();
                 feats_down_body->points.reserve(joint_mid_n + odin_iekf_body->size());
@@ -2267,7 +2266,8 @@ int main(int argc, char** argv)
                                               odin_iekf_body->points.end());
                 feats_down_body->width = feats_down_body->points.size();
                 feats_down_body->height = 1;
-                sort(feats_down_body->points.begin(), feats_down_body->points.end(), time_list);
+                sort(feats_down_body->points.begin(), feats_down_body->points.end(),
+                     time_list);
                 feats_down_size = feats_down_body->points.size();
                 var_down_body.clear();
                 var_down_body.reserve(feats_down_size);
@@ -2277,7 +2277,6 @@ int main(int argc, char** argv)
                     M3D cov_lidar = calcBodyCov(point_this, ranging_cov, angle_cov);
                     if (pt.intensity >= 150.0f)
                     {
-                        // Soft Odin info weight (constraint-fusion Hb*W).
                         double s = odin_frame_cov_scale / std::max(1e-3, odin_info_weight);
                         const double r = point_this.norm();
                         const double rr = r / odin_range_ref;
@@ -2321,7 +2320,6 @@ int main(int argc, char** argv)
                                       << " odin=" << odin_iekf_n
                                       << " clip=" << clipped
                                       << " clip_r=" << odin_s2_clip_ratio
-                                      << " cov=" << odin_frame_cov_scale
                                       << " n=" << iekf_reject_s2 << std::endl;
                         kf.change_x(state_after_mid);
                         state_point = state_after_mid;
