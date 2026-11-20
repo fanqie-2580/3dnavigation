@@ -19,6 +19,7 @@ TUNE = {
     "odin_static_gyro": 0.08,
 
     # --- Tight couple: Mid S1 then joint S2 (not joint-only) ---
+    # S2 params restored to dual_s2 (best revisit); densify gated by require_s2.
     "odin_s2_enable": True,
     "odin_joint_only_en": False,
     "odin_iekf_max_pts": 1200,
@@ -26,7 +27,6 @@ TUNE = {
     "odin_info_weight": 0.12,
     "odin_range_ref": 8.0,
     "odin_max_residual": 0.05,
-    # Allow mild walk; hard turn/stairs still densify-only (gyr gate).
     "odin_s2_gyr_gate": 0.22,
     "odin_s2_max_clip_ratio": 0.35,
     "shallow_s1_en": True,
@@ -49,11 +49,12 @@ TUNE = {
     "iekf_max_upd": 10.0,
     "iekf_max_rot": 10.0,
     "iekf_max_vel": 0.0,
-    "iekf_s2_max_upd": 10.0,
-    "iekf_s2_max_rot": 10.0,
+    "iekf_s2_max_upd": 0.15,
+    "iekf_s2_max_rot": 0.08,
     "consec_bad_freeze": 5,
 
-    # --- Global densify (paired Odin); S2 reject must not block map fill ---
+    # --- Mid densify always; Odin densify ONLY after accepted S2 (anti double-wall) ---
+    # Prior !require_s2 densified Odin while walking → ghost corridor walls.
     "map_jump_upd": 10.0,
     "map_jump_frame": 10.0,
     "map_max_range": 30.0,
@@ -61,7 +62,7 @@ TUNE = {
     "map_still_gyr": 0.12,
     "map_use_downsample": True,
     "odin_global_insert_en": True,
-    "odin_global_require_s2": False,
+    "odin_global_require_s2": True,
     "odin_body_pub_en": False,
 
     # --- go2 residual_z_v6.3 (multilevel → full H_z locks each floor) ---
