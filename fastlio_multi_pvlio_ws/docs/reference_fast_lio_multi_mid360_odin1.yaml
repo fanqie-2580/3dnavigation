@@ -1,0 +1,176 @@
+/**:
+  ros__parameters:
+
+    common:
+      async_debug: false
+      # true: Mid360 + Odin1 into FAST_LIO_MULTI (tight / densify path).
+      multi_lidar: true
+      publish_tf_results: false
+      # Tight coupling: Mid IEKF owns system /Odometry + map→body TF.
+      publish_odom_tf: true
+      # Smooth map→body TF for RViz (1.0=off). /Odometry stays raw.
+      # Keep low; C++ also holds TF when |dp|<1.2cm and |dyaw|<0.4deg (still).
+      tf_pose_ema: 0.08
+      max_iteration: 3
+      map_frame: "map"
+      # Mid360 Livox CustomMsg + Odin1 dToF raw (downsampled, host-restamped)
+      lid_topic: "/livox/lidar"
+      # Lidar-frame Odin for IEKF (downsample dual-stream). Viz stays on /odin1/cloud_raw_ds.
+      lid_topic2: "/odin1/cloud_l2_body"
+      imu_topic: "/livox/imu"
+      # Odin device IMU for scan-local deskew (not Mid /livox/imu).
+      imu_topic2: "/odin1/imu"
+
+    method:
+      voxelized_pt_num_thres: 1000
+      effect_pt_num_ratio_thres: 0.4
+      bundle_enabled_tic_thres: 10
+
+    preprocess:
+      # Smaller leaf → denser /Laser_map (ikdtree).
+      filter_size_surf: 0.15
+      point_filter_num: 2
+      # Odin is dense (~240x180); stride 1 keeps nearly all bridge points for viz/IEKF.
+      point_filter_num2: 1
+      lidar_type: 1                   # Livox CustomMsg (Mid360)
+      lidar_type2: 4                  # XYZ_ONLY / Odin1 PointCloud2 (+offset_time)
+      scan_line: 4
+      scan_line2: 1
+      scan_rate: 10
+      scan_rate2: 10
+      timestamp_unit: 3
+      # Odin offset_time is already in seconds; preprocess converts to ms.
+      timestamp_unit2: 0
+      blind: 0.5
+      blind2: 0.3
+      # Mid360 far returns are noisy flyers; clip before IEKF / ikdtree.
+      max_range: 25.0
+      max_range2: 25.0
+      min_confidence: 0.0
+      min_confidence2: 30.0           # Odin1 wiki typical confidence gate
+
+    mapping:
+      zero_start_pose: true
+      zero_start_delay_scans: 40
+      cube_side_length: 1000.0
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      # Match preprocess.max_range; also gates map_incremental body-range insert.
+      det_range: 25.0
+      extrinsic_est_en: false
+      # Official FAST_LIO_MULTI tight couple: Odin point residuals → IEKF,
+      # and successful Odin IEKF frames also insert into ikdtree (/Laser_map).
+      # Pose-factor stays OFF (soft /odin1/odometry pull caused Mid jitter).
+      # Soft densify (/viz/accum_*) is optional viz only — truth map = /Laser_map.
+      lidar2_update_en: true
+      lidar2_point_update_en: true
+      # Odin intra-scan on /odin1/imu, then one Mid Stage1 rigid map pose.
+      # Avoids mapping each Odin point onto Mid IMU time (cross-sensor delay).
+      odin_native_deskew_en: true
+      # Orange map pose at Odin scan-end (Mid-clock via stamp_bias), not Mid_end.
+      # Fixes whole-frame yaw error ≈ ω·center_dt when ends disagree.
+      odin_pose_at_scan_end_en: true
+      # Formal orange t_query: "A"=Mid_center+(span-med) [default], "D"=H2+span.
+      # Viz-only; invalid hist → Mid_end Stage1 fallback (never clamp-as-valid).
+      # Roll back by setting A. Does not change IEKF / map / deskew / bias EMA.
+      odin_pub_time_mode: "A"
+      # Debug-only: /cloud_odin_registered_{A,D} + /cloud_odin_tq_ab_id (default false).
+      publish_odin_time_query_ab_en: false
+      # Debug-only shadow: Odin_end→Mid_end SE3 vs raw Mid_end project.
+      # Topics: /cloud_odin_xtform_{A,B}, /odin_xtform_metrics. No IEKF/map change.
+      odin_cross_time_shadow_en: false
+      lidar2_pose_factor_en: false
+      lidar2_pose_alpha: 0.03
+      lidar2_pose_max_dt: 0.20
+      odin_odom_topic: "/odin1/odometry"
+      lidar2_pose_gyr_gate: 0.0
+      lidar2_pitch_gyr_gate: 0.0
+      lidar2_vz_gate: 0.0
+      lidar2_pitch_gate_deg: 0.0
+      # Half-period window (~10Hz→55ms) + soft-wait for late bridge L2.
+      # Mid never freezes multi-100ms; Mid-only only after soft_wait or Odin gap.
+      # Causal L2 preferred in code to avoid early/late flip sawtooth.
+      lidar2_max_sync_dt: 0.055
+      lidar2_soft_wait_sec: 0.025
+      # USB L2 stamp leads Mid by ~−65ms at same wall; bias recenters Bundle dt.
+      lidar2_stamp_bias_sec: 0.065
+      # Internal Odin pose-time calibration from bag geometry; header stamps are unchanged.
+      lidar2_pose_time_correction_sec: 0.020
+      # Pairing-only EMA: bias -= ema * center_dt, clamped [min,max].
+      lidar2_bias_ema: 0.05
+      lidar2_bias_min: 0.0
+      lidar2_bias_max: 0.12
+      # Weak Stage2 (time-weighted); orange viz uses Stage1 pose.
+      lidar2_residual_cov_scale: 100.0
+      lidar2_max_residual: 0.06
+      lidar2_time_sigma_sec: 0.025
+      # Odin → ikdtree: center sync quality (not |ω| gate).
+      lidar2_map_insert_en: true
+      lidar2_map_insert_max_sync_dt: 0.055
+      # Mid owns map geometry; Odin only densifies existing stable surfaces.
+      lidar2_map_insert_require_support_en: true
+      lidar2_map_insert_support_nn_m: 0.15
+      lidar2_map_insert_support_res_m: 0.05
+      lidar2_map_candidate_min_hits: 3
+      lidar2_map_candidate_voxel_m: 0.20
+      lidar2_map_candidate_radius_m: 0.12
+      lidar2_map_candidate_span_m: 0.15
+      lidar2_map_candidate_ttl_sec: 3.0
+      lidar2_map_candidate_pose_trans_m: 0.05
+      lidar2_map_candidate_pose_yaw_rad: 0.10
+      lidar2_map_insert_max_sync_dt_still: 0.055
+      lidar2_map_insert_still_gyr: 0.12
+      lidar2_map_insert_max_center_dt: 0.025
+      lidar2_map_insert_gyr_gate: 0.0
+      lidar2_map_insert_cooldown_sec: 0.0
+
+      # Mid360 IMU -> Mid360 lidar (from existing mid360.yaml)
+      # Odin lidar expressed relative to Mid360 lidar (coarse; calibrate on robot)
+      extrinsic_imu_to_lidars: false
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      extrinsic_T2: [0.0, 0.0, 0.0]
+      extrinsic_R2: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      # Official T_imu_L: Odin lidar in Odin IMU (wiki). Used by native deskew.
+      extrinsic_T_L2_wrt_odin_imu: [-0.02663, 0.03447, 0.02174]
+      extrinsic_R_L2_wrt_odin_imu: [1.0, 0.0, 0.0,
+                                   0.0, 1.0, 0.0,
+                                   0.0, 0.0, 1.0]
+      # L2_wrt_L1 = Odin lidar in Mid360 lidar (X fwd, Y left, Z up).
+      # Derived 2026-11-06:
+      #   T_base_odinIMU (hand/CAD) t=[0.313654,-0.028974,0.104418] R=I
+      #   T_odinIMU_L (wiki) t=[-0.02663,0.03447,0.02174] R=I
+      #   T_go2IMU_midL (Unitree official) t=[0.187,0,0.0803] Ry(+13°)
+      #   T_base_go2IMU (URDF) t=[-0.02557,0,0.04232] R=I
+      #   T_L1_L2 = inv(T_base_midL) @ T_base_odinIMU @ T_odinIMU_L  → Ry(-13°)
+      # MUST be false for /odin1/cloud_l2_body (lidar frame). true was for
+      # gravity-leveled cloud_slam and dropped Ry(-13°) → stage-2 "No Effective
+      # Points" + map_insert gated off + densify/IEKF extrinsic mismatch.
+      extrinsic_L2_gravity_frame: false
+      # CAD T_z was 0.0317; still-frame ground Δz Odin-Mid ≈ -0.127m so raise T_z.
+      extrinsic_T_L2_wrt_L1: [0.13245180, -0.01039588, 0.1587]
+      # Go2-relative attitude: Odin R≈I, Mid@Go2IMU Ry(+13°) → L2 = Ry(-13°).
+      extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
+                             -0.0007179391, 0.9999997285, 0.0001657493,
+                             0.22495105, 0.0, 0.97437006]
+      extrinsic_T_L1_wrt_drone: [0.0, 0.0, 0.0]
+      extrinsic_R_L1_wrt_drone: [1.0, 0.0, 0.0,
+                                 0.0, 1.0, 0.0,
+                                 0.0, 0.0, 1.0]
+
+    publish:
+      path_en: true
+      scan_publish_en: true
+      # true: /cloud_registered keeps full undistorted scan (better RViz accum while moving)
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: true
+      interval: -1

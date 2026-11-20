@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fast_lio_multi</name>
+  <version>0.0.1</version>
+  <description>FAST-LIO Multi – ROS2 port</description>
+
+  <maintainer email="dwojcikie@ethz.ch">Dominik Wojcikiewicz</maintainer>
+  <license>GPL2</license>
+
+  <!-- REQUIRED: build tool -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Runtime and build dependencies -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>message_filters</depend>
+  <depend>livox_ros_driver2</depend>
+
+  <!-- TF & Eigen -->
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+
+  <depend>eigen3_cmake_module</depend>
+
+  <!-- PCL -->
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+
+  <!-- Export build type -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+
+</package>

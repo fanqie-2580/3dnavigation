@@ -1,0 +1,75 @@
+/**:
+  ros__parameters:
+    # FAST-LIO-MULTI Bundle semantics on PV-LIO voxel map (Mid360 + Odin1).
+    # Always-on joint IEKF when L2 pairs; mapping backend = PV-LIO voxels (not ikd-Tree).
+    common:
+      lid_topic: "/livox/lidar"
+      lid_topic2: "/odin1/cloud_raw"
+      imu_topic: "/livox/imu"
+      time_sync_en: false
+      multi_lidar: true
+      # Do not block Mid waiting for Odin (Jetson realtime). Pair opportunistically.
+      lidar2_soft_wait_sec: 0.0
+
+    preprocess:
+      lidar_type: 1                # Mid360 Livox CustomMsg
+      scan_line: 4
+      scan_rate: 10
+      blind: 0.15
+      point_filter_num: 2
+      min_range: 0.15
+      max_range: 40.0
+      feature_extract_enable: false
+      lidar_type2: 6               # Odin1 PointCloud2
+      point_filter_num2: 2
+      blind2: 0.3
+      min_range2: 0.3
+      max_range2: 20.0
+      min_confidence2: 40.0
+
+    mapping:
+      down_sample_size: 0.15
+      max_iteration: 4
+      # PV-LIO voxel map (replaces FAST-LIO ikd-Tree)
+      voxel_size: 0.25
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.05
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 40.0
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      # L2→L1 from dual ground calib (row-major R)
+      # Match FAST_LIO_MULTI_ROS2_mid_odin mid360_odin1.yaml (CAD+Ry)
+      extrinsic_T_L2_wrt_L1: [0.13245180, -0.01039588, 0.1587]
+      extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
+                             -0.0007179391, 0.9999997285, 0.0001657493,
+                              0.22495105, 0.0, 0.97437006]
+      # Pure Bundle: no Odin odom Z hijack (unlike older pv_lio_multi default).
+      odin_z_replace_en: false
+      odin_odom_topic: "/odin1/odometry"
+
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      acc_cov: 0.2
+      gyr_cov: 0.05
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+
+    publish:
+      pub_voxel_map: false
+      publish_global_cloud_map: true
+      publish_max_voxel_layer: 1
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: false
+      save_path: "/home/ll/fastlio_multi_pvlio_ws/maps"
+      interval: -1

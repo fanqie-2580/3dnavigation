@@ -1,0 +1,2 @@
+This workspace is independent of pv_lio_dual_ws / FAST_LIO_MULTI_ROS2_mid_odin.
+Do not rsync into those trees.
