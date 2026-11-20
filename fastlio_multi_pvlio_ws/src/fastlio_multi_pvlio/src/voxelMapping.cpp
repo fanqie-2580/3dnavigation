@@ -224,18 +224,23 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
-// z_fusion = z_fusion0 + (z_odin - z_odin0). XY/attitude unchanged.
+// z_fusion = z_fusion0 + (z_odin - z_odin0). XY/attitude stay from Mid Bundle.
+// Soft per-frame step avoids map tears when Odin Z moves faster than Mid XY.
 void apply_odin_z_replace()
 {
     if (!odin_z_replace_en)
         return;
-    double z_o = 0.0;
+    double z_o = 0.0, t_o = -1.0;
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
         if (!odin_odom_have)
             return;
         z_o = odin_odom_z;
+        t_o = odin_odom_stamp;
     }
+    // Stale Odin odom (bag gap / drop) → skip.
+    if (lidar_end_time > 0.0 && t_o > 0.0 && std::fabs(lidar_end_time - t_o) > 0.5)
+        return;
     state_ikfom s = kf.get_x();
     if (!odin_z_anchor_ok)
     {
@@ -246,13 +251,19 @@ void apply_odin_z_replace()
                   << " odin_z=" << odin_z_anchor_odin << std::endl;
         return;
     }
-    const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    const double z_target = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    double z_new = z_target;
+    const double dz = z_target - s.pos(2);
+    const double max_step = 0.12; // m/frame @~10 Hz ≈ 1.2 m/s vertical
+    if (std::fabs(dz) > max_step)
+        z_new = s.pos(2) + std::copysign(max_step, dz);
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
     kf.change_x(s);
     ++n_odin_z_replace;
     if ((n_odin_z_replace % 50) == 1)
         std::cout << "[pv-z] odin_z_replace z=" << z_new
+                  << " target=" << z_target
                   << " odin_z=" << z_o
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
                   << " n=" << n_odin_z_replace << std::endl;
@@ -1490,13 +1501,9 @@ int main(int argc, char** argv)
                 have_last_good_state = true;
             }
 
-            // Optional Odin Z pin (default OFF — XY/att must stay consistent).
+            // Pose Z from Odin onboard odom (init-aligned); Mid keeps XY/att.
             if (odin_z_replace_en && !state_bad)
             {
-                state_ikfom s = kf.get_x();
-                s.pos(2) = state_before_update.pos(2);
-                s.vel(2) = 0.0;
-                kf.change_x(s);
                 apply_odin_z_replace();
                 state_point = kf.get_x();
             }

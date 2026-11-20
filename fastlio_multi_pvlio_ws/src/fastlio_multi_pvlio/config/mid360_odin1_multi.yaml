@@ -48,8 +48,8 @@
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # OFF: Z-pin while Bundle XY drifts caused worse smear (path→600m).
-      odin_z_replace_en: false
+      # ON: pose Z := /odin1/odometry (init-aligned). Mid Bundle keeps XY/att.
+      odin_z_replace_en: true
       odin_odom_topic: "/odin1/odometry"
       # OFF: band followed sinking pose → death spiral (run9 z→-2900). Was 1.8.
       odin_bundle_z_band: 0.0

@@ -33,6 +33,8 @@
 
 run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）、横向偏≈1.5 m → 叠影。曾加 `odin_bundle_z_band`，但 run9 中 band 跟着错误 Z 下沉 → `No Effective Points` → IMU 自由落体（z→−2900）。现默认 band=0；匹配失效时冻结 last_good 并短暂 Mid-only。
 
+高度：`odin_z_replace_en` 用 Odin 自带 `/odin1/odometry` 的 Z（初始对齐 + 每帧 ≤0.12 m 软限幅）；XY/姿态仍由 Mid Bundle。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。
