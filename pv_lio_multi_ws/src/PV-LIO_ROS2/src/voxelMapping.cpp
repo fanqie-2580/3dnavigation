@@ -110,6 +110,20 @@ bool   multi_lidar = false;
 double lidar2_soft_wait_sec = 0.18;
 double bundle_l1_push_wall = -1.0;
 
+// Root cause of corridor Δz meters: Bundle IEKF lets Mid floor + Odin near
+// planes pull Z; wrong Z then enters voxel map and reinforces. Fix: XY/att
+// stay from PV-LIO Bundle; pose Z := Odin /odin1/odometry (init-aligned).
+bool odin_z_replace_en = true;
+std::string odin_odom_topic = "/odin1/odometry";
+std::mutex mtx_odin_odom;
+double odin_odom_stamp = -1.0;
+double odin_odom_z = 0.0;
+bool odin_odom_have = false;
+bool odin_z_anchor_ok = false;
+double odin_z_anchor_mid = 0.0;
+double odin_z_anchor_odin = 0.0;
+long long n_odin_z_replace = 0;
+
 
 vector<vector<int>>  pointSearchInd_surf;
 vector<PointVector>  Nearest_Points;
@@ -191,6 +205,48 @@ void SigHandle(int sig)
     flg_exit = true;
     RCLCPP_WARN(rclcpp::get_logger("pv_lio_multi"), "catch sig %d", sig);
     sig_buffer.notify_all();
+}
+
+void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lk(mtx_odin_odom);
+    odin_odom_stamp = rclcpp::Time(msg->header.stamp).seconds();
+    odin_odom_z = msg->pose.pose.position.z;
+    odin_odom_have = true;
+}
+
+// z_fusion = z_fusion0 + (z_odin - z_odin0). XY/attitude unchanged.
+void apply_odin_z_replace()
+{
+    if (!odin_z_replace_en)
+        return;
+    double z_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        z_o = odin_odom_z;
+    }
+    state_ikfom s = kf.get_x();
+    if (!odin_z_anchor_ok)
+    {
+        odin_z_anchor_mid = s.pos(2);
+        odin_z_anchor_odin = z_o;
+        odin_z_anchor_ok = true;
+        std::cout << "[pv-z] odin_z_replace init fusion_z=" << odin_z_anchor_mid
+                  << " odin_z=" << odin_z_anchor_odin << std::endl;
+        return;
+    }
+    const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    s.pos(2) = z_new;
+    s.vel(2) = 0.0;
+    kf.change_x(s);
+    ++n_odin_z_replace;
+    if ((n_odin_z_replace % 50) == 1)
+        std::cout << "[pv-z] odin_z_replace z=" << z_new
+                  << " odin_z=" << z_o
+                  << " dz_odin=" << (z_o - odin_z_anchor_odin)
+                  << " n=" << n_odin_z_replace << std::endl;
 }
 
 const bool var_contrast(pointWithCov &x, pointWithCov &y) {
@@ -906,6 +962,8 @@ int main(int argc, char** argv)
         std::vector<double>{0.9711343, 0.0000000, -0.2385335,
                             0.0000000, 1.0000000, 0.0000000,
                             0.2385335, 0.0000000, 0.9711343});
+    node->declare_parameter<bool>("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->declare_parameter<std::string>("mapping.odin_odom_topic", odin_odom_topic);
 
     double det_range_d;
     node->get_parameter("mapping.det_range", det_range_d);
@@ -924,6 +982,8 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_R", extrinR);
     node->get_parameter("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2);
     node->get_parameter("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2);
+    node->get_parameter("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->get_parameter("mapping.odin_odom_topic", odin_odom_topic);
 
     // noise model params
     node->declare_parameter<double>("noise_model.ranging_cov", 0.02);
@@ -1025,7 +1085,8 @@ int main(int argc, char** argv)
         LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_L2;
         LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = T_L2;
         std::cout << "\033[32;1mMulti LiDAR Bundle on! soft_wait=" << lidar2_soft_wait_sec
-                  << "s\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
+                  << "s odin_z_replace=" << odin_z_replace_en
+                  << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
     }
 
     double epsi[23] = {0.001};
@@ -1053,6 +1114,16 @@ int main(int argc, char** argv)
     }
     auto sub_imu = node->create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, imu_qos, imu_cbk);
+
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odin_odom;
+    if (odin_z_replace_en)
+    {
+        auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
+        sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
+            odin_odom_topic, odin_odom_qos, odin_odom_cbk);
+        std::cout << "[pv-z] subscribe " << odin_odom_topic
+                  << " replace=1 (pose Z from Odin odom)" << std::endl;
+    }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
     auto pubLaserCloudFull_body = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 100);
@@ -1138,6 +1209,8 @@ int main(int argc, char** argv)
                             false : true;
 
             if (flg_EKF_inited && !init_map) {
+                apply_odin_z_replace();
+                state_point = kf.get_x();
                 PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
                 transformLidar(state_point, feats_undistort, world_lidar);
 
@@ -1233,6 +1306,27 @@ int main(int argc, char** argv)
                 kf.change_x(state_before_update);
                 state_point = kf.get_x();
             }
+
+            // Drop Bundle IEKF Δz (floor/near-plane pull), then force Odin odom Z
+            // before map insert so voxels/global cloud use corrected height.
+            if (odin_z_replace_en)
+            {
+                if (!state_bad)
+                {
+                    state_ikfom s = kf.get_x();
+                    const double dz_iekf = s.pos(2) - state_before_update.pos(2);
+                    s.pos(2) = state_before_update.pos(2);
+                    s.vel(2) = 0.0;
+                    kf.change_x(s);
+                    static int n_drop_z = 0;
+                    if ((++n_drop_z % 50) == 1)
+                        std::cout << "[pv-z] drop_iekf_z dz=" << dz_iekf
+                                  << " n=" << n_drop_z << std::endl;
+                }
+                apply_odin_z_replace();
+                state_point = kf.get_x();
+            }
+
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];

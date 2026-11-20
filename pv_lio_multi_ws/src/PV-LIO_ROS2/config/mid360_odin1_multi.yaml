@@ -45,6 +45,9 @@
       extrinsic_R_L2_wrt_L1: [0.9711343, 0.0000000, -0.2385335,
                               0.0000000, 1.0000000, 0.0000000,
                               0.2385335, 0.0000000, 0.9711343]
+      # Corridor: Bundle IEKF Z drifts meters; use Odin onboard odom Z only.
+      odin_z_replace_en: true
+      odin_odom_topic: "/odin1/odometry"
 
     noise_model:
       ranging_cov: 0.04

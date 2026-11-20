@@ -31,6 +31,13 @@ ros2 bag play /home/ll/pv_lio_dual_ws/bags/corridor_20261118_outbound_1014_1017 
 
 配置：`config/mid360_odin1_multi.yaml`（外参与 dual 地面标定一致）。
 
+## 走廊高度根因与修复
+
+冒烟（去程约 30 s）纯 Bundle 时 **Δz≈3.5 m**：Mid 地板 + Odin 近距平面在同轮 IEKF 里持续拉 Z，错误高度写入体素后正反馈。
+
+修复（仍用 PV-LIO 估 XY/姿态）：IEKF 后丢弃本帧 Δz，再  
+`z = z0_fusion + (z_odin − z0_odin)`（话题 `/odin1/odometry`，`mapping.odin_z_replace_en: true`）。建图在替换之后，避免错层入图。
+
 ## 预期
 
-同质双雷达上应接近官方 MULTI Bundle。Mid+Odin 异质场景可能出现航向/高度被副雷达拉偏——那正是 dual 加防护的原因；本包用于对照「官方同质紧耦合在 PV-LIO 上的最小形态」。
+同质双雷达上应接近官方 MULTI Bundle。Mid+Odin 上 XY/姿态仍为 Bundle；高度跟 Odin 里程计（其自身长漂约分米级，远小于纯 IEKF 的米级漂）。日常带门控方案仍见 `pv_lio_dual_ws`。
