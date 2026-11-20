@@ -174,9 +174,14 @@ double residual_z_flat_ba_z_alpha = 0.25;
 double residual_z_flat_max_step = 0.015;
 double residual_z_floor_nz_thr = 0.85;
 double residual_z_floor_info_scale = 0.45; // mild always (Point-LIO-like)
-double residual_z_h_dampen = 0.50;         // scale h_x Z on floors; 1=off
+double residual_z_h_dampen = 0.50;         // single-level H_z scale; multilevel → 1.0
 double residual_z_dz_tol = 0.06;
 double residual_z_floor_ratio_thr = 0.03;
+// go2 residual_z_v6.3: after stairs, full H_z so each floor re-locks absolute Z.
+// Without this, constant H_z*=0.12 leaves Z to IMU → upstairs sink / return rise.
+double residual_z_multilevel_thr = 1.5;
+double residual_z_vz_alpha = 0.75;
+bool residual_z_multilevel = false;
 bool residual_z_flat_ref_init = false;
 double residual_z_flat_z_ref = 0.0;
 double residual_z_hard_band = 0.0; // 0=off; clamp |z-flat_ref| after soft Z
@@ -725,29 +730,70 @@ void apply_odin_z_factor(double mid_stamp)
                   << " n=" << n_odin_z_factor << std::endl;
 }
 
-// go2 residual_z: soft flat z_ref + damp vz/ba.z (clipped step).
+// go2 residual_z_v6.3 post-update:
+//  single-level → flat z_ref + vz/ba damp
+//  multilevel   → only soft vz/ba (H_z already full in h_share)
 void apply_residual_z_flat()
 {
     if (!residual_z_en)
         return;
     state_ikfom s = kf.get_x();
-    if (!residual_z_flat_ref_init)
+    if (!last_floor_valid)
     {
-        residual_z_flat_z_ref = s.pos(2);
-        residual_z_flat_ref_init = true;
-        std::cout << "[pv-z] residual_z flat_z_ref=" << residual_z_flat_z_ref
-                  << std::endl;
+        // Still damp vz/ba lightly so IMU Z coast is limited when no floor.
+        const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
+        const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
+        s.vel(2) *= (1.0 - 0.5 * av);
+        s.ba(2) *= (1.0 - 0.5 * ab);
+        kf.change_x(s);
+        return;
     }
-    const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
-    const double az = std::max(0.0, std::min(1.0, residual_z_flat_z_alpha));
-    const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
-    s.vel(2) *= (1.0 - av);
-    s.ba(2) *= (1.0 - ab);
-    double step = az * (residual_z_flat_z_ref - s.pos(2));
-    if (residual_z_flat_max_step > 0.0 &&
-        std::fabs(step) > residual_z_flat_max_step)
-        step = std::copysign(residual_z_flat_max_step, step);
-    s.pos(2) += step;
+    static double floor_z_ema = 0.0;
+    static bool hold_init = false;
+    if (!hold_init)
+    {
+        floor_z_ema = last_floor_z;
+        hold_init = true;
+        std::cout << "[pv-z] residual_z v6.3 post: multilevel_thr="
+                  << residual_z_multilevel_thr << std::endl;
+    }
+    const double dz_floor = last_floor_z - floor_z_ema;
+    floor_z_ema = 0.90 * floor_z_ema + 0.10 * last_floor_z;
+    const double tol = std::max(1e-3, residual_z_dz_tol);
+    const double move = std::fabs(dz_floor);
+    const double stable = std::exp(-0.5 * (move / tol) * (move / tol));
+    double w = 0.0;
+    if (last_floor_n >= 12 || last_floor_ratio >= residual_z_floor_ratio_thr)
+        w = stable * std::min(1.0, std::max(last_floor_ratio / 0.08,
+                                            last_floor_n / 80.0));
+
+    if (!residual_z_multilevel)
+    {
+        if (!residual_z_flat_ref_init)
+        {
+            residual_z_flat_z_ref = s.pos(2);
+            residual_z_flat_ref_init = true;
+            std::cout << "[pv-z] residual_z flat_z_ref=" << residual_z_flat_z_ref
+                      << " (single-level)" << std::endl;
+        }
+        const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
+        const double az = std::max(0.0, std::min(1.0, residual_z_flat_z_alpha));
+        const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
+        s.vel(2) *= (1.0 - av);
+        s.ba(2) *= (1.0 - ab);
+        double step = az * (residual_z_flat_z_ref - s.pos(2));
+        if (residual_z_flat_max_step > 0.0 &&
+            std::fabs(step) > residual_z_flat_max_step)
+            step = std::copysign(residual_z_flat_max_step, step);
+        s.pos(2) += step;
+    }
+    else
+    {
+        // Multi-level: soft vz/ba only; absolute Z from full floor H_z.
+        const double a = std::max(0.0, std::min(0.90, residual_z_vz_alpha));
+        s.vel(2) *= (1.0 - w * a);
+        s.ba(2) *= (1.0 - 0.35 * w * a);
+    }
     kf.change_x(s);
 }
 
@@ -1520,24 +1566,20 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
 
         V3D norm_vec(ptpl_list[i].normal);
         const bool is_odin_pt = (ptpl_list[i].lidar_src == 1);
-        // Mid floor damp applies to Mid rows even during joint S2.
+        // Mid floors: H_z damp applied after residual build (go2 multilevel).
         const bool is_floor =
             residual_z_en && !is_odin_pt &&
             std::fabs(norm_vec.z()) > residual_z_floor_nz_thr;
-        V3D norm_jac = norm_vec;
-        if (is_floor && residual_z_h_dampen < 1.0)
-            norm_jac.z() *= std::max(0.0, std::min(1.0, residual_z_h_dampen));
-
         V3D C(s.rot.conjugate() *norm_vec);
         V3D A(point_crossmat * C);
         if (extrinsic_est_en)
         {
             V3D B(point_be_crossmat * s.offset_R_L_I.conjugate() * C);
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_jac.x(), norm_jac.y(), norm_jac.z(), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_vec.x(), norm_vec.y(), norm_vec.z(), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
         }
         else
         {
-            ekfom_data.h_x.block<1, 12>(i,0) << norm_jac.x(), norm_jac.y(), norm_jac.z(), VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+            ekfom_data.h_x.block<1, 12>(i,0) << norm_vec.x(), norm_vec.y(), norm_vec.z(), VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
         }
 
         float pd2 = norm_vec.x() * ptpl_list[i].point_world.x()
@@ -1590,6 +1632,82 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         }
 
         ekfom_data.R(i) = R_inv;
+    }
+
+    // go2 residual_z_v6: floor plane under robot → multilevel H_z policy.
+    last_floor_valid = false;
+    last_floor_n = 0;
+    last_floor_ratio = 0.0;
+    if (residual_z_en && effct_feat_num > 0)
+    {
+        double z_sum = 0.0;
+        int n_floor = 0;
+        for (int i = 0; i < effct_feat_num; ++i)
+        {
+            if (ptpl_list[i].lidar_src == 1) continue;
+            const double nz = ptpl_list[i].normal.z();
+            if (std::fabs(nz) <= residual_z_floor_nz_thr) continue;
+            const double z_map =
+                -(ptpl_list[i].d + ptpl_list[i].normal.x() * s.pos(0) +
+                  ptpl_list[i].normal.y() * s.pos(1)) /
+                nz;
+            if (z_map > s.pos(2) - 0.15) continue;
+            if (z_map < s.pos(2) - 2.5) continue;
+            z_sum += z_map;
+            ++n_floor;
+        }
+        last_floor_n = n_floor;
+        last_floor_ratio =
+            static_cast<double>(n_floor) / static_cast<double>(effct_feat_num);
+        last_floor_valid = (n_floor >= 12);
+        if (last_floor_valid)
+            last_floor_z = z_sum / static_cast<double>(n_floor);
+
+        if (last_floor_valid && ekfom_data.h_x.cols() > 2)
+        {
+            static double floor_z_ema_h = 0.0;
+            static bool floor_z_ema_h_init = false;
+            static double floor_z_min_seen_h = 0.0;
+            static double floor_z_max_seen_h = 0.0;
+            static bool floor_span_init_h = false;
+            if (!floor_z_ema_h_init)
+            {
+                floor_z_ema_h = last_floor_z;
+                floor_z_ema_h_init = true;
+            }
+            if (!floor_span_init_h)
+            {
+                floor_z_min_seen_h = last_floor_z;
+                floor_z_max_seen_h = last_floor_z;
+                floor_span_init_h = true;
+            }
+            const double dz_floor = last_floor_z - floor_z_ema_h;
+            floor_z_ema_h = 0.90 * floor_z_ema_h + 0.10 * last_floor_z;
+            floor_z_min_seen_h = std::min(floor_z_min_seen_h, last_floor_z);
+            floor_z_max_seen_h = std::max(floor_z_max_seen_h, last_floor_z);
+            if ((floor_z_max_seen_h - floor_z_min_seen_h) >=
+                residual_z_multilevel_thr)
+            {
+                if (!residual_z_multilevel)
+                {
+                    residual_z_multilevel = true;
+                    std::cout << "[pv-z] multi-level floor span="
+                              << (floor_z_max_seen_h - floor_z_min_seen_h)
+                              << " → full H_z, flat z_ref OFF" << std::endl;
+                }
+            }
+            const double tol = std::max(1e-3, residual_z_dz_tol);
+            const double move = std::fabs(dz_floor);
+            const double stable =
+                std::exp(-0.5 * (move / tol) * (move / tol));
+            // After stairs: full H_z so floor re-locks absolute Z (stops sink).
+            const double zmin = residual_z_multilevel
+                                    ? 1.0
+                                    : std::max(0.0, std::min(1.0, residual_z_h_dampen));
+            const double zdamp = zmin + (1.0 - zmin) * (1.0 - stable);
+            if (zdamp < 0.999)
+                ekfom_data.h_x.col(2) *= zdamp;
+        }
     }
 
     res_mean_last = (effct_feat_num > 0) ? (total_residual / effct_feat_num) : 0.0;
@@ -1807,6 +1925,8 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
     node->declare_parameter<double>("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->declare_parameter<double>("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
+    node->declare_parameter<double>("dual_tune.residual_z_multilevel_thr", residual_z_multilevel_thr);
+    node->declare_parameter<double>("dual_tune.residual_z_vz_alpha", residual_z_vz_alpha);
     node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->declare_parameter<bool>("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<bool>("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
@@ -1895,6 +2015,8 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_h_dampen", residual_z_h_dampen);
     node->get_parameter("dual_tune.residual_z_dz_tol", residual_z_dz_tol);
     node->get_parameter("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
+    node->get_parameter("dual_tune.residual_z_multilevel_thr", residual_z_multilevel_thr);
+    node->get_parameter("dual_tune.residual_z_vz_alpha", residual_z_vz_alpha);
     node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->get_parameter("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->get_parameter("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
@@ -1940,6 +2062,7 @@ int main(int argc, char** argv)
               << " hard_z=" << residual_z_hard_band
               << " floor_info=" << residual_z_floor_info_scale
               << " h_damp=" << residual_z_h_dampen
+              << " ml_thr=" << residual_z_multilevel_thr
               << " odin_z_factor=" << odin_z_factor_en
               << " odin_z_replace=" << odin_z_replace_en
               << " odin_xyz_replace=" << odin_xyz_replace_en

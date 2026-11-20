@@ -13,13 +13,15 @@ TUNE = {
     "odin_voxel_insert_en": False,
     "residual_z_en": True,
     "residual_z_h_dampen": 0.12,
+    "residual_z_multilevel_thr": 1.5,
+    "residual_z_vz_alpha": 0.75,
     "residual_z_floor_nz_thr": 0.85,
     "residual_z_dz_tol": 0.06,
     "residual_z_floor_ratio_thr": 0.03,
     "residual_z_floor_info_scale": 0.45,
-    # go2 flat alphas fight stairs — zero z pull, still damp vz/ba
-    "residual_z_flat_z_alpha": 0.0,
-    "residual_z_flat_vz_alpha": 0.75,
+    # single-level pin; after stairs multilevel → full H_z, flat OFF
+    "residual_z_flat_z_alpha": 0.12,
+    "residual_z_flat_vz_alpha": 1.0,
     "residual_z_flat_ba_z_alpha": 0.06,
     "residual_z_flat_max_step": 0.0,
     "residual_z_hard_band": 0.0,

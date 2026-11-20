@@ -60,15 +60,18 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- go2 residual_z (identical spirit to mid360_go2_tune) ---
+    # --- go2 residual_z_v6.3 (multilevel → full H_z locks each floor) ---
     "residual_z_en": True,
-    "residual_z_h_dampen": 0.12,
+    "residual_z_h_dampen": 0.12,          # single-level only; multilevel forces 1.0
+    "residual_z_multilevel_thr": 1.5,
+    "residual_z_vz_alpha": 0.75,
     "residual_z_floor_nz_thr": 0.85,
     "residual_z_dz_tol": 0.06,
     "residual_z_floor_ratio_thr": 0.03,
     "residual_z_floor_info_scale": 0.45,
-    "residual_z_flat_z_alpha": 0.0,
-    "residual_z_flat_vz_alpha": 0.75,
+    # single-level corridor pin (disabled once multilevel); keep vz/ba soft
+    "residual_z_flat_z_alpha": 0.12,
+    "residual_z_flat_vz_alpha": 1.0,
     "residual_z_flat_ba_z_alpha": 0.06,
     "residual_z_flat_max_step": 0.0,
     "residual_z_hard_band": 0.0,
