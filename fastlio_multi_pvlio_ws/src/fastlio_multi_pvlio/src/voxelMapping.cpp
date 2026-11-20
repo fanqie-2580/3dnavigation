@@ -1164,7 +1164,11 @@ int main(int argc, char** argv)
             sensor_msgs::msg::PointCloud2 laserCloudmsg;
             pcl::toROSMsg(*filter_global_cloud_map_t, laserCloudmsg);
             laserCloudmsg.header.stamp = node->now();
-            laserCloudmsg.header.frame_id = "world";
+            // Points are accumulated in the IEKF/odom frame (same as /path, /Odometry).
+            // Publishing as "world" while TF world→camera_init = Initial_R_wrt_G
+            // rotates the map in RViz (Fixed Frame=camera_init) so path ≠ map.
+            // Match dual / official corrected frame: camera_init.
+            laserCloudmsg.header.frame_id = "camera_init";
             pubGlobalCloudMap->publish(laserCloudmsg);
         }
     );

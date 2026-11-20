@@ -17,9 +17,13 @@
 
 | | dual (`pv_lio_dual_ws`) | 本树 |
 |--|--|--|
-| IEKF | Mid S1 → 可选 Odin S2 + 门控 | 合并点云 **全程一次 Bundle** |
+| IEKF | Mid S1 → 可选 Odin S2 + 门控 | 设计为合并点云一次 Bundle；实践上 Mid↔Odin `end_dt>50ms` 会本帧 Mid-only |
 | densify / residual_z | 有 | 无（纯 Bundle+体素） |
 | 地图 | PV 体素 | PV 体素 |
+
+## 注意（RViz 图/路径对不齐）
+
+`/Global_cloud_map` 点坐标与 `/path` 同属 `camera_init`。若 `frame_id` 误标 `world`，再经 `world→camera_init = Initial_R_wrt_G`（重力对齐），Fixed Frame=`camera_init` 时图会被多旋一次，路线看起来斜出走廊。
 
 ## 构建 / 运行
 
