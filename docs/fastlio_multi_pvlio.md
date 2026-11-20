@@ -25,6 +25,10 @@
 
 `/Global_cloud_map` 点坐标与 `/path` 同属 `camera_init`。若 `frame_id` 误标 `world`，再经 `world→camera_init = Initial_R_wrt_G`（重力对齐），Fixed Frame=`camera_init` 时图会被多旋一次，路线看起来斜出走廊。
 
+## 注意（末段漂）
+
+`lidar2_soft_wait` 可能在一个 Mid 帧下攒多帧 Odin。若把 buffer 全部 `+=` 进 Bundle，会出现 `l2_pts≈2×` 的坏更新并触发 Divergence。现改为只取与 Mid 结束时刻最近的**一帧** Odin。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。

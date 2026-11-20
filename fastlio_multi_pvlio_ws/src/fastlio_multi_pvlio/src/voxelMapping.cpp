@@ -460,13 +460,39 @@ static void fill_lidar_end_time(PointCloudXYZI::Ptr cloud, double beg_time,
 
 static void push_lidar2_into_meas(MeasureGroup &meas)
 {
-    meas.lidar2 = lidar_buffer2.front();
-    for (size_t i = 1; i < lidar_buffer2.size(); i++)
-        *meas.lidar2 += *lidar_buffer2[i];
+    // soft_wait can queue several Odin scans behind one Mid frame. Concatenating
+    // them (~2x points) into one Bundle IEKF update yanked pose at bag end.
+    // Use only the single L2 scan whose end time is closest to Mid end time.
+    const double t_ref = meas.lidar_end_time;
+    size_t best = 0;
+    double best_dt = 1e9;
+    for (size_t i = 0; i < lidar_buffer2.size(); ++i)
+    {
+        const double beg = time_buffer2[i];
+        double end = beg + lidar_mean_scantime2;
+        const auto &cloud = lidar_buffer2[i];
+        if (cloud && cloud->points.size() > 1)
+            end = beg + cloud->points.back().curvature / double(1000);
+        const double dt = std::fabs(end - t_ref);
+        if (dt < best_dt)
+        {
+            best_dt = dt;
+            best = i;
+        }
+    }
+    if (lidar_buffer2.size() > 1)
+    {
+        static int n_pick = 0;
+        if ((++n_pick % 50) == 1)
+            std::cout << "[bundle] pick single L2 idx=" << best << "/"
+                      << lidar_buffer2.size() << " end_dt_ms=" << best_dt * 1000.0
+                      << std::endl;
+    }
+    meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best]));
     pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1);
     // Tag Odin so RViz Intensity can separate Mid vs Odin.
     for (auto &pt : meas.lidar2->points) pt.intensity = 200.f;
-    meas.lidar_beg_time2 = time_buffer2.front();
+    meas.lidar_beg_time2 = time_buffer2[best];
     fill_lidar_end_time(meas.lidar2, meas.lidar_beg_time2, lidar_end_time2,
                         lidar_mean_scantime2, scan_num2, "lidar2");
     meas.lidar_end_time2 = lidar_end_time2;
@@ -482,9 +508,8 @@ bool sync_packages(MeasureGroup &meas)
         /*** push lidar1; soft-wait ~0.18s for late lidar2 (Mid+Odin practical) ***/
         if (!lidar_pushed)
         {
+            // One Mid scan only (do not merge queued Mid frames into Bundle).
             meas.lidar = lidar_buffer.front();
-            for (size_t i = 1; i < lidar_buffer.size(); i++)
-                *meas.lidar += *lidar_buffer[i];
             meas.lidar_beg_time = time_buffer.front();
             fill_lidar_end_time(meas.lidar, meas.lidar_beg_time, lidar_end_time,
                                 lidar_mean_scantime, scan_num, "lidar1");
