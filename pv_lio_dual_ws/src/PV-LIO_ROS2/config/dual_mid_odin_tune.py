@@ -1,8 +1,7 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Multifloor/stairs: pose Z + attitude follow /odin1/odometry (init-aligned).
-# Z-only left Mid roll/pitch → tilted cloud + upstairs NEP/drift.
+# Multifloor/stairs: Odin Z + roll/pitch; keep Mid yaw (full att broke map match).
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -79,6 +78,7 @@ TUNE = {
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,
     "odin_att_replace_en": True,
+    "odin_att_rp_only": True,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,

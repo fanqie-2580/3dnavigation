@@ -195,9 +195,11 @@ bool odin_pose_hold_on_bad = true;
 // and re-anchor offset so onboard slow sink is absorbed (not tracked).
 bool odin_z_flat_hold_en = true;
 double odin_z_flat_vz_thr = 0.03; // m/s; stairs ~0.1, upper-floor sink ~0.002
-// Multifloor: Z-only Odin replace left Mid roll/pitch → tilted cloud + NEP.
-// Map Odin odom attitude into fusion via init R_align (R_mid = R_align * R_odin).
+// Multifloor: Z-only Odin left Mid roll/pitch → tilted cloud.
+// Full att replace also overwrites yaw → Mid rays miss Mid map → NEP/drift.
+// Default: take Odin roll/pitch (init-aligned), keep Mid yaw.
 bool odin_att_replace_en = true;
+bool odin_att_rp_only = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
@@ -387,7 +389,17 @@ Eigen::Matrix3d odin_odom_R_locked()
     return q.toRotationMatrix();
 }
 
+Eigen::Matrix3d ypr_deg_to_R(double roll_deg, double pitch_deg, double yaw_deg)
+{
+    const double d2r = M_PI / 57.3;
+    return (Eigen::AngleAxisd(yaw_deg * d2r, Eigen::Vector3d::UnitZ()) *
+            Eigen::AngleAxisd(pitch_deg * d2r, Eigen::Vector3d::UnitY()) *
+            Eigen::AngleAxisd(roll_deg * d2r, Eigen::Vector3d::UnitX()))
+        .toRotationMatrix();
+}
+
 // Write fusion attitude from Odin odom (init-aligned). Returns true if applied.
+// rp_only: Odin roll/pitch + Mid yaw (preserves map heading).
 bool apply_odin_att_replace(state_ikfom &s)
 {
     if (!odin_att_replace_en)
@@ -403,9 +415,19 @@ bool apply_odin_att_replace(state_ikfom &s)
     {
         odin_R_align = s.rot.toRotationMatrix() * R_o.transpose();
         odin_att_align_valid = true;
-        std::cout << "[pv-z] odin_att_replace init align" << std::endl;
+        std::cout << "[pv-z] odin_att_replace init align rp_only="
+                  << odin_att_rp_only << std::endl;
     }
-    Eigen::Quaterniond qm(odin_R_align * R_o);
+    Eigen::Quaterniond qo(odin_R_align * R_o);
+    qo.normalize();
+    Eigen::Matrix3d R_new = qo.toRotationMatrix();
+    if (odin_att_rp_only)
+    {
+        const vect3 ypr_o = SO3ToEuler(SO3(qo));
+        const vect3 ypr_m = SO3ToEuler(s.rot);
+        R_new = ypr_deg_to_R(ypr_o[0], ypr_o[1], ypr_m[2]);
+    }
+    Eigen::Quaterniond qm(R_new);
     qm.normalize();
     s.rot = SO3(qm);
     ++n_odin_att_replace;
@@ -413,8 +435,8 @@ bool apply_odin_att_replace(state_ikfom &s)
     {
         const vect3 ypr = SO3ToEuler(s.rot);
         std::cout << "[pv-z] odin_att_replace ypr=(" << ypr[0] << ","
-                  << ypr[1] << "," << ypr[2] << ") n=" << n_odin_att_replace
-                  << std::endl;
+                  << ypr[1] << "," << ypr[2] << ") rp_only=" << odin_att_rp_only
+                  << " n=" << n_odin_att_replace << std::endl;
     }
     return true;
 }
@@ -1770,6 +1792,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->declare_parameter<bool>("dual_tune.odin_att_replace_en", odin_att_replace_en);
+    node->declare_parameter<bool>("dual_tune.odin_att_rp_only", odin_att_rp_only);
     node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1856,6 +1879,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->get_parameter("dual_tune.odin_att_replace_en", odin_att_replace_en);
+    node->get_parameter("dual_tune.odin_att_rp_only", odin_att_rp_only);
     node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1899,6 +1923,7 @@ int main(int argc, char** argv)
               << " flat_hold=" << odin_z_flat_hold_en
               << " flat_vz_thr=" << odin_z_flat_vz_thr
               << " odin_att_replace=" << odin_att_replace_en
+              << " att_rp_only=" << odin_att_rp_only
               << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err
