@@ -187,6 +187,9 @@ int last_floor_n = 0;
 double last_floor_ratio = 0.0;
 bool odin_z_factor_en = true;
 bool odin_z_replace_en = false; // true: pose Z := Odin odom Z (init-aligned), no algo Z
+// Single-Odin / cam_z: also pin XY to Odin Δ (same anchors). Z-only leaves
+// PV-LIO free to walk off by tens of meters on stairs while Z looks fine.
+bool odin_xyz_replace_en = false;
 // Stairs/open FOV: Mid match can die while Odin odom stays good. Freezing XY to
 // last_good then still replacing Z → upper-floor XY + stair Z → permanent NEP.
 // On bad frames, hold full XYZ from Odin (same init anchors) + zero vel.
@@ -551,6 +554,12 @@ void apply_odin_z_replace(double /*stamp*/)
         return;
     }
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    if (odin_xyz_replace_en)
+    {
+        s.pos(0) = odin_xy_anchor_mid_x + (x_o - odin_xy_anchor_odin_x);
+        s.pos(1) = odin_xy_anchor_mid_y + (y_o - odin_xy_anchor_odin_y);
+        s.vel.setZero();
+    }
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
     apply_odin_att_replace(s);
@@ -560,7 +569,9 @@ void apply_odin_z_replace(double /*stamp*/)
     last_pf_odin_z = z_o;
     last_pf_odin_stamp = t_o;
     if ((n_odin_z_factor % 50) == 1)
-        std::cout << "[pv-z] odin_z_replace z=" << z_new
+        std::cout << "[pv-z] odin_z_replace"
+                  << (odin_xyz_replace_en ? "_xyz" : "")
+                  << " xyz=(" << s.pos(0) << "," << s.pos(1) << "," << z_new << ")"
                   << " odin_z=" << z_o
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
                   << " vz=" << vz
@@ -1798,6 +1809,7 @@ int main(int argc, char** argv)
     node->declare_parameter<double>("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
     node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->declare_parameter<bool>("dual_tune.odin_z_replace_en", odin_z_replace_en);
+    node->declare_parameter<bool>("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
     node->declare_parameter<bool>("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
@@ -1885,6 +1897,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.residual_z_floor_ratio_thr", residual_z_floor_ratio_thr);
     node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->get_parameter("dual_tune.odin_z_replace_en", odin_z_replace_en);
+    node->get_parameter("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
     node->get_parameter("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
@@ -1929,6 +1942,7 @@ int main(int argc, char** argv)
               << " h_damp=" << residual_z_h_dampen
               << " odin_z_factor=" << odin_z_factor_en
               << " odin_z_replace=" << odin_z_replace_en
+              << " odin_xyz_replace=" << odin_xyz_replace_en
               << " odin_pose_hold_on_bad=" << odin_pose_hold_on_bad
               << " flat_hold=" << odin_z_flat_hold_en
               << " flat_vz_thr=" << odin_z_flat_vz_thr
