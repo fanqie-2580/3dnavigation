@@ -1,8 +1,8 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Joint Bundle IEKF + Odin into voxels, but pose Z := /odin1/odometry
-# (init-aligned). Corridor IEKF Z sinks meters without this.
+# Joint Bundle IEKF; corridor Z = residual_z flat + band-limited Odin Δz
+# (not hard replace — full Odin Z inherits onboard sink on flat floors).
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -38,13 +38,15 @@ TUNE = {
     "odin_voxel_body_z_min": -0.05,
     "odin_voxel_cov_scale": 2.0,
 
-    # --- Jump / vel / freeze off ---
+    # --- Jump / vel / freeze ---
+    # Stairs: Mid NEP → IMU coast; freeze=100 allowed ~10s of ~50m/s blowup.
+    # Hold Odin XYZ on bad (see odin_pose_hold_on_bad); freeze is fallback only.
     "iekf_max_upd": 10.0,
     "iekf_max_rot": 10.0,
     "iekf_max_vel": 0.0,
     "iekf_s2_max_upd": 10.0,
     "iekf_s2_max_rot": 10.0,
-    "consec_bad_freeze": 100,
+    "consec_bad_freeze": 5,
 
     # --- Global display map ---
     "map_jump_upd": 10.0,
@@ -57,32 +59,36 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Z: hard replace from Odin odom (no residual_z flat/hard) ---
-    "residual_z_en": False,
-    "residual_z_flat_z_alpha": 0.0,
-    "residual_z_flat_vz_alpha": 0.0,
-    "residual_z_flat_ba_z_alpha": 0.0,
-    "residual_z_flat_max_step": 0.0,
-    "residual_z_hard_band": 0.0,
+    # --- Corridor Z: ±2cm Odin band + hard_band 2.5cm (verified outbound/return) ---
+    # ±2cm Odin band (band=0 return sank ~13cm — Odin Δz counters Mid floor).
+    # hard_band caps |z-flat_ref| peak (soft pulls alone left ptp ~8cm).
+    "residual_z_en": True,
+    "residual_z_flat_z_alpha": 0.32,
+    "residual_z_flat_vz_alpha": 1.0,
+    "residual_z_flat_ba_z_alpha": 0.30,
+    "residual_z_flat_max_step": 0.020,
+    "residual_z_hard_band": 0.025,
     "residual_z_floor_nz_thr": 0.85,
-    "residual_z_floor_info_scale": 1.0,
-    "residual_z_h_dampen": 1.0,
+    "residual_z_floor_info_scale": 0.42,
+    "residual_z_h_dampen": 0.48,
     "residual_z_dz_tol": 0.05,
     "residual_z_floor_ratio_thr": 0.03,
-    "odin_z_factor_en": False,
-    "odin_z_replace_en": True,
+    "odin_z_factor_en": True,
+    "odin_z_replace_en": False,
+    # Bad Mid match (stairs): hold fusion XYZ from Odin Δpose.
+    "odin_pose_hold_on_bad": True,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.0,
+    "odin_z_factor_alpha": 0.60,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.0,
-    "odin_z_factor_band": 0.0,
+    "odin_z_factor_max_innov": 0.025,
+    "odin_z_factor_band": 0.020,
     "odin_z_factor_catch_err": 0.0,
     "odin_z_factor_catch_frac": 1.0,
-    "odin_z_factor_catch_max": 0.0,
-    "odin_z_factor_catch_alpha": 0.0,
+    "odin_z_factor_catch_max": 0.05,
+    "odin_z_factor_catch_alpha": 0.50,
     "odin_z_factor_catch_min_feat": 30,
     "odin_z_factor_one_sided": False,
-    "odin_z_factor_floor_scale": 1.0,
+    "odin_z_factor_floor_scale": 0.30,
 }
 
 
