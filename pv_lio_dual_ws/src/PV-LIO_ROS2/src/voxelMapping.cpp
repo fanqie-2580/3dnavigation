@@ -2987,10 +2987,14 @@ int main(int argc, char** argv)
                     frame_quasi_static && (d_upd > map_jump_upd);
                 const bool motion_gate =
                     map_require_still && (frame_gyr_mean >= map_still_gyr);
+                // When pose XYZ is pinned to Odin, Mid match failure must not
+                // starve Global densify — otherwise Laser_map stays empty while
+                // /Odometry tracks (looks like total drift in RViz).
+                const bool trust_odin_pose = odin_xyz_replace_en;
                 const char *skip_why = nullptr;
-                if (state_bad) { skip_why = "bad"; ++map_skip_bad; }
-                else if (fuse_is_hold) { skip_why = "hold"; ++map_skip_hold; }
-                else if (jump_gate) { skip_why = "jump"; ++map_skip_jump; }
+                if (state_bad && !trust_odin_pose) { skip_why = "bad"; ++map_skip_bad; }
+                else if (fuse_is_hold && !trust_odin_pose) { skip_why = "hold"; ++map_skip_hold; }
+                else if (jump_gate && !trust_odin_pose) { skip_why = "jump"; ++map_skip_jump; }
                 else if (motion_gate) { skip_why = "motion"; ++map_skip_jump; }
                 (void)d_frame; (void)map_jump_frame;
 
