@@ -1,7 +1,8 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Multifloor/stairs: Odin Z + roll/pitch; keep Mid yaw (full att broke map match).
+# Multifloor/stairs: Odin Z only. Att replace OFF — Euler RP mixed pitch~50°
+# and full att overwrote yaw → both caused visible drift.
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -77,7 +78,7 @@ TUNE = {
     # flat_hold OFF: re-anchoring made fusion sink meters while Odin stayed high.
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,
-    "odin_att_replace_en": True,
+    "odin_att_replace_en": False,
     "odin_att_rp_only": True,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,

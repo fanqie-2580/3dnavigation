@@ -389,17 +389,8 @@ Eigen::Matrix3d odin_odom_R_locked()
     return q.toRotationMatrix();
 }
 
-Eigen::Matrix3d ypr_deg_to_R(double roll_deg, double pitch_deg, double yaw_deg)
-{
-    const double d2r = M_PI / 57.3;
-    return (Eigen::AngleAxisd(yaw_deg * d2r, Eigen::Vector3d::UnitZ()) *
-            Eigen::AngleAxisd(pitch_deg * d2r, Eigen::Vector3d::UnitY()) *
-            Eigen::AngleAxisd(roll_deg * d2r, Eigen::Vector3d::UnitX()))
-        .toRotationMatrix();
-}
-
-// Write fusion attitude from Odin odom (init-aligned). Returns true if applied.
-// rp_only: Odin roll/pitch + Mid yaw (preserves map heading).
+// Level fusion to Odin gravity while keeping Mid heading in the horizontal plane.
+// (Euler roll/pitch+yaw mix was wrong: flat start printed pitch~50°.)
 bool apply_odin_att_replace(state_ikfom &s)
 {
     if (!odin_att_replace_en)
@@ -415,17 +406,36 @@ bool apply_odin_att_replace(state_ikfom &s)
     {
         odin_R_align = s.rot.toRotationMatrix() * R_o.transpose();
         odin_att_align_valid = true;
-        std::cout << "[pv-z] odin_att_replace init align rp_only="
+        std::cout << "[pv-z] odin_att_replace init align gravity_level rp_only="
                   << odin_att_rp_only << std::endl;
     }
-    Eigen::Quaterniond qo(odin_R_align * R_o);
-    qo.normalize();
-    Eigen::Matrix3d R_new = qo.toRotationMatrix();
+    const Eigen::Matrix3d R_o_al = odin_R_align * R_o;
+    Eigen::Matrix3d R_new = R_o_al;
     if (odin_att_rp_only)
     {
-        const vect3 ypr_o = SO3ToEuler(SO3(qo));
-        const vect3 ypr_m = SO3ToEuler(s.rot);
-        R_new = ypr_deg_to_R(ypr_o[0], ypr_o[1], ypr_m[2]);
+        // World +Z from Odin-aligned body; keep Mid forward projected to that plane.
+        Eigen::Vector3d z_des = R_o_al.col(2);
+        const double zn = z_des.norm();
+        if (zn < 1e-6)
+            return false;
+        z_des /= zn;
+        Eigen::Vector3d x_mid = s.rot.toRotationMatrix().col(0);
+        Eigen::Vector3d x_new = x_mid - x_mid.dot(z_des) * z_des;
+        if (x_new.norm() < 1e-6)
+        {
+            x_mid = s.rot.toRotationMatrix().col(1);
+            x_new = x_mid - x_mid.dot(z_des) * z_des;
+        }
+        if (x_new.norm() < 1e-6)
+            return false;
+        x_new.normalize();
+        Eigen::Vector3d y_new = z_des.cross(x_new);
+        y_new.normalize();
+        x_new = y_new.cross(z_des);
+        x_new.normalize();
+        R_new.col(0) = x_new;
+        R_new.col(1) = y_new;
+        R_new.col(2) = z_des;
     }
     Eigen::Quaterniond qm(R_new);
     qm.normalize();
@@ -435,7 +445,7 @@ bool apply_odin_att_replace(state_ikfom &s)
     {
         const vect3 ypr = SO3ToEuler(s.rot);
         std::cout << "[pv-z] odin_att_replace ypr=(" << ypr[0] << ","
-                  << ypr[1] << "," << ypr[2] << ") rp_only=" << odin_att_rp_only
+                  << ypr[1] << "," << ypr[2] << ") grav=" << odin_att_rp_only
                   << " n=" << n_odin_att_replace << std::endl;
     }
     return true;
