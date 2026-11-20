@@ -1,0 +1,62 @@
+/**:
+  ros__parameters:
+    common:
+      # Single Odin1 → PV-LIO (via odin_cloud_to_pvlio). Mid off.
+      lid_topic: "/odin1/points_pvlio"
+      imu_topic: "/odin1/imu"
+      time_sync_en: false
+      multi_lidar_en: false
+
+    preprocess:
+      # Converter publishes Velodyne-like cloud (x,y,z,intensity,ring,time).
+      lidar_type: 2
+      scan_line: 16
+      scan_rate: 10
+      blind: 0.2
+      point_filter_num: 2
+      min_range: 0.3
+      max_range: 20.0
+      feature_extract_enable: false
+
+    mapping:
+      down_sample_size: 0.2
+      max_iteration: 4
+      voxel_size: 0.5
+      max_layer: 4
+      layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
+      plannar_threshold: 0.01
+      max_points_size: 1000
+      max_cov_points_size: 1000
+      fov_degree: 360.0
+      det_range: 30.0
+      extrinsic_est_en: true
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    noise_model:
+      ranging_cov: 0.04
+      angle_cov: 0.1
+      acc_cov: 0.2
+      gyr_cov: 0.05
+      b_acc_cov: 0.0043
+      b_gyr_cov: 0.000266
+
+    publish:
+      pub_voxel_map: false
+      publish_global_cloud_map: true
+      publish_max_voxel_layer: 1
+      global_map_leaf_size: 0.08
+      global_map_pub_leaf_size: 0.20
+      global_map_pub_period: 2.0
+      global_map_pub_max_pts: 350000
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: false
+      save_path: "/home/ll/pv_lio_dual_ws/maps"
+      interval: -1
