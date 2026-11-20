@@ -8,8 +8,8 @@
       imu_topic: "/livox/imu"
       time_sync_en: false
       multi_lidar: true
-      # Do not block Mid waiting for Odin (Jetson realtime). Pair opportunistically.
-      lidar2_soft_wait_sec: 0.0
+      # Short soft-wait so Odin can enter Bundle (0 → Mid-only, RViz looks Mid-only).
+      lidar2_soft_wait_sec: 0.08
 
     preprocess:
       lidar_type: 1                # Mid360 Livox CustomMsg
@@ -48,8 +48,9 @@
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # Pure Bundle: no Odin odom Z hijack (unlike older pv_lio_multi default).
-      odin_z_replace_en: false
+      # Mid+Odin Bundle IEKF alone drifts Z/tilt on multifloor; pin Z to Odin odom
+      # (XY/att still from Bundle). Set false to test pure Bundle Z.
+      odin_z_replace_en: true
       odin_odom_topic: "/odin1/odometry"
 
     noise_model:
@@ -66,7 +67,7 @@
       publish_max_voxel_layer: 1
       path_en: true
       scan_publish_en: true
-      dense_publish_en: false
+      dense_publish_en: true
       scan_bodyframe_pub_en: true
 
     pcd_save:

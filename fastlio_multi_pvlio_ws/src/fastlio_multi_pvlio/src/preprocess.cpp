@@ -819,7 +819,12 @@ void Preprocess::odin1_handler(const sensor_msgs::msg::PointCloud2::SharedPtr &m
     if(off_c>=0 && read_i(p+off_c,type_c)<min_confidence) continue;
     const float r2=x*x+y*y+z*z;
     if(r2<blind*blind || (max_range>0 && r2>max_range*max_range)) continue;
-    PointType q; q.x=x;q.y=y;q.z=z;q.intensity=off_i>=0?read_i(p+off_i,type_i):0.f;
+    PointType q; q.x=x;q.y=y;q.z=z;
+    // RViz /cloud_registered drops intensity<5; Odin often has no intensity field.
+    float inten = off_i >= 0 ? read_i(p + off_i, type_i) : 0.f;
+    if (inten < 5.f)
+      inten = off_c >= 0 ? std::max(50.f, read_i(p + off_c, type_c)) : 100.f;
+    q.intensity = inten;
     q.normal_x=q.normal_y=q.normal_z=0;
     float t_ms=0.f;
     if(off_t>=0) t_ms=(type_t==sensor_msgs::msg::PointField::FLOAT32)?read_f32(p+off_t)*1000.f:0.f;

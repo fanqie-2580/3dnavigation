@@ -588,9 +588,8 @@ void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>:
         for (int i = 0; i < size; i++)
         {
             PointType const * const p = &laserCloudFullRes->points[i];
-            if(p->intensity < 5){
-                continue;
-            }
+            // Keep low-intensity points (Odin often has weak/zero intensity).
+            // Old gate intensity<5 hid almost all Odin in RViz /cloud_registered.
             PointType p_world;
 
             RGBpointBodyToWorld(p, &p_world);
