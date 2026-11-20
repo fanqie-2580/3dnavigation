@@ -191,6 +191,10 @@ bool odin_z_replace_en = false; // true: pose Z := Odin odom Z (init-aligned), n
 // last_good then still replacing Z → upper-floor XY + stair Z → permanent NEP.
 // On bad frames, hold full XYZ from Odin (same init anchors) + zero vel.
 bool odin_pose_hold_on_bad = true;
+// Multifloor: follow Odin Z while |vz| >= thr (stairs); on flat, keep fusion Z
+// and re-anchor offset so onboard slow sink is absorbed (not tracked).
+bool odin_z_flat_hold_en = true;
+double odin_z_flat_vz_thr = 0.03; // m/s; stairs ~0.1, upper-floor sink ~0.002
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
@@ -211,7 +215,9 @@ double odin_odom_z = 0.0;
 bool odin_odom_have = false;
 double last_pf_mid_z = 0.0;
 double last_pf_odin_z = 0.0;
+double last_pf_odin_stamp = -1.0;
 bool last_pf_z_valid = false;
+long long n_odin_z_flat_hold = 0;
 double odin_z_anchor_mid = 0.0;   // fusion z at factor init
 double odin_z_anchor_odin = 0.0;  // odin z at factor init
 double odin_xy_anchor_mid_x = 0.0;
@@ -375,13 +381,39 @@ double odin_z_signed_err(const state_ikfom &s)
     return target_z - s.pos(2);
 }
 
+// True when Odin vertical speed looks like flat-floor drift (not stairs).
+bool odin_z_is_flat_vz(double z_o, double t_o, double *vz_out)
+{
+    if (vz_out)
+        *vz_out = 0.0;
+    if (!odin_z_flat_hold_en || last_pf_odin_stamp < 0.0)
+        return false;
+    const double dt = t_o - last_pf_odin_stamp;
+    if (dt < 1e-3 || dt > 1.0)
+        return false;
+    const double vz = (z_o - last_pf_odin_z) / dt;
+    if (vz_out)
+        *vz_out = vz;
+    return std::fabs(vz) < odin_z_flat_vz_thr;
+}
+
+// Absorb Odin slow Z drift into the init offset; leave fusion Z unchanged.
+void absorb_odin_z_flat(double z_o, double t_o, double fusion_z)
+{
+    odin_z_anchor_odin = z_o - (fusion_z - odin_z_anchor_mid);
+    last_pf_mid_z = fusion_z;
+    last_pf_odin_z = z_o;
+    last_pf_odin_stamp = t_o;
+    ++n_odin_z_flat_hold;
+}
+
 // Hard replace fusion Z with Odin onboard odom Z (only an initial offset).
-// z_fusion = z_fusion0 + (z_odin - z_odin0). No residual_z / soft factor.
+// z_fusion = z_fusion0 + (z_odin - z_odin0). Optional flat-hold absorbs sink.
 void apply_odin_z_replace(double /*stamp*/)
 {
     if (!odin_z_replace_en)
         return;
-    double x_o = 0.0, y_o = 0.0, z_o = 0.0;
+    double x_o = 0.0, y_o = 0.0, z_o = 0.0, t_o = -1.0;
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
         if (!odin_odom_have)
@@ -389,6 +421,7 @@ void apply_odin_z_replace(double /*stamp*/)
         x_o = odin_odom_x;
         y_o = odin_odom_y;
         z_o = odin_odom_z;
+        t_o = odin_odom_stamp;
     }
     state_ikfom s = kf.get_x();
     if (!last_pf_z_valid)
@@ -403,8 +436,11 @@ void apply_odin_z_replace(double /*stamp*/)
         last_pf_z_valid = true;
         last_pf_mid_z = s.pos(2);
         last_pf_odin_z = z_o;
+        last_pf_odin_stamp = t_o;
         std::cout << "[pv-z] odin_z_replace init fusion_z=" << odin_z_anchor_mid
-                  << " odin_z=" << odin_z_anchor_odin << std::endl;
+                  << " odin_z=" << odin_z_anchor_odin
+                  << " flat_hold=" << odin_z_flat_hold_en
+                  << " vz_thr=" << odin_z_flat_vz_thr << std::endl;
         return;
     }
     if (!odin_xy_anchor_valid)
@@ -415,6 +451,18 @@ void apply_odin_z_replace(double /*stamp*/)
         odin_xy_anchor_odin_y = y_o;
         odin_xy_anchor_valid = true;
     }
+    double vz = 0.0;
+    if (odin_z_is_flat_vz(z_o, t_o, &vz))
+    {
+        absorb_odin_z_flat(z_o, t_o, s.pos(2));
+        s.vel(2) = 0.0;
+        kf.change_x(s);
+        if ((n_odin_z_flat_hold % 50) == 1)
+            std::cout << "[pv-z] odin_z_flat_hold z=" << s.pos(2)
+                      << " odin_z=" << z_o << " vz=" << vz
+                      << " n=" << n_odin_z_flat_hold << std::endl;
+        return;
+    }
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
@@ -422,21 +470,24 @@ void apply_odin_z_replace(double /*stamp*/)
     ++n_odin_z_factor;
     last_pf_mid_z = z_new;
     last_pf_odin_z = z_o;
+    last_pf_odin_stamp = t_o;
     if ((n_odin_z_factor % 50) == 1)
         std::cout << "[pv-z] odin_z_replace z=" << z_new
                   << " odin_z=" << z_o
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
+                  << " vz=" << vz
                   << " n=" << n_odin_z_factor << std::endl;
 }
 
 // Bad-frame hold: map Odin Δxyz into fusion frame (same anchors as z_replace).
 // Keeps XY/Z self-consistent through stairs when Mid→voxel match is empty.
+// Z uses the same flat-hold gate so upper-floor NEP does not import Odin sink.
 bool apply_odin_pose_hold_on_bad()
 {
     // Hold works with factor or replace; only needs Odin odom + flag.
     if (!odin_pose_hold_on_bad)
         return false;
-    double x_o = 0.0, y_o = 0.0, z_o = 0.0;
+    double x_o = 0.0, y_o = 0.0, z_o = 0.0, t_o = -1.0;
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
         if (!odin_odom_have)
@@ -444,6 +495,7 @@ bool apply_odin_pose_hold_on_bad()
         x_o = odin_odom_x;
         y_o = odin_odom_y;
         z_o = odin_odom_z;
+        t_o = odin_odom_stamp;
     }
     state_ikfom s = kf.get_x();
     if (!last_pf_z_valid)
@@ -458,6 +510,7 @@ bool apply_odin_pose_hold_on_bad()
         last_pf_z_valid = true;
         last_pf_mid_z = s.pos(2);
         last_pf_odin_z = z_o;
+        last_pf_odin_stamp = t_o;
         return false;
     }
     if (!odin_xy_anchor_valid)
@@ -470,15 +523,28 @@ bool apply_odin_pose_hold_on_bad()
     }
     s.pos(0) = odin_xy_anchor_mid_x + (x_o - odin_xy_anchor_odin_x);
     s.pos(1) = odin_xy_anchor_mid_y + (y_o - odin_xy_anchor_odin_y);
-    s.pos(2) = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    double vz = 0.0;
+    if (odin_z_is_flat_vz(z_o, t_o, &vz))
+    {
+        // Keep last good floor height; do not import Odin sink on bad frames.
+        const double z_keep = last_pf_mid_z;
+        absorb_odin_z_flat(z_o, t_o, z_keep);
+        s.pos(2) = z_keep;
+    }
+    else
+    {
+        s.pos(2) = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+        last_pf_mid_z = s.pos(2);
+        last_pf_odin_z = z_o;
+        last_pf_odin_stamp = t_o;
+    }
     s.vel.setZero();
     kf.change_x(s);
     ++n_odin_pose_hold;
-    last_pf_mid_z = s.pos(2);
-    last_pf_odin_z = z_o;
     if ((n_odin_pose_hold % 50) == 1)
         std::cout << "[pv-z] odin_pose_hold xyz=(" << s.pos(0) << ","
                   << s.pos(1) << "," << s.pos(2) << ")"
+                  << " vz=" << vz
                   << " n=" << n_odin_pose_hold << std::endl;
     return true;
 }
@@ -1644,6 +1710,8 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->declare_parameter<bool>("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<bool>("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
+    node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
+    node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1727,6 +1795,8 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->get_parameter("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->get_parameter("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
+    node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
+    node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1767,6 +1837,8 @@ int main(int argc, char** argv)
               << " odin_z_factor=" << odin_z_factor_en
               << " odin_z_replace=" << odin_z_replace_en
               << " odin_pose_hold_on_bad=" << odin_pose_hold_on_bad
+              << " flat_hold=" << odin_z_flat_hold_en
+              << " flat_vz_thr=" << odin_z_flat_vz_thr
               << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err

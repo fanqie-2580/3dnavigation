@@ -1,8 +1,8 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Joint Bundle IEKF; corridor Z = residual_z flat + band-limited Odin Δz
-# (not hard replace — full Odin Z inherits onboard sink on flat floors).
+# Multifloor/stairs: Odin Z replace + flat-hold (follow climb |vz|, absorb
+# slow onboard sink on corridors). Corridor residual_z/band fights stairs.
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -59,36 +59,37 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Corridor Z: ±2cm Odin band + hard_band 2.5cm (verified outbound/return) ---
-    # ±2cm Odin band (band=0 return sank ~13cm — Odin Δz counters Mid floor).
-    # hard_band caps |z-flat_ref| peak (soft pulls alone left ptp ~8cm).
-    "residual_z_en": True,
-    "residual_z_flat_z_alpha": 0.32,
-    "residual_z_flat_vz_alpha": 1.0,
-    "residual_z_flat_ba_z_alpha": 0.30,
-    "residual_z_flat_max_step": 0.020,
-    "residual_z_hard_band": 0.025,
+    # --- Multifloor Z: Odin replace + flat-hold (stairs OK, no corridor clamp) ---
+    "residual_z_en": False,
+    "residual_z_flat_z_alpha": 0.0,
+    "residual_z_flat_vz_alpha": 0.0,
+    "residual_z_flat_ba_z_alpha": 0.0,
+    "residual_z_flat_max_step": 0.0,
+    "residual_z_hard_band": 0.0,
     "residual_z_floor_nz_thr": 0.85,
-    "residual_z_floor_info_scale": 0.42,
-    "residual_z_h_dampen": 0.48,
+    "residual_z_floor_info_scale": 1.0,
+    "residual_z_h_dampen": 1.0,
     "residual_z_dz_tol": 0.05,
     "residual_z_floor_ratio_thr": 0.03,
-    "odin_z_factor_en": True,
-    "odin_z_replace_en": False,
+    "odin_z_factor_en": False,
+    "odin_z_replace_en": True,
     # Bad Mid match (stairs): hold fusion XYZ from Odin Δpose.
     "odin_pose_hold_on_bad": True,
+    # |vz|<thr → keep fusion Z, re-anchor offset (kill upper-floor sink).
+    "odin_z_flat_hold_en": True,
+    "odin_z_flat_vz_thr": 0.03,
     "odin_odom_topic": "/odin1/odometry",
-    "odin_z_factor_alpha": 0.60,
+    "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,
-    "odin_z_factor_max_innov": 0.025,
-    "odin_z_factor_band": 0.020,
+    "odin_z_factor_max_innov": 0.0,
+    "odin_z_factor_band": 0.0,
     "odin_z_factor_catch_err": 0.0,
     "odin_z_factor_catch_frac": 1.0,
-    "odin_z_factor_catch_max": 0.05,
-    "odin_z_factor_catch_alpha": 0.50,
+    "odin_z_factor_catch_max": 0.0,
+    "odin_z_factor_catch_alpha": 0.0,
     "odin_z_factor_catch_min_feat": 30,
     "odin_z_factor_one_sided": False,
-    "odin_z_factor_floor_scale": 0.30,
+    "odin_z_factor_floor_scale": 1.0,
 }
 
 
