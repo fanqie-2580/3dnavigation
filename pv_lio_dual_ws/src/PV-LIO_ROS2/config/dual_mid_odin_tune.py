@@ -49,16 +49,17 @@ TUNE = {
     "iekf_s2_max_rot": 10.0,
     "consec_bad_freeze": 5,
 
-    # --- Global: Mid + Odin densify under Mid pose ---
+    # --- Global: Mid densify always; Odin densify only when paired (see code) ---
     "map_jump_upd": 10.0,
     "map_jump_frame": 10.0,
     "map_max_range": 30.0,
     "map_require_still": False,
     "map_still_gyr": 0.12,
     "map_use_downsample": True,
+    # Keep densify for fill, but Mid pose must stay single-Mid quality.
     "odin_global_insert_en": True,
     "odin_global_require_s2": False,
-    "odin_body_pub_en": True,
+    "odin_body_pub_en": False,
 
     # --- go2 residual_z_v6.3 (multilevel → full H_z locks each floor) ---
     "residual_z_en": True,

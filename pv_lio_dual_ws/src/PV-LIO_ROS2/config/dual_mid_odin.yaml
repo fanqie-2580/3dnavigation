@@ -8,23 +8,23 @@
       lid_topic2: "/odin1/cloud_raw"
       imu_topic2: "/odin1/imu"
       lidar2_stamp_bias_sec: 0.0
-      # Stationary “jitter” was Mid↔Odin composition flicker: ~30% unpaired when
-      # end-time phase drifted past 100ms. Widen window so soft-wait can catch Odin.
-      lidar2_max_sync_dt: 0.20
-      lidar2_soft_wait_sec: 0.18
+      # Densify-only: never block Mid IEKF waiting for Odin (soft_wait=0).
+      # Prior soft_wait=0.18 + filter=1 blew Mid at ~60s (z→-12, NEP storm).
+      lidar2_max_sync_dt: 0.15
+      lidar2_soft_wait_sec: 0.0
       lidar2_bias_ema: 0.0
     preprocess:
-      # Mid: match mid360_go2 / go2_mid360 (was too coarse → return corridor shrink).
+      # Mid: go2 voxel/extrinsic; filter=2 keeps dual realtime (filter=1 diverged).
       lidar_type: 1
       scan_line: 4
       scan_rate: 10
       blind: 0.15
-      point_filter_num: 1
+      point_filter_num: 2
       min_range: 0.15
-      max_range: 80.0
+      max_range: 40.0
       feature_extract_enable: false
       lidar_type2: 6
-      point_filter_num2: 2
+      point_filter_num2: 3
       blind2: 0.3
       min_range2: 0.3
       max_range2: 20.0
@@ -32,14 +32,14 @@
     mapping:
       down_sample_size: 0.15
       max_iteration: 4
-      voxel_size: 0.20
+      voxel_size: 0.25
       max_layer: 4
       layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
       plannar_threshold: 0.05
       max_points_size: 1000
       max_cov_points_size: 1000
       fov_degree: 360.0
-      det_range: 80.0
+      det_range: 40.0
       extrinsic_est_en: false
       extrinsic_T: [-0.011, -0.02329, 0.04412]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
