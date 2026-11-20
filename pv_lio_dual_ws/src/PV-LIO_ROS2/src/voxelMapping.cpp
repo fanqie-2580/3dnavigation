@@ -138,7 +138,16 @@ bool map_require_still = true;        // skip Global densify when moving
 double map_still_gyr = 0.12;          // rad/s
 bool map_use_downsample = true;       // Global Mid downs (not dense undistort)
 bool odin_global_insert_en = false;
-bool odin_global_require_s2 = true;   // densify Odin only after good S2
+bool odin_global_require_s2 = true;   // full Odin densify prefers accepted S2
+// Fill ground without resurrecting double walls:
+//  - still densify: full Odin when gyro low even if S2 did not run
+//  - walk floor densify: while moving, insert only near-floor Odin points
+bool odin_global_still_densify_en = true;
+double odin_global_still_gyr = 0.18;
+bool odin_global_walk_floor_densify_en = true;
+float odin_global_walk_floor_z_min = -0.35f;
+float odin_global_walk_floor_z_max = 0.45f;
+int odin_global_walk_floor_stride = 2; // subsample while walking
 double odin_s2_max_clip_ratio = 0.40; // reject S2 / densify if clip_r above
 bool odin_body_pub_en = false;
 // When end_dt+gyro look Bundle-safe, run a 1-iter Mid S1 then full joint S2
@@ -1968,6 +1977,16 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.map_use_downsample", map_use_downsample);
     node->declare_parameter<bool>("dual_tune.odin_global_insert_en", odin_global_insert_en);
     node->declare_parameter<bool>("dual_tune.odin_global_require_s2", odin_global_require_s2);
+    node->declare_parameter<bool>("dual_tune.odin_global_still_densify_en", odin_global_still_densify_en);
+    node->declare_parameter<double>("dual_tune.odin_global_still_gyr", odin_global_still_gyr);
+    node->declare_parameter<bool>("dual_tune.odin_global_walk_floor_densify_en",
+                                  odin_global_walk_floor_densify_en);
+    node->declare_parameter<double>("dual_tune.odin_global_walk_floor_z_min",
+                                    odin_global_walk_floor_z_min);
+    node->declare_parameter<double>("dual_tune.odin_global_walk_floor_z_max",
+                                    odin_global_walk_floor_z_max);
+    node->declare_parameter<int>("dual_tune.odin_global_walk_floor_stride",
+                                 odin_global_walk_floor_stride);
     node->declare_parameter<double>("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->declare_parameter<bool>("dual_tune.odin_body_pub_en", odin_body_pub_en);
     node->declare_parameter<bool>("dual_tune.shallow_s1_en", shallow_s1_en);
@@ -2055,6 +2074,20 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.map_use_downsample", map_use_downsample);
     node->get_parameter("dual_tune.odin_global_insert_en", odin_global_insert_en);
     node->get_parameter("dual_tune.odin_global_require_s2", odin_global_require_s2);
+    node->get_parameter("dual_tune.odin_global_still_densify_en", odin_global_still_densify_en);
+    node->get_parameter("dual_tune.odin_global_still_gyr", odin_global_still_gyr);
+    node->get_parameter("dual_tune.odin_global_walk_floor_densify_en",
+                        odin_global_walk_floor_densify_en);
+    {
+        double z0 = odin_global_walk_floor_z_min, z1 = odin_global_walk_floor_z_max;
+        node->get_parameter("dual_tune.odin_global_walk_floor_z_min", z0);
+        node->get_parameter("dual_tune.odin_global_walk_floor_z_max", z1);
+        odin_global_walk_floor_z_min = static_cast<float>(z0);
+        odin_global_walk_floor_z_max = static_cast<float>(z1);
+    }
+    node->get_parameter("dual_tune.odin_global_walk_floor_stride",
+                        odin_global_walk_floor_stride);
+    if (odin_global_walk_floor_stride < 1) odin_global_walk_floor_stride = 1;
     node->get_parameter("dual_tune.odin_s2_max_clip_ratio", odin_s2_max_clip_ratio);
     node->get_parameter("dual_tune.odin_body_pub_en", odin_body_pub_en);
     node->get_parameter("dual_tune.shallow_s1_en", shallow_s1_en);
@@ -2131,6 +2164,9 @@ int main(int argc, char** argv)
               << " downs=" << map_use_downsample
               << " odin_global=" << odin_global_insert_en
               << " req_s2=" << odin_global_require_s2
+              << " still_den=" << odin_global_still_densify_en
+              << "@" << odin_global_still_gyr
+              << " walk_floor=" << odin_global_walk_floor_densify_en
               << " odin_body=" << odin_body_pub_en
               << " residual_z=" << residual_z_en
               << " flat_z_a=" << residual_z_flat_z_alpha
@@ -3214,29 +3250,39 @@ int main(int argc, char** argv)
                                    ? feats_undistort
                                    : feats_down_body);
                     PointCloudXYZI::Ptr body_f(new PointCloudXYZI);
-                    // Odin→Global:
-                    //  require_s2: only accept_s2 (live: accept~0.3% → almost empty).
-                    //  !require_s2: allow ok_map* (S2 not run); still block this
-                    //  frame if S2 ran and was rejected (clip~0.8 dual floor).
+                    // Odin→Global densify policy (anti double-wall + fill ground):
+                    //  full cloud: S2 accepted, or still densify, or legacy !req_s2 map path
+                    //  walk floor: while moving without S2, only near-floor Odin points
                     const bool s2_attempted = odin_iekf_n > 0;
-                    const bool odin_densify_ok =
+                    const bool s2_rejected = s2_attempted && !odin_s2_accepted;
+                    const bool still_for_odin =
+                        odin_global_still_densify_en &&
+                        (frame_gyr_mean < odin_global_still_gyr);
+                    const bool full_odin_ok =
                         odin_global_insert_en && odin_map_full &&
-                        !odin_map_full->empty() &&
-                        (odin_global_require_s2
-                             ? odin_s2_accepted
-                             : (odin_s2_accepted || !s2_attempted));
-                    const size_t odin_extra =
-                        odin_densify_ok ? odin_map_full->size() : 0;
-                    if (!odin_densify_ok && odin_map_full &&
+                        !odin_map_full->empty() && !s2_rejected &&
+                        (odin_s2_accepted ||
+                         still_for_odin ||
+                         (!odin_global_require_s2 && !s2_attempted));
+                    // Floor-only is OK even after S2 reject: Mid pose restored,
+                    // near-floor points fill holes without stacking corridor walls.
+                    const bool floor_odin_ok =
+                        odin_global_insert_en &&
+                        odin_global_walk_floor_densify_en && odin_map_full &&
+                        !odin_map_full->empty() && !full_odin_ok;
+                    if (!full_odin_ok && !floor_odin_ok && odin_map_full &&
                         !odin_map_full->empty() && ((map_ins_ok % 50) == 1))
                     {
                         std::cout << "[pv-map] odin_skip_global s2="
                                   << odin_s2_accepted
                                   << " clip_r=" << odin_s2_clip_ratio
                                   << " req_s2=" << odin_global_require_s2
+                                  << " gyr=" << frame_gyr_mean
                                   << std::endl;
                     }
-                    body_f->points.reserve(body_src->size() + odin_extra);
+                    const size_t odin_budget =
+                        (full_odin_ok || floor_odin_ok) ? odin_map_full->size() : 0;
+                    body_f->points.reserve(body_src->size() + odin_budget);
                     const float r2max = map_max_range * map_max_range;
                     for (const auto &pt : body_src->points)
                     {
@@ -3246,7 +3292,7 @@ int main(int argc, char** argv)
                         if (r2 > r2max) continue;
                         body_f->points.push_back(pt);
                     }
-                    if (odin_extra > 0)
+                    if (full_odin_ok)
                     {
                         for (const auto &pt : odin_map_full->points)
                         {
@@ -3254,6 +3300,25 @@ int main(int argc, char** argv)
                             if (r2 > r2max) continue;
                             body_f->points.push_back(pt);
                         }
+                    }
+                    else if (floor_odin_ok)
+                    {
+                        const int stride = odin_global_walk_floor_stride;
+                        for (size_t i = 0; i < odin_map_full->points.size(); i += stride)
+                        {
+                            const auto &pt = odin_map_full->points[i];
+                            if (pt.z < odin_global_walk_floor_z_min ||
+                                pt.z > odin_global_walk_floor_z_max)
+                                continue;
+                            const float r2 = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+                            if (r2 > r2max) continue;
+                            body_f->points.push_back(pt);
+                        }
+                        if ((map_ins_ok % 100) == 1)
+                            std::cout << "[pv-map] odin_walk_floor gyr="
+                                      << frame_gyr_mean
+                                      << " n_src=" << odin_map_full->size()
+                                      << std::endl;
                     }
                     body_f->width = body_f->points.size();
                     body_f->height = 1;

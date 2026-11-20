@@ -53,8 +53,7 @@ TUNE = {
     "iekf_s2_max_rot": 0.08,
     "consec_bad_freeze": 5,
 
-    # --- Mid densify always; Odin densify ONLY after accepted S2 (anti double-wall) ---
-    # Prior !require_s2 densified Odin while walking → ghost corridor walls.
+    # --- Densify: Mid always; Odin full on S2/still; walk → floor-only (fill gaps) ---
     "map_jump_upd": 10.0,
     "map_jump_frame": 10.0,
     "map_max_range": 30.0,
@@ -63,6 +62,12 @@ TUNE = {
     "map_use_downsample": True,
     "odin_global_insert_en": True,
     "odin_global_require_s2": True,
+    "odin_global_still_densify_en": True,
+    "odin_global_still_gyr": 0.18,
+    "odin_global_walk_floor_densify_en": True,
+    "odin_global_walk_floor_z_min": -0.35,
+    "odin_global_walk_floor_z_max": 0.45,
+    "odin_global_walk_floor_stride": 2,
     "odin_body_pub_en": False,
 
     # --- go2 residual_z_v6.3 (multilevel → full H_z locks each floor) ---
