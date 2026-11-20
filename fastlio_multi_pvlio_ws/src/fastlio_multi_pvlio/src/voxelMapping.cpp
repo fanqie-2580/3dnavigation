@@ -495,7 +495,8 @@ static void push_lidar2_into_meas(MeasureGroup &meas)
     meas.lidar2.reset(new PointCloudXYZI(*lidar_buffer2[best]));
     pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1);
     // Tag Odin so RViz Intensity can separate Mid vs Odin.
-    for (auto &pt : meas.lidar2->points) pt.intensity = 200.f;
+    // Tag >> Mid reflectivity (0..255) so Bundle filters do not confuse Mid/Odin.
+    for (auto &pt : meas.lidar2->points) pt.intensity = 500.f;
     meas.lidar_beg_time2 = time_buffer2[best];
     fill_lidar_end_time(meas.lidar2, meas.lidar_beg_time2, lidar_end_time2,
                         lidar_mean_scantime2, scan_num2, "lidar2");
@@ -1270,7 +1271,7 @@ int main(int argc, char** argv)
                 size_t n_odin = 0, n_keep_odin = 0;
                 for (const auto &pt : feats_undistort->points)
                 {
-                    if (pt.intensity <= 150.f)
+                    if (pt.intensity < 400.f)
                     {
                         kept->push_back(pt);
                         continue;
@@ -1294,7 +1295,7 @@ int main(int argc, char** argv)
                     PointCloudXYZI::Ptr mid_only(new PointCloudXYZI);
                     mid_only->reserve(kept->size());
                     for (const auto &pt : kept->points)
-                        if (pt.intensity <= 150.f) mid_only->push_back(pt);
+                        if (pt.intensity < 400.f) mid_only->push_back(pt);
                     feats_undistort.swap(mid_only);
                     static int n_mid = 0;
                     if ((++n_mid % 50) == 1)
@@ -1412,7 +1413,7 @@ int main(int argc, char** argv)
             bool had_l2 = false;
             for (const auto &pt : feats_down_body->points)
             {
-                if (pt.intensity > 150.f) { had_l2 = true; break; }
+                if (pt.intensity >= 400.f) { had_l2 = true; break; }
             }
             const double d_upd = (state_point.pos - state_before_update.pos).norm();
             const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
@@ -1465,7 +1466,7 @@ int main(int argc, char** argv)
                 body_mid_only.reset(new PointCloudXYZI());
                 body_mid_only->reserve(feats_down_body->size());
                 for (const auto &pt : feats_down_body->points)
-                    if (pt.intensity <= 150.f) body_mid_only->push_back(pt);
+                    if (pt.intensity < 400.f) body_mid_only->push_back(pt);
                 body_for_map = body_mid_only;
             }
             transformLidar(state_point, body_for_map, world_lidar);
