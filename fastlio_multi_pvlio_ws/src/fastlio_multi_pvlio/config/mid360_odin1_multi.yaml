@@ -51,6 +51,8 @@
       # OFF: Z-pin while Bundle XY drifts caused worse smear (path→600m).
       odin_z_replace_en: false
       odin_odom_topic: "/odin1/odometry"
+      # Only Bundle-use Odin points with |world_z - pose_z| <= band (anti other-floor).
+      odin_bundle_z_band: 1.8
 
     noise_model:
       ranging_cov: 0.04

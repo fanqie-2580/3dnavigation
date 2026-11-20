@@ -123,6 +123,10 @@ bool odin_z_anchor_ok = false;
 double odin_z_anchor_mid = 0.0;
 double odin_z_anchor_odin = 0.0;
 long long n_odin_z_replace = 0;
+// Keep Odin Bundle points within |world_z - pose_z| band so IEKF cannot match
+// other floors (run7: same corridor y≈-40 outbound z≈4.9 vs return z≈1.0).
+double odin_bundle_z_band = 1.8;
+long long n_odin_z_band_drop = 0;
 
 
 vector<vector<int>>  pointSearchInd_surf;
@@ -990,6 +994,7 @@ int main(int argc, char** argv)
                             0.2385335, 0.0000000, 0.9711343});
     node->declare_parameter<bool>("mapping.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<std::string>("mapping.odin_odom_topic", odin_odom_topic);
+    node->declare_parameter<double>("mapping.odin_bundle_z_band", odin_bundle_z_band);
 
     double det_range_d;
     node->get_parameter("mapping.det_range", det_range_d);
@@ -1009,6 +1014,7 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2);
     node->get_parameter("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2);
     node->get_parameter("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->get_parameter("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->get_parameter("mapping.odin_odom_topic", odin_odom_topic);
 
     // noise model params
@@ -1112,6 +1118,7 @@ int main(int argc, char** argv)
         LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = T_L2;
         std::cout << "\033[32;1mMulti LiDAR Bundle on! soft_wait=" << lidar2_soft_wait_sec
                   << "s odin_z_replace=" << odin_z_replace_en
+                  << " odin_bundle_z_band=" << odin_bundle_z_band
                   << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
     }
 
@@ -1254,6 +1261,57 @@ int main(int argc, char** argv)
                 continue;
             }
 
+            // Drop Odin points whose world-Z is far from current pose (other floor).
+            if (multi_lidar && odin_bundle_z_band > 0.0 && feats_undistort)
+            {
+                const state_ikfom s0 = kf.get_x();
+                PointCloudXYZI::Ptr kept(new PointCloudXYZI);
+                kept->reserve(feats_undistort->size());
+                size_t n_odin = 0, n_keep_odin = 0;
+                for (const auto &pt : feats_undistort->points)
+                {
+                    if (pt.intensity <= 150.f)
+                    {
+                        kept->push_back(pt);
+                        continue;
+                    }
+                    ++n_odin;
+                    V3D pl(pt.x, pt.y, pt.z);
+                    V3D pw = s0.rot * (s0.offset_R_L_I * pl + s0.offset_T_L_I) + s0.pos;
+                    if (std::fabs(pw[2] - s0.pos(2)) <= odin_bundle_z_band)
+                    {
+                        kept->push_back(pt);
+                        ++n_keep_odin;
+                    }
+                    else
+                    {
+                        ++n_odin_z_band_drop;
+                    }
+                }
+                if (n_odin > 0 && n_keep_odin < 40)
+                {
+                    // Too few in-band Odin → Mid-only this frame.
+                    PointCloudXYZI::Ptr mid_only(new PointCloudXYZI);
+                    mid_only->reserve(kept->size());
+                    for (const auto &pt : kept->points)
+                        if (pt.intensity <= 150.f) mid_only->push_back(pt);
+                    feats_undistort.swap(mid_only);
+                    static int n_mid = 0;
+                    if ((++n_mid % 50) == 1)
+                        std::cout << "[bundle] z_band Mid-only keep_odin=" << n_keep_odin
+                                  << "/" << n_odin << " band=" << odin_bundle_z_band
+                                  << std::endl;
+                }
+                else
+                {
+                    feats_undistort.swap(kept);
+                    if (n_odin > n_keep_odin && (n_odin_z_band_drop % 200) == 1)
+                        std::cout << "[bundle] z_band drop_odin=" << (n_odin - n_keep_odin)
+                                  << " keep=" << n_keep_odin << " pose_z=" << s0.pos(2)
+                                  << std::endl;
+                }
+            }
+
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
 
@@ -1365,7 +1423,7 @@ int main(int argc, char** argv)
                     "Reject Bundle jump d_upd=%.3f dz=%.3f m (L2) — restore prior state",
                     d_upd, dz_upd);
             }
-            else if (!state_bad && !had_l2 && d_upd > 0.50)
+            else if (!state_bad && !had_l2 && d_upd > 0.35)
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
