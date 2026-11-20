@@ -77,9 +77,15 @@ TUNE = {
     "residual_z_hard_band": 0.0,
 
     # --- Never hijack Mid pose with Odin odom ---
+    # odin_xy_factor OFF: Mid/Odin frames differ in yaw after gravity-align;
+    # raw Δxy pull sheared the map (z→-38). Return shrink was from coarse Mid
+    # params (voxel 0.5); aligning to mid360_go2 matches Odin path length.
     "odin_z_factor_en": False,
     "odin_z_replace_en": False,
     "odin_xyz_replace_en": False,
+    "odin_xy_factor_en": False,
+    "odin_xy_factor_alpha": 0.30,
+    "odin_xy_factor_max_step": 0.05,
     "odin_pose_hold_on_bad": False,
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,

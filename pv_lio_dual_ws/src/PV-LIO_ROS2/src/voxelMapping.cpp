@@ -195,6 +195,12 @@ bool odin_z_replace_en = false; // true: pose Z := Odin odom Z (init-aligned), n
 // Single-Odin / cam_z: also pin XY to Odin Δ (same anchors). Z-only leaves
 // PV-LIO free to walk off by tens of meters on stairs while Z looks fine.
 bool odin_xyz_replace_en = false;
+// Soft XY pull toward Odin Δxy (init-aligned). Fixes Mid corridor scale shrink
+// on return (~5m vs Odin onboard) without full pose hijack.
+bool odin_xy_factor_en = false;
+double odin_xy_factor_alpha = 0.25;
+double odin_xy_factor_max_step = 0.05; // m per axis per frame
+long long n_odin_xy_factor = 0;
 // Stairs/open FOV: Mid match can die while Odin odom stays good. Freezing XY to
 // last_good then still replacing Z → upper-floor XY + stair Z → permanent NEP.
 // On bad frames, hold full XYZ from Odin (same init anchors) + zero vel.
@@ -581,6 +587,70 @@ void apply_odin_z_replace(double /*stamp*/)
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
                   << " vz=" << vz
                   << " n=" << n_odin_z_factor << std::endl;
+}
+
+// Soft XY: pull Mid toward Odin init-aligned XY (scale/yaw assist on return).
+void apply_odin_xy_factor()
+{
+    if (!odin_xy_factor_en)
+        return;
+    double x_o = 0.0, y_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        x_o = odin_odom_x;
+        y_o = odin_odom_y;
+    }
+    state_ikfom s = kf.get_x();
+    if (!odin_xy_anchor_valid)
+    {
+        odin_xy_anchor_mid_x = s.pos(0);
+        odin_xy_anchor_mid_y = s.pos(1);
+        odin_xy_anchor_odin_x = x_o;
+        odin_xy_anchor_odin_y = y_o;
+        odin_xy_anchor_valid = true;
+        if (!last_pf_z_valid)
+        {
+            // Keep Z-replace anchors consistent if enabled later.
+            odin_z_anchor_mid = s.pos(2);
+            {
+                std::lock_guard<std::mutex> lk(mtx_odin_odom);
+                odin_z_anchor_odin = odin_odom_z;
+            }
+            last_pf_z_valid = true;
+            last_pf_mid_z = s.pos(2);
+            last_pf_odin_z = odin_z_anchor_odin;
+        }
+        std::cout << "[pv-xy] odin_xy_factor init mid=(" << odin_xy_anchor_mid_x
+                  << "," << odin_xy_anchor_mid_y << ") odin=("
+                  << odin_xy_anchor_odin_x << "," << odin_xy_anchor_odin_y
+                  << ")" << std::endl;
+        return;
+    }
+    const double tgt_x = odin_xy_anchor_mid_x + (x_o - odin_xy_anchor_odin_x);
+    const double tgt_y = odin_xy_anchor_mid_y + (y_o - odin_xy_anchor_odin_y);
+    double dx = tgt_x - s.pos(0);
+    double dy = tgt_y - s.pos(1);
+    const double lim = std::max(0.0, odin_xy_factor_max_step);
+    if (lim > 0.0)
+    {
+        if (std::fabs(dx) > lim) dx = std::copysign(lim, dx);
+        if (std::fabs(dy) > lim) dy = std::copysign(lim, dy);
+    }
+    const double a = std::max(0.0, std::min(1.0, odin_xy_factor_alpha));
+    s.pos(0) += a * dx;
+    s.pos(1) += a * dy;
+    // Do not zero vel fully — keep Mid motion; lightly damp xy vel mismatch.
+    s.vel(0) *= (1.0 - 0.5 * a);
+    s.vel(1) *= (1.0 - 0.5 * a);
+    kf.change_x(s);
+    ++n_odin_xy_factor;
+    if ((n_odin_xy_factor % 50) == 1)
+        std::cout << "[pv-xy] odin_xy_factor dx=" << (a * dx) << " dy=" << (a * dy)
+                  << " err=(" << (tgt_x - (s.pos(0) - a * dx)) << ","
+                  << (tgt_y - (s.pos(1) - a * dy)) << ")"
+                  << " n=" << n_odin_xy_factor << std::endl;
 }
 
 // Bad-frame hold: map Odin Δxyz into fusion frame (same anchors as z_replace).
@@ -1930,6 +2000,9 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->declare_parameter<bool>("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<bool>("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
+    node->declare_parameter<bool>("dual_tune.odin_xy_factor_en", odin_xy_factor_en);
+    node->declare_parameter<double>("dual_tune.odin_xy_factor_alpha", odin_xy_factor_alpha);
+    node->declare_parameter<double>("dual_tune.odin_xy_factor_max_step", odin_xy_factor_max_step);
     node->declare_parameter<bool>("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
@@ -2020,6 +2093,9 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_factor_en", odin_z_factor_en);
     node->get_parameter("dual_tune.odin_z_replace_en", odin_z_replace_en);
     node->get_parameter("dual_tune.odin_xyz_replace_en", odin_xyz_replace_en);
+    node->get_parameter("dual_tune.odin_xy_factor_en", odin_xy_factor_en);
+    node->get_parameter("dual_tune.odin_xy_factor_alpha", odin_xy_factor_alpha);
+    node->get_parameter("dual_tune.odin_xy_factor_max_step", odin_xy_factor_max_step);
     node->get_parameter("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
@@ -2066,6 +2142,7 @@ int main(int argc, char** argv)
               << " odin_z_factor=" << odin_z_factor_en
               << " odin_z_replace=" << odin_z_replace_en
               << " odin_xyz_replace=" << odin_xyz_replace_en
+              << " odin_xy_factor=" << odin_xy_factor_en
               << " odin_pose_hold_on_bad=" << odin_pose_hold_on_bad
               << " flat_hold=" << odin_z_flat_hold_en
               << " flat_vz_thr=" << odin_z_flat_vz_thr
@@ -2231,15 +2308,17 @@ int main(int argc, char** argv)
         sub_imu2 = node->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic2, odin_imu_qos, imu2_cbk);
     }
-    // Single-Odin PV-LIO also needs Odin odom for Z replace (not only dual).
-    if (odin_z_factor_en || odin_z_replace_en)
+    // Need Odin odom for Z/XY factors, replace, or pose-hold.
+    if (odin_z_factor_en || odin_z_replace_en || odin_xy_factor_en ||
+        odin_pose_hold_on_bad)
     {
         auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
         sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
             odin_odom_topic, odin_odom_qos, odin_odom_cbk);
         std::cout << "[pv-z] subscribe " << odin_odom_topic
                   << " replace=" << odin_z_replace_en
-                  << " factor=" << odin_z_factor_en
+                  << " z_factor=" << odin_z_factor_en
+                  << " xy_factor=" << odin_xy_factor_en
                   << " multi=" << multi_lidar_en << std::endl;
     }
 
@@ -2999,6 +3078,9 @@ int main(int argc, char** argv)
                     apply_odin_z_factor(lidar_end_time);
                     apply_residual_z_hard_clamp();
                 }
+                // Soft Odin XY (scale assist) after Mid IEKF + Z residual.
+                if (!odin_xyz_replace_en)
+                    apply_odin_xy_factor();
                 state_point = kf.get_x();
                 if (iekf_max_vel > 0.0)
                 {

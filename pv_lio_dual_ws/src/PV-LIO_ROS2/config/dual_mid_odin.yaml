@@ -14,37 +14,33 @@
       lidar2_soft_wait_sec: 0.18
       lidar2_bias_ema: 0.0
     preprocess:
+      # Mid: match mid360_go2 / go2_mid360 (was too coarse → return corridor shrink).
       lidar_type: 1
-      scan_line: 6
+      scan_line: 4
       scan_rate: 10
-      blind: 0.5
-      # Match official indoor (avia_indoor): keep every point for denser map.
-      # filter=2 cuts Mid CPU so Odin pairing stays realtime (anti unpaired vanish).
-      point_filter_num: 2
-      min_range: 0.5
-      max_range: 25.0
+      blind: 0.15
+      point_filter_num: 1
+      min_range: 0.15
+      max_range: 80.0
       feature_extract_enable: false
       lidar_type2: 6
-      # filter=1 + range25 doubled Odin (~41k) → Mid lag / No Effective / NaN crash.
-      # Keep filter=2 / 20m for realtime; far density via leaf only.
       point_filter_num2: 2
       blind2: 0.3
       min_range2: 0.3
       max_range2: 20.0
       min_confidence2: 40.0
     mapping:
-      down_sample_size: 0.20
+      down_sample_size: 0.15
       max_iteration: 4
-      voxel_size: 0.5
+      voxel_size: 0.20
       max_layer: 4
       layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
-      plannar_threshold: 0.01
+      plannar_threshold: 0.05
       max_points_size: 1000
       max_cov_points_size: 1000
       fov_degree: 360.0
-      det_range: 30.0
+      det_range: 80.0
       extrinsic_est_en: false
-      # Match go2_mid360 / mid360_go2 (single-Mid that mapped cleanly).
       extrinsic_T: [-0.011, -0.02329, 0.04412]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
@@ -58,12 +54,13 @@
       # Effective scale ≈ lidar2_cov_scale * time/motion_soft / odin_info_weight.
       lidar2_cov_scale: 1.0
     noise_model:
-      ranging_cov: 0.04
-      angle_cov: 0.1
-      acc_cov: 0.2
-      gyr_cov: 0.05
-      b_acc_cov: 0.0043
-      b_gyr_cov: 0.000266
+      # Match go2_mid360 / mid360_go2
+      ranging_cov: 0.02
+      angle_cov: 0.05
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
     publish:
       pub_voxel_map: false
       publish_global_cloud_map: true
