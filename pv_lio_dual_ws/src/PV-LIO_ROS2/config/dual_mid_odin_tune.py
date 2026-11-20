@@ -1,11 +1,14 @@
-# Dual Mid360 + Odin1 — Mid-primary (match mid360_go2 residual_z), Odin densify-only.
+# Dual Mid360 + Odin1 — tight couple (Mid S1 → joint Mid+Odin S2).
 #
-# Lesson from single Mid360 multifloor run:
-#   - residual_z H_z damp + NO flat pin → stairs OK, map clean
-#   - odin_z_replace / pose_hold / att → Z/XY desync, shear, NEP
+# Safety from dual_bal / dual_go2mid lessons:
+#   - soft_wait=0 (yaml): never block Mid waiting for Odin
+#   - Mid filter=2 / voxel=0.25: dual-safe CPU (filter=1 diverged)
+#   - residual_z multilevel: stairs + floor re-lock
+#   - NO odin_z/xy_factor/replace (pose hijack shears map)
 # Fusion policy:
-#   - Pose/LIO = Mid only (same residual_z as mid360_go2)
-#   - Odin points → Global densify under Mid pose (no IEKF / no pose hijack)
+#   - S1: Mid IEKF lock; S2: joint Mid+Odin when time+gyr gates pass
+#   - Reject S2 on jump/clip; moving hard → densify-only that frame
+#   - Odin also Global densify under Mid pose
 
 TUNE = {
     # --- Odin cloud quality ---
@@ -15,16 +18,17 @@ TUNE = {
     "odin_body_z_max": 4.0,
     "odin_static_gyro": 0.08,
 
-    # --- Mid-only IEKF (do NOT joint-update with Odin on stairs) ---
-    "odin_s2_enable": False,
+    # --- Tight couple: Mid S1 then joint S2 (not joint-only) ---
+    "odin_s2_enable": True,
     "odin_joint_only_en": False,
-    "odin_iekf_max_pts": 2000,
-    "odin_iekf_max_end_dt": 0.25,
-    "odin_info_weight": 0.15,
+    "odin_iekf_max_pts": 1200,
+    "odin_iekf_max_end_dt": 0.20,
+    "odin_info_weight": 0.12,
     "odin_range_ref": 8.0,
     "odin_max_residual": 0.05,
-    "odin_s2_gyr_gate": 0.12,
-    "odin_s2_max_clip_ratio": 0.4,
+    # Allow mild walk; hard turn/stairs still densify-only (gyr gate).
+    "odin_s2_gyr_gate": 0.22,
+    "odin_s2_max_clip_ratio": 0.35,
     "shallow_s1_en": True,
     "shallow_s1_end_dt": 0.05,
     "shallow_s1_gyr": 0.08,
@@ -49,14 +53,13 @@ TUNE = {
     "iekf_s2_max_rot": 10.0,
     "consec_bad_freeze": 5,
 
-    # --- Global: Mid densify always; Odin densify only when paired (see code) ---
+    # --- Global densify (paired Odin); S2 reject must not block map fill ---
     "map_jump_upd": 10.0,
     "map_jump_frame": 10.0,
     "map_max_range": 30.0,
     "map_require_still": False,
     "map_still_gyr": 0.12,
     "map_use_downsample": True,
-    # Keep densify for fill, but Mid pose must stay single-Mid quality.
     "odin_global_insert_en": True,
     "odin_global_require_s2": False,
     "odin_body_pub_en": False,
