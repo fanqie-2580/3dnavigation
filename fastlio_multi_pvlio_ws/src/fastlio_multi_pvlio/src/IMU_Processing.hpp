@@ -357,6 +357,17 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   PointCloudXYZI pcl_2_out;
   if (meas.lidar2) pcl_2_out = *(meas.lidar2);
 
+  // Rebase per-point time (curvature, ms) to pcl_beg_time used by IMUpose offs_t.
+  // Mid curvature is vs lidar_beg_time; Odin vs lidar_beg_time2 — without rebase,
+  // Odin deskew uses wrong IMU pose → Bundle smear / drift.
+  auto rebase_curvature = [&](PointCloudXYZI &cloud, double cloud_beg) {
+    const double dt_ms = (cloud_beg - pcl_beg_time) * 1000.0;
+    for (auto &pt : cloud.points) pt.curvature = static_cast<float>(pt.curvature + dt_ms);
+  };
+  rebase_curvature(pcl_1_out, meas.lidar_beg_time);
+  if (!pcl_2_out.points.empty())
+    rebase_curvature(pcl_2_out, meas.lidar_beg_time2);
+
   sort(pcl_1_out.points.begin(), pcl_1_out.points.end(), time_list);
   if (!pcl_2_out.points.empty())
     sort(pcl_2_out.points.begin(), pcl_2_out.points.end(), time_list);

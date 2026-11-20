@@ -48,9 +48,8 @@
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # Mid+Odin Bundle IEKF alone drifts Z/tilt on multifloor; pin Z to Odin odom
-      # (XY/att still from Bundle). Set false to test pure Bundle Z.
-      odin_z_replace_en: true
+      # OFF: Z-pin while Bundle XY drifts caused worse smear (path→600m).
+      odin_z_replace_en: false
       odin_odom_topic: "/odin1/odometry"
 
     noise_model:

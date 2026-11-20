@@ -464,6 +464,8 @@ static void push_lidar2_into_meas(MeasureGroup &meas)
     for (size_t i = 1; i < lidar_buffer2.size(); i++)
         *meas.lidar2 += *lidar_buffer2[i];
     pcl::transformPointCloud(*meas.lidar2, *meas.lidar2, LiDAR2_wrt_LiDAR1);
+    // Tag Odin so RViz Intensity can separate Mid vs Odin.
+    for (auto &pt : meas.lidar2->points) pt.intensity = 200.f;
     meas.lidar_beg_time2 = time_buffer2.front();
     fill_lidar_end_time(meas.lidar2, meas.lidar_beg_time2, lidar_end_time2,
                         lidar_mean_scantime2, scan_num2, "lidar2");
@@ -1126,6 +1128,7 @@ int main(int argc, char** argv)
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
     auto pubLaserCloudFull_body = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 100);
+    auto pubOdinBody = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_odin_body", 100);
     auto pubLaserCloudEffect = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 100);
     auto pubLaserCloudMap = node->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 100);
     auto pubOdomAftMapped = node->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 100);
@@ -1191,6 +1194,24 @@ int main(int argc, char** argv)
                 p_imu->first_lidar_time = first_lidar_time;
                 flg_first_scan = false;
                 continue;
+            }
+
+            // Keep a copy for /cloud_odin_body viz even if we drop L2 from IEKF.
+            PointCloudXYZI::Ptr odin_body_viz(new PointCloudXYZI());
+            if (multi_lidar && Measures.lidar2 && !Measures.lidar2->empty())
+            {
+                *odin_body_viz = *Measures.lidar2;
+                const double end_dt =
+                    std::fabs(Measures.lidar_end_time - Measures.lidar_end_time2);
+                // Bad Mid↔Odin phase → Mid-only IEKF this frame (still show Odin).
+                if (end_dt > 0.05)
+                {
+                    static int n_drop = 0;
+                    if ((++n_drop % 50) == 1)
+                        std::cout << "[bundle] drop L2 IEKF end_dt_ms="
+                                  << end_dt * 1000.0 << " n=" << n_drop << std::endl;
+                    Measures.lidar2->clear();
+                }
             }
 
             p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
@@ -1299,6 +1320,14 @@ int main(int argc, char** argv)
             double rot_norm = 0;
             for (int i = 0; i < 4; i++) rot_norm += rot_coeffs[i] * rot_coeffs[i];
             if (std::isnan(rot_norm) || std::fabs(rot_norm - 1.0) > 0.1) state_bad = true;
+            // Large single-frame jump → restore (Bundle Mid+Odin can yank pose).
+            const double d_upd = (state_point.pos - state_before_update.pos).norm();
+            if (!state_bad && d_upd > 0.35)
+            {
+                state_bad = true;
+                RCLCPP_WARN(node->get_logger(),
+                    "Reject Bundle jump d_upd=%.3f m — restore prior state", d_upd);
+            }
             if (state_bad)
             {
                 RCLCPP_ERROR(node->get_logger(), "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.", pos_norm, rot_norm);
@@ -1306,22 +1335,13 @@ int main(int argc, char** argv)
                 state_point = kf.get_x();
             }
 
-            // Drop Bundle IEKF Δz (floor/near-plane pull), then force Odin odom Z
-            // before map insert so voxels/global cloud use corrected height.
-            if (odin_z_replace_en)
+            // Optional Odin Z pin (default OFF — XY/att must stay consistent).
+            if (odin_z_replace_en && !state_bad)
             {
-                if (!state_bad)
-                {
-                    state_ikfom s = kf.get_x();
-                    const double dz_iekf = s.pos(2) - state_before_update.pos(2);
-                    s.pos(2) = state_before_update.pos(2);
-                    s.vel(2) = 0.0;
-                    kf.change_x(s);
-                    static int n_drop_z = 0;
-                    if ((++n_drop_z % 50) == 1)
-                        std::cout << "[pv-z] drop_iekf_z dz=" << dz_iekf
-                                  << " n=" << n_drop_z << std::endl;
-                }
+                state_ikfom s = kf.get_x();
+                s.pos(2) = state_before_update.pos(2);
+                s.vel(2) = 0.0;
+                kf.change_x(s);
                 apply_odin_z_replace();
                 state_point = kf.get_x();
             }
@@ -1394,6 +1414,15 @@ int main(int argc, char** argv)
                                                  publish_frame_world(pubLaserCloudFull);
 
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            // Always publish Odin body cloud for RViz (even if dropped from IEKF).
+            if (odin_body_viz && !odin_body_viz->empty())
+            {
+                sensor_msgs::msg::PointCloud2 odin_msg;
+                pcl::toROSMsg(*odin_body_viz, odin_msg);
+                odin_msg.header.stamp = sec_to_stamp(lidar_end_time);
+                odin_msg.header.frame_id = "body";
+                pubOdinBody->publish(odin_msg);
+            }
             if (publish_voxel_map) {
                 pubVoxelMap(voxel_map, publish_max_voxel_layer, voxel_map_pub);
             }
