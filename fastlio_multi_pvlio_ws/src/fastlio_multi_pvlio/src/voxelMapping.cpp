@@ -1349,13 +1349,16 @@ int main(int argc, char** argv)
             double rot_norm = 0;
             for (int i = 0; i < 4; i++) rot_norm += rot_coeffs[i] * rot_coeffs[i];
             if (std::isnan(rot_norm) || std::fabs(rot_norm - 1.0) > 0.1) state_bad = true;
-            // Large single-frame jump → restore (Bundle Mid+Odin can yank pose).
+            // Bundle Mid+Odin can yank pose: run5 late corridor had |Δz|≈1.4 m in ~1.7 s
+            // while XY barely moved (re-couple after Mid-only). Reject those updates.
             const double d_upd = (state_point.pos - state_before_update.pos).norm();
-            if (!state_bad && d_upd > 0.35)
+            const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
+            if (!state_bad && (d_upd > 0.25 || std::fabs(dz_upd) > 0.12))
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
-                    "Reject Bundle jump d_upd=%.3f m — restore prior state", d_upd);
+                    "Reject Bundle jump d_upd=%.3f dz=%.3f m — restore prior state",
+                    d_upd, dz_upd);
             }
             if (state_bad)
             {
@@ -1382,7 +1385,9 @@ int main(int argc, char** argv)
             geoQuat.z = state_point.rot.coeffs()[2];
             geoQuat.w = state_point.rot.coeffs()[3];
 
-            /*** add the points to the voxel map ***/
+            /*** add the points to the voxel map (skip if update was rejected) ***/
+            if (!state_bad)
+            {
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             transformLidar(state_point, feats_down_body, world_lidar);
@@ -1391,17 +1396,6 @@ int main(int argc, char** argv)
                 *global_cloud_map += *world_lidar;
             }
 
-            // std::cout << "result----x: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2)
-            //             << " " << euler_cur[0] << " " << euler_cur[1] << " " << euler_cur[2] << std::endl;
-            // Print online-estimated LiDAR-IMU extrinsic
-            Eigen::Vector3d ext_t = state_point.offset_T_L_I;
-            auto ext_q_coeffs = state_point.offset_R_L_I.coeffs(); // [x, y, z, w]
-            Eigen::Quaterniond ext_q(ext_q_coeffs[3], ext_q_coeffs[0], ext_q_coeffs[1], ext_q_coeffs[2]);
-            Eigen::Matrix3d ext_R = ext_q.toRotationMatrix();
-            // std::cout << "extrinsic_T: [" << ext_t(0) << ", " << ext_t(1) << ", " << ext_t(2) << "]"
-            //           << "  extrinsic_R (quat wxyz): [" << ext_q.w() << ", " << ext_q.x() << ", " << ext_q.y() << ", " << ext_q.z() << "]"
-            //           << "  R_pitch(y-deg): " << (std::asin(ext_R(0,2)) * 180.0 / M_PI)
-            //           << std::endl;
             for (size_t i = 0; i < feats_down_body->size(); i++) {
                 pointWithCov pv;
                 pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
@@ -1420,6 +1414,7 @@ int main(int argc, char** argv)
                            voxel_map);
             t_update_end = omp_get_wtime();
             sum_update_time += t_update_end - t_update_start;
+            }
 
             scan_index++;
             if (scan_index % 20 == 0) {
