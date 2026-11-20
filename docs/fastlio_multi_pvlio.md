@@ -29,7 +29,7 @@
 
 `lidar2_soft_wait` 可能在一个 Mid 帧下攒多帧 Odin。若把 buffer 全部 `+=` 进 Bundle，会出现 `l2_pts≈2×` 的坏更新并触发 Divergence。现改为只取与 Mid 结束时刻最近的**一帧** Odin。
 
-回程末段另见：Mid-only 后再接回 Bundle 时，Odin 可在 XY 几乎不动的情况下把 **Z 在 ~2s 内拉高 >1 m**。现对单帧 `|Δz|>0.12` 或 `d_upd>0.25` 拒更，且拒更帧不写入体素/全局图。
+回程末段另见：Mid-only 后再接回 Bundle 时，Odin 可在 XY 几乎不动的情况下把 **Z 在 ~2s 内拉高 >1 m**。仅对**含 Odin** 的帧做 `|Δz|>0.15` / `d_upd>0.35` 拒更；拒更后仍写入 Mid 点（避免 skip-map → No Effective Points → IMU 崩，见 run6）。
 
 ## 构建 / 运行
 

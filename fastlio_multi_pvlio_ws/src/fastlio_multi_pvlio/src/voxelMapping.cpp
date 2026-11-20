@@ -1349,16 +1349,27 @@ int main(int argc, char** argv)
             double rot_norm = 0;
             for (int i = 0; i < 4; i++) rot_norm += rot_coeffs[i] * rot_coeffs[i];
             if (std::isnan(rot_norm) || std::fabs(rot_norm - 1.0) > 0.1) state_bad = true;
-            // Bundle Mid+Odin can yank pose: run5 late corridor had |Δz|≈1.4 m in ~1.7 s
-            // while XY barely moved (re-couple after Mid-only). Reject those updates.
+            // Joint Bundle only: Odin re-couple can yank Z with tiny XY (run5 ~+1.4 m / 2 s).
+            // Do NOT starve the map on reject (run6: skip-map → No Effective Points → IMU blow-up).
+            bool had_l2 = false;
+            for (const auto &pt : feats_down_body->points)
+            {
+                if (pt.intensity > 150.f) { had_l2 = true; break; }
+            }
             const double d_upd = (state_point.pos - state_before_update.pos).norm();
             const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
-            if (!state_bad && (d_upd > 0.25 || std::fabs(dz_upd) > 0.12))
+            if (!state_bad && had_l2 && (d_upd > 0.35 || std::fabs(dz_upd) > 0.15))
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
-                    "Reject Bundle jump d_upd=%.3f dz=%.3f m — restore prior state",
+                    "Reject Bundle jump d_upd=%.3f dz=%.3f m (L2) — restore prior state",
                     d_upd, dz_upd);
+            }
+            else if (!state_bad && !had_l2 && d_upd > 0.50)
+            {
+                state_bad = true;
+                RCLCPP_WARN(node->get_logger(),
+                    "Reject Mid jump d_upd=%.3f m — restore prior state", d_upd);
             }
             if (state_bad)
             {
@@ -1385,21 +1396,30 @@ int main(int argc, char** argv)
             geoQuat.z = state_point.rot.coeffs()[2];
             geoQuat.w = state_point.rot.coeffs()[3];
 
-            /*** add the points to the voxel map (skip if update was rejected) ***/
-            if (!state_bad)
-            {
+            /*** add the points to the voxel map ***/
+            // On Bundle reject: insert Mid-only (intensity<=150) so the map keeps matching.
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-            transformLidar(state_point, feats_down_body, world_lidar);
+            PointCloudXYZI::Ptr body_for_map(feats_down_body);
+            PointCloudXYZI::Ptr body_mid_only;
+            if (state_bad && had_l2)
+            {
+                body_mid_only.reset(new PointCloudXYZI());
+                body_mid_only->reserve(feats_down_body->size());
+                for (const auto &pt : feats_down_body->points)
+                    if (pt.intensity <= 150.f) body_mid_only->push_back(pt);
+                body_for_map = body_mid_only;
+            }
+            transformLidar(state_point, body_for_map, world_lidar);
             {
                 std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
                 *global_cloud_map += *world_lidar;
             }
 
-            for (size_t i = 0; i < feats_down_body->size(); i++) {
+            for (size_t i = 0; i < body_for_map->size(); i++) {
                 pointWithCov pv;
-                pv.point << feats_down_body->points[i].x, feats_down_body->points[i].y, feats_down_body->points[i].z;
-                M3D cov_lidar = var_down_body[i];
+                pv.point << body_for_map->points[i].x, body_for_map->points[i].y, body_for_map->points[i].z;
+                M3D cov_lidar = calcBodyCov(pv.point, ranging_cov, angle_cov);
                 M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
 
                 pv.cov = cov_world;
@@ -1414,7 +1434,6 @@ int main(int argc, char** argv)
                            voxel_map);
             t_update_end = omp_get_wtime();
             sum_update_time += t_update_end - t_update_start;
-            }
 
             scan_index++;
             if (scan_index % 20 == 0) {
