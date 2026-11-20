@@ -44,7 +44,8 @@
       fov_degree: 360.0
       det_range: 30.0
       extrinsic_est_en: false
-      extrinsic_T: [0.0, 0.0, 0.0]
+      # Match go2_mid360 / mid360_go2 (single-Mid that mapped cleanly).
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       # Ground calib: map verify 2026-11-17 — Global Odin≈Mid+2cm → Tz↓2cm.
       # Absolute Mid ground still ~-0.25m (body Odin near floor ~-0.29m); Mid pitch TBD.
