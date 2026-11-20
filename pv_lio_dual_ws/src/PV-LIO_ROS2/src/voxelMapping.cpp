@@ -195,6 +195,9 @@ bool odin_pose_hold_on_bad = true;
 // and re-anchor offset so onboard slow sink is absorbed (not tracked).
 bool odin_z_flat_hold_en = true;
 double odin_z_flat_vz_thr = 0.03; // m/s; stairs ~0.1, upper-floor sink ~0.002
+// Multifloor: Z-only Odin replace left Mid roll/pitch → tilted cloud + NEP.
+// Map Odin odom attitude into fusion via init R_align (R_mid = R_align * R_odin).
+bool odin_att_replace_en = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
 double odin_z_factor_max_dt = 0.30;
@@ -212,7 +215,14 @@ double odin_odom_stamp = -1.0;
 double odin_odom_x = 0.0;
 double odin_odom_y = 0.0;
 double odin_odom_z = 0.0;
+double odin_odom_qw = 1.0;
+double odin_odom_qx = 0.0;
+double odin_odom_qy = 0.0;
+double odin_odom_qz = 0.0;
 bool odin_odom_have = false;
+bool odin_att_align_valid = false;
+Eigen::Matrix3d odin_R_align = Eigen::Matrix3d::Identity();
+long long n_odin_att_replace = 0;
 double last_pf_mid_z = 0.0;
 double last_pf_odin_z = 0.0;
 double last_pf_odin_stamp = -1.0;
@@ -361,7 +371,52 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_x = msg->pose.pose.position.x;
     odin_odom_y = msg->pose.pose.position.y;
     odin_odom_z = msg->pose.pose.position.z;
+    odin_odom_qw = msg->pose.pose.orientation.w;
+    odin_odom_qx = msg->pose.pose.orientation.x;
+    odin_odom_qy = msg->pose.pose.orientation.y;
+    odin_odom_qz = msg->pose.pose.orientation.z;
     odin_odom_have = true;
+}
+
+Eigen::Matrix3d odin_odom_R_locked()
+{
+    Eigen::Quaterniond q(odin_odom_qw, odin_odom_qx, odin_odom_qy, odin_odom_qz);
+    if (q.norm() < 1e-6)
+        return Eigen::Matrix3d::Identity();
+    q.normalize();
+    return q.toRotationMatrix();
+}
+
+// Write fusion attitude from Odin odom (init-aligned). Returns true if applied.
+bool apply_odin_att_replace(state_ikfom &s)
+{
+    if (!odin_att_replace_en)
+        return false;
+    Eigen::Matrix3d R_o;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return false;
+        R_o = odin_odom_R_locked();
+    }
+    if (!odin_att_align_valid)
+    {
+        odin_R_align = s.rot.toRotationMatrix() * R_o.transpose();
+        odin_att_align_valid = true;
+        std::cout << "[pv-z] odin_att_replace init align" << std::endl;
+    }
+    Eigen::Quaterniond qm(odin_R_align * R_o);
+    qm.normalize();
+    s.rot = SO3(qm);
+    ++n_odin_att_replace;
+    if ((n_odin_att_replace % 50) == 1)
+    {
+        const vect3 ypr = SO3ToEuler(s.rot);
+        std::cout << "[pv-z] odin_att_replace ypr=(" << ypr[0] << ","
+                  << ypr[1] << "," << ypr[2] << ") n=" << n_odin_att_replace
+                  << std::endl;
+    }
+    return true;
 }
 
 // Signed (target - fusion_z): >0 means fusion below Odin (needs raise).
@@ -466,6 +521,7 @@ void apply_odin_z_replace(double /*stamp*/)
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
+    apply_odin_att_replace(s);
     kf.change_x(s);
     ++n_odin_z_factor;
     last_pf_mid_z = z_new;
@@ -539,6 +595,7 @@ bool apply_odin_pose_hold_on_bad()
         last_pf_odin_stamp = t_o;
     }
     s.vel.setZero();
+    apply_odin_att_replace(s);
     kf.change_x(s);
     ++n_odin_pose_hold;
     if ((n_odin_pose_hold % 50) == 1)
@@ -1712,6 +1769,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
+    node->declare_parameter<bool>("dual_tune.odin_att_replace_en", odin_att_replace_en);
     node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->declare_parameter<double>("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1797,6 +1855,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_pose_hold_on_bad", odin_pose_hold_on_bad);
     node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
+    node->get_parameter("dual_tune.odin_att_replace_en", odin_att_replace_en);
     node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
     node->get_parameter("dual_tune.odin_z_factor_max_dt", odin_z_factor_max_dt);
@@ -1839,6 +1898,7 @@ int main(int argc, char** argv)
               << " odin_pose_hold_on_bad=" << odin_pose_hold_on_bad
               << " flat_hold=" << odin_z_flat_hold_en
               << " flat_vz_thr=" << odin_z_flat_vz_thr
+              << " odin_att_replace=" << odin_att_replace_en
               << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
               << " catch_err=" << odin_z_factor_catch_err

@@ -1,8 +1,8 @@
 # Dual Mid360 + Odin1 PV-LIO runtime knobs (edit → restart launch, no rebuild).
 # Loaded by mapping_dual_mid_odin.launch.py → ROS params under dual_tune.*.
 #
-# Multifloor/stairs: pose Z follows /odin1/odometry (init-aligned Δz).
-# No residual_z/band (kills climb). No flat_hold (re-anchor corrupted offset).
+# Multifloor/stairs: pose Z + attitude follow /odin1/odometry (init-aligned).
+# Z-only left Mid roll/pitch → tilted cloud + upstairs NEP/drift.
 
 TUNE = {
     # --- Odin cloud quality (mild) ---
@@ -59,7 +59,7 @@ TUNE = {
     "odin_global_require_s2": False,
     "odin_body_pub_en": True,
 
-    # --- Multifloor Z: pure Odin odom Z (init-aligned). Trust /odin1/odometry. ---
+    # --- Multifloor: Odin odom Z + attitude (init-aligned). ---
     "residual_z_en": False,
     "residual_z_flat_z_alpha": 0.0,
     "residual_z_flat_vz_alpha": 0.0,
@@ -78,6 +78,7 @@ TUNE = {
     # flat_hold OFF: re-anchoring made fusion sink meters while Odin stayed high.
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,
+    "odin_att_replace_en": True,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,
     "odin_z_factor_max_dt": 0.30,
