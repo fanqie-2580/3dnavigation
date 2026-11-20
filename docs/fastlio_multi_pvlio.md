@@ -31,7 +31,7 @@
 
 回程末段另见：Mid-only 后再接回 Bundle 时，Odin 可在 XY 几乎不动的情况下把 **Z 在 ~2s 内拉高 >1 m**。仅对**含 Odin** 的帧做 `|Δz|>0.15` / `d_upd>0.35` 拒更；拒更后仍写入 Mid 点（避免 skip-map → No Effective Points → IMU 崩，见 run6）。
 
-run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）、横向偏≈1.5 m → 叠影。现加 `odin_bundle_z_band`（默认 1.8 m）：IEKF 前丢掉 world-Z 远离当前 pose 的 Odin 点，避免跨层匹配。
+run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）、横向偏≈1.5 m → 叠影。曾加 `odin_bundle_z_band`，但 run9 中 band 跟着错误 Z 下沉 → `No Effective Points` → IMU 自由落体（z→−2900）。现默认 band=0；匹配失效时冻结 last_good 并短暂 Mid-only。
 
 ## 构建 / 运行
 

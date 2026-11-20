@@ -125,8 +125,13 @@ double odin_z_anchor_odin = 0.0;
 long long n_odin_z_replace = 0;
 // Keep Odin Bundle points within |world_z - pose_z| band so IEKF cannot match
 // other floors (run7: same corridor y≈-40 outbound z≈4.9 vs return z≈1.0).
-double odin_bundle_z_band = 1.8;
+double odin_bundle_z_band = 0.0; // 0=off; >0 filters Odin by |world_z-pose_z|
 long long n_odin_z_band_drop = 0;
+// After No Effective Points / Bundle reject: Mid-only for N scans + freeze vel.
+int force_mid_only_scans = 0;
+state_ikfom last_good_state;
+bool have_last_good_state = false;
+int consecutive_neff = 0;
 
 
 vector<vector<int>>  pointSearchInd_surf;
@@ -1250,6 +1255,13 @@ int main(int argc, char** argv)
                     Measures.lidar2->clear();
                 }
             }
+            // After matching failure / jump reject: stay Mid-only briefly.
+            if (force_mid_only_scans > 0)
+            {
+                if (Measures.lidar2 && !Measures.lidar2->empty())
+                    Measures.lidar2->clear();
+                --force_mid_only_scans;
+            }
 
             p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
 
@@ -1417,24 +1429,65 @@ int main(int argc, char** argv)
             }
             const double d_upd = (state_point.pos - state_before_update.pos).norm();
             const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
-            if (!state_bad && had_l2 && (d_upd > 0.35 || std::fabs(dz_upd) > 0.15))
+            const double vel_n = state_point.vel.norm();
+            if (!state_bad && had_l2 && (d_upd > 0.30 || std::fabs(dz_upd) > 0.12))
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
                     "Reject Bundle jump d_upd=%.3f dz=%.3f m (L2) — restore prior state",
                     d_upd, dz_upd);
             }
-            else if (!state_bad && !had_l2 && d_upd > 0.35)
+            else if (!state_bad && !had_l2 && d_upd > 0.30)
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
                     "Reject Mid jump d_upd=%.3f m — restore prior state", d_upd);
             }
+            // Walking platform: |v|>>3 m/s is almost always divergence.
+            if (!state_bad && vel_n > 3.0)
+            {
+                state_bad = true;
+                RCLCPP_WARN(node->get_logger(),
+                    "Reject velocity |v|=%.2f m/s — restore prior state", vel_n);
+            }
+            // No Effective Points: IMU-only prediction runs away (run9 z→-2900).
+            if (effct_feat_num < 1)
+            {
+                ++consecutive_neff;
+                state_bad = true;
+            }
+            else
+            {
+                consecutive_neff = 0;
+            }
             if (state_bad)
             {
                 RCLCPP_ERROR(node->get_logger(), "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.", pos_norm, rot_norm);
-                kf.change_x(state_before_update);
+                if (have_last_good_state && consecutive_neff >= 2)
+                {
+                    state_ikfom frozen = last_good_state;
+                    frozen.vel.setZero();
+                    kf.change_x(frozen);
+                    force_mid_only_scans = std::max(force_mid_only_scans, 40);
+                    static int n_freeze = 0;
+                    if ((++n_freeze % 20) == 1)
+                        std::cout << "[bundle] freeze last_good neff=" << consecutive_neff
+                                  << " mid_only_left=" << force_mid_only_scans << std::endl;
+                }
+                else
+                {
+                    state_ikfom restored = state_before_update;
+                    restored.vel.setZero();
+                    kf.change_x(restored);
+                }
                 state_point = kf.get_x();
+                if (had_l2)
+                    force_mid_only_scans = std::max(force_mid_only_scans, 20);
+            }
+            else if (effct_feat_num >= 15)
+            {
+                last_good_state = state_point;
+                have_last_good_state = true;
             }
 
             // Optional Odin Z pin (default OFF — XY/att must stay consistent).
