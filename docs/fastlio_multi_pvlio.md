@@ -53,6 +53,19 @@ run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）
 `map_mid_only=0 ml_h_min=1 floor_info=0.45`；joint≈89.5%，z∈[−5.2,9.18]，Reject=2；  
 y≈−40 Δx≈0.89 / Δz≈−2.51。截图 `rviz_shot{1,2,3}.png`。
 
+**Odin Z 软因子（`/odin1/odometry` Δz）**：
+- 全程 soft follow；`|err|>2.5` 时丢掉楼面观测再加强 catch；`|err|>3.5` snap。
+- **禁止**全局 mute `H_z`（run20 原点卡死）或一直 drop floors（run21/22 XY 抖）。
+- 速度门改为钳位而非整帧 Reject；jump 门在 factor 开启时只看 XY。
+- freeze/restore 后仍施加 Odin Z（避免 state_bad 跳过因子 → 末段自由落体）。
+
+**run25（1×+RViz）**：`/tmp/fastlio_multi_pvlio_run25/`  
+早期 XY≈run16（t=30≈12.9/−1.8）；楼梯 `|z−odin|` mean≈0.30、峰≈3.74（Odin≈3.87，远好于 run16 峰 9.2）。  
+末段仍下沉（z→−6），远段 XY 略胀（x→50）。joint≈90%，Div≈18。
+
+**run27（run25 软参 + freeze 后仍修 Z + 大误差 snap）**：`/tmp/fastlio_multi_pvlio_run27/`  
+早期/楼梯仍可用；末段 z→−4.8（略好于 run25）；Div=1；远段 y 胀到 ≈−118（变差）。截图 `rviz_shot{1,2,3}.png`。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。

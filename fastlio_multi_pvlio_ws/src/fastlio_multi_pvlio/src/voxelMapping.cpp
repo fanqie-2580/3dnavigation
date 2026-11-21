@@ -110,9 +110,14 @@ bool   multi_lidar = false;
 double lidar2_soft_wait_sec = 0.18;
 double bundle_l1_push_wall = -1.0;
 
-// Hard Z replace (pose Z := Odin odom) breaks Bundle map/XY consistency
-// (run11). Prefer residual_z floor dampening like dual go2 instead.
+// Hard Z replace (pose Z := Odin odom) breaks Bundle map/XY (run11).
+// Soft factor: follow Odin Δz with tiny steps — run16 Mid peak~9m then sink
+// to -5 while Odin peak~3.9m and returns to ~0.2 (correct same-floor).
 bool odin_z_replace_en = false;
+bool odin_z_factor_en = true;
+double odin_z_factor_alpha = 0.45;
+double odin_z_factor_max_step = 0.035; // m/frame @~10Hz ≈ 0.35 m/s catch-up
+double odin_z_factor_max_dt = 0.35;
 std::string odin_odom_topic = "/odin1/odometry";
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
@@ -122,6 +127,10 @@ bool odin_z_anchor_ok = false;
 double odin_z_anchor_mid = 0.0;
 double odin_z_anchor_odin = 0.0;
 long long n_odin_z_replace = 0;
+long long n_odin_z_factor = 0;
+// |MidZ−OdinTarget| large → drop floors this frame + stronger catch (run22).
+bool odin_z_catch_active = false;
+double odin_z_last_err = 0.0;
 // Keep Odin Bundle points within |world_z - pose_z| band so IEKF cannot match
 // other floors (run7: same corridor y≈-40 outbound z≈4.9 vs return z≈1.0).
 double odin_bundle_z_band = 0.0; // 0=off; >0 filters Odin by |world_z-pose_z|
@@ -255,7 +264,7 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
-// z_fusion = z_fusion0 + (z_odin - z_odin0). Optional only; default OFF.
+// Hard replace (legacy). Prefer apply_odin_z_factor.
 void apply_odin_z_replace()
 {
     if (!odin_z_replace_en)
@@ -296,6 +305,72 @@ void apply_odin_z_replace()
                   << " odin_z=" << z_o
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
                   << " n=" << n_odin_z_replace << std::endl;
+}
+
+// Soft Z: z ← z + α·clip( (z0_mid+Δodin) − z , ±max_step ).
+// Trusts Odin floor schedule (stairs ~+3.9m, return ~0) without XY hijack.
+void apply_odin_z_factor(double mid_stamp)
+{
+    if (!odin_z_factor_en)
+        return;
+    double z_o = 0.0, t_o = -1.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        z_o = odin_odom_z;
+        t_o = odin_odom_stamp;
+    }
+    if (odin_z_factor_max_dt > 0.0 && t_o > 0.0 &&
+        std::fabs(t_o - mid_stamp) > odin_z_factor_max_dt)
+        return;
+
+    state_ikfom s = kf.get_x();
+    if (!odin_z_anchor_ok)
+    {
+        odin_z_anchor_mid = s.pos(2);
+        odin_z_anchor_odin = z_o;
+        odin_z_anchor_ok = true;
+        std::cout << "[pv-z] odin_z_factor init mid_z=" << odin_z_anchor_mid
+                  << " odin_z=" << odin_z_anchor_odin
+                  << " step=" << odin_z_factor_max_step
+                  << " alpha=" << odin_z_factor_alpha << std::endl;
+        return;
+    }
+    const double odin_dz = z_o - odin_z_anchor_odin;
+    const double target_z = odin_z_anchor_mid + odin_dz;
+    double raw = target_z - s.pos(2);
+    odin_z_last_err = raw;
+    // Soft follow (run25 params). Floor-drop |err|>2.5; snap only |err|>3.5 (late sink).
+    odin_z_catch_active = (std::fabs(raw) > 2.5);
+    if (std::fabs(raw) < 0.08)
+        return;
+    double max_step = std::max(0.02, odin_z_factor_max_step);
+    double a = std::max(0.0, std::min(1.0, odin_z_factor_alpha));
+    if (odin_z_catch_active)
+    {
+        max_step = std::max(max_step, 0.12);
+        a = std::max(a, 0.85);
+    }
+    if (std::fabs(raw) > 3.5)
+    {
+        max_step = std::max(max_step, 0.22);
+        a = 1.0;
+    }
+    double innov = raw;
+    if (std::fabs(innov) > max_step)
+        innov = std::copysign(max_step, innov);
+    s.pos(2) += a * innov;
+    s.vel(2) = 0.0;
+    kf.change_x(s);
+    ++n_odin_z_factor;
+    if ((n_odin_z_factor % 50) == 1)
+        std::cout << "[pv-z] odin_z_factor innov=" << (a * innov)
+                  << " tgt=" << target_z << " z=" << s.pos(2)
+                  << " odin_dz=" << odin_dz
+                  << " err=" << raw
+                  << " catch=" << odin_z_catch_active
+                  << " n=" << n_odin_z_factor << std::endl;
 }
 
 // go2 residual_z post-update (ported from dual): single-level flat pull;
@@ -347,11 +422,15 @@ void apply_residual_z_flat()
         const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
         s.vel(2) *= (1.0 - av);
         s.ba(2) *= (1.0 - ab);
-        double step = az * (residual_z_flat_z_ref - s.pos(2));
-        if (residual_z_flat_max_step > 0.0 &&
-            std::fabs(step) > residual_z_flat_max_step)
-            step = std::copysign(residual_z_flat_max_step, step);
-        s.pos(2) += step;
+        // When Odin Z factor is on, skip flat_ref position pull (would fight Odin).
+        if (!odin_z_factor_en)
+        {
+            double step = az * (residual_z_flat_z_ref - s.pos(2));
+            if (residual_z_flat_max_step > 0.0 &&
+                std::fabs(step) > residual_z_flat_max_step)
+                step = std::copysign(residual_z_flat_max_step, step);
+            s.pos(2) += step;
+        }
     }
     else
     {
@@ -989,9 +1068,10 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
 
         V3D norm_vec(ptpl_list[i].normal);
         const bool is_odin_pt = (ptpl_list[i].lidar_src == 1);
-        const bool is_floor =
-            residual_z_en && !is_odin_pt &&
+        const bool is_floor_like =
             std::fabs(norm_vec.z()) > residual_z_floor_nz_thr;
+        const bool is_floor =
+            residual_z_en && !is_odin_pt && is_floor_like;
 
         V3D C(s.rot.conjugate() *norm_vec);
         V3D A(point_crossmat * C);
@@ -1009,6 +1089,16 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + norm_vec.y() * ptpl_list[i].point_world.y()
                 + norm_vec.z() * ptpl_list[i].point_world.z()
                 + ptpl_list[i].d;
+
+        // Only while catching Mid↔Odin Z error: drop floor planes so they
+        // cannot fight the post-IEKF Z pull (or leak into XY).
+        if (odin_z_factor_en && odin_z_catch_active && is_floor_like)
+        {
+            ekfom_data.h(i) = 0.0;
+            ekfom_data.h_x.row(i).setZero();
+            ekfom_data.R(i) = 1e-12;
+            continue;
+        }
 
         // Bundle: clip large Odin residuals (ghost floor / far plane).
         if (is_odin_pt && std::fabs(pd2) > odin_max_residual)
@@ -1037,8 +1127,10 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
 
         if (is_floor)
         {
-            const double sc =
+            double sc =
                 std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
+            if (odin_z_factor_en)
+                sc = std::min(sc, 0.22);
             R_inv *= sc;
         }
         if (is_odin_pt)
@@ -1119,8 +1211,6 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
             const double move = std::fabs(dz_floor);
             const double stable =
                 std::exp(-0.5 * (move / tol) * (move / tol));
-            // Bundle: joint IEKF + Odin can bias floors. Full H_z after stairs
-            // sank Z on long corridors (run12); too-low H_z hurt re-lock (run14).
             const double zmin = residual_z_multilevel
                                     ? std::max(0.0, std::min(1.0, residual_z_multilevel_h_min))
                                     : std::max(0.0, std::min(1.0, residual_z_h_dampen));
@@ -1225,6 +1315,10 @@ int main(int argc, char** argv)
                             0.0000000, 1.0000000, 0.0000000,
                             0.2385335, 0.0000000, 0.9711343});
     node->declare_parameter<bool>("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->declare_parameter<bool>("mapping.odin_z_factor_en", odin_z_factor_en);
+    node->declare_parameter<double>("mapping.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->declare_parameter<double>("mapping.odin_z_factor_max_step", odin_z_factor_max_step);
+    node->declare_parameter<double>("mapping.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->declare_parameter<std::string>("mapping.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->declare_parameter<double>("mapping.bundle_end_dt_max", bundle_end_dt_max);
@@ -1258,6 +1352,10 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2);
     node->get_parameter("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2);
     node->get_parameter("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->get_parameter("mapping.odin_z_factor_en", odin_z_factor_en);
+    node->get_parameter("mapping.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->get_parameter("mapping.odin_z_factor_max_step", odin_z_factor_max_step);
+    node->get_parameter("mapping.odin_z_factor_max_dt", odin_z_factor_max_dt);
     node->get_parameter("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->get_parameter("mapping.odin_odom_topic", odin_odom_topic);
     node->get_parameter("mapping.bundle_end_dt_max", bundle_end_dt_max);
@@ -1377,6 +1475,7 @@ int main(int argc, char** argv)
                   << " residual_z=" << residual_z_en
                   << " map_mid_only=" << bundle_map_mid_only
                   << " ml_h_min=" << residual_z_multilevel_h_min
+                  << " odin_z_factor=" << odin_z_factor_en
                   << " odin_z_replace=" << odin_z_replace_en
                   << " odin_bundle_z_band=" << odin_bundle_z_band
                   << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
@@ -1409,13 +1508,14 @@ int main(int argc, char** argv)
         imu_topic, imu_qos, imu_cbk);
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odin_odom;
-    if (odin_z_replace_en)
+    if (odin_z_factor_en || odin_z_replace_en)
     {
         auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
         sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
             odin_odom_topic, odin_odom_qos, odin_odom_cbk);
         std::cout << "[pv-z] subscribe " << odin_odom_topic
-                  << " replace=1 (pose Z from Odin odom)" << std::endl;
+                  << " factor=" << odin_z_factor_en
+                  << " replace=" << odin_z_replace_en << std::endl;
     }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -1702,29 +1802,42 @@ int main(int argc, char** argv)
             {
                 if (pt.intensity >= 400.f) { had_l2 = true; break; }
             }
-            const double d_upd = (state_point.pos - state_before_update.pos).norm();
-            const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
+            const Eigen::Vector3d dpos = state_point.pos - state_before_update.pos;
+            const double d_xy = std::hypot(dpos(0), dpos(1));
+            const double d_upd = dpos.norm();
+            const double dz_upd = dpos(2);
             const double vel_n = state_point.vel.norm();
+            // When Odin owns Z, ignore IEKF Δz in jump gate (post-factor fixes Z).
+            const double d_gate = odin_z_factor_en ? d_xy : d_upd;
+            const double dz_gate = odin_z_factor_en ? 1e9 : bundle_l2_dz_reject;
             if (!state_bad && had_l2 &&
-                (d_upd > bundle_l2_d_reject || std::fabs(dz_upd) > bundle_l2_dz_reject))
+                (d_gate > bundle_l2_d_reject || std::fabs(dz_upd) > dz_gate))
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
-                    "Reject Bundle jump d_upd=%.3f dz=%.3f m (L2) — restore prior state",
-                    d_upd, dz_upd);
+                    "Reject Bundle jump d_upd=%.3f d_xy=%.3f dz=%.3f m (L2) — restore prior state",
+                    d_upd, d_xy, dz_upd);
             }
-            else if (!state_bad && !had_l2 && d_upd > 0.30)
+            else if (!state_bad && !had_l2 && d_gate > 0.30)
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
-                    "Reject Mid jump d_upd=%.3f m — restore prior state", d_upd);
+                    "Reject Mid jump d_upd=%.3f d_xy=%.3f m — restore prior state",
+                    d_upd, d_xy);
             }
-            // Walking platform: |v|>>3 m/s is almost always divergence.
-            if (!state_bad && vel_n > 3.0)
+            // Clamp absurd velocity instead of full-frame reject (run23 freeze→XY stall).
             {
-                state_bad = true;
-                RCLCPP_WARN(node->get_logger(),
-                    "Reject velocity |v|=%.2f m/s — restore prior state", vel_n);
+                const double vxy = std::hypot(state_point.vel(0), state_point.vel(1));
+                const double vlim = odin_z_factor_en ? 4.0 : 3.0;
+                if (!state_bad && (vxy > vlim || std::fabs(state_point.vel(2)) > vlim))
+                {
+                    RCLCPP_WARN_THROTTLE(
+                        node->get_logger(), *node->get_clock(), 2000,
+                        "Clamp velocity |v|=%.2f |vxy|=%.2f → 0 (keep pose)",
+                        vel_n, vxy);
+                    state_point.vel.setZero();
+                    kf.change_x(state_point);
+                }
             }
             // No Effective Points: IMU-only prediction runs away (run9 z→-2900).
             if (effct_feat_num < 1)
@@ -1739,12 +1852,15 @@ int main(int argc, char** argv)
             if (state_bad)
             {
                 RCLCPP_ERROR(node->get_logger(), "Divergence detected (pos_norm=%.1f, rot_norm=%.4f)! Restoring previous state.", pos_norm, rot_norm);
-                if (have_last_good_state && consecutive_neff >= 2)
+                // run18: Reject/Div spiral walked away because only neff>=2 froze.
+                // Any bad update → prefer last_good and Mid-only briefly.
+                if (have_last_good_state)
                 {
                     state_ikfom frozen = last_good_state;
                     frozen.vel.setZero();
                     kf.change_x(frozen);
-                    force_mid_only_scans = std::max(force_mid_only_scans, 40);
+                    // run21: 30 Mid-only frames after every vel reject killed joint%.
+                    force_mid_only_scans = std::max(force_mid_only_scans, 8);
                     static int n_freeze = 0;
                     if ((++n_freeze % 20) == 1)
                         std::cout << "[bundle] freeze last_good neff=" << consecutive_neff
@@ -1766,16 +1882,22 @@ int main(int argc, char** argv)
                 have_last_good_state = true;
             }
 
-            // Optional hard Z replace (default OFF). Prefer residual_z below.
-            if (odin_z_replace_en && !state_bad)
-            {
-                apply_odin_z_replace();
-                state_point = kf.get_x();
-            }
-            // Soft Z / vz damp (dual residual_z) — keeps Bundle map consistent.
+            // Soft Z / vz damp first (floor), then Odin odom soft factor.
             if (residual_z_en && !state_bad)
             {
                 apply_residual_z_flat();
+                state_point = kf.get_x();
+            }
+            // Apply Odin Z even after freeze/restore — run25 late sink skipped factor
+            // on state_bad and fell to z≈−6 while Odin≈0.
+            if (odin_z_factor_en)
+            {
+                apply_odin_z_factor(lidar_end_time);
+                state_point = kf.get_x();
+            }
+            else if (odin_z_replace_en && !state_bad)
+            {
+                apply_odin_z_replace();
                 state_point = kf.get_x();
             }
 
@@ -1787,44 +1909,47 @@ int main(int argc, char** argv)
             geoQuat.w = state_point.rot.coeffs()[3];
 
             /*** add the points to the voxel map ***/
-            // Default: Mid-only map (Bundle IEKF still joint). Inserting Odin into
-            // the voxel map caused corridor ghost walls (run14 RViz).
-            std::vector<pointWithCov> pv_list;
-            PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-            PointCloudXYZI::Ptr body_for_map(feats_down_body);
-            PointCloudXYZI::Ptr body_mid_only;
-            if (bundle_map_mid_only || (state_bad && had_l2))
+            // Skip map write on Reject/freeze — inserting live cloud at frozen
+            // pose smeared the map and fed the run18 Div spiral.
+            if (!state_bad)
             {
-                body_mid_only.reset(new PointCloudXYZI());
-                body_mid_only->reserve(feats_down_body->size());
-                for (const auto &pt : feats_down_body->points)
-                    if (pt.intensity < 400.f) body_mid_only->push_back(pt);
-                body_for_map = body_mid_only;
-            }
-            transformLidar(state_point, body_for_map, world_lidar);
-            {
-                std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
-                *global_cloud_map += *world_lidar;
-            }
+                std::vector<pointWithCov> pv_list;
+                PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
+                PointCloudXYZI::Ptr body_for_map(feats_down_body);
+                PointCloudXYZI::Ptr body_mid_only;
+                if (bundle_map_mid_only)
+                {
+                    body_mid_only.reset(new PointCloudXYZI());
+                    body_mid_only->reserve(feats_down_body->size());
+                    for (const auto &pt : feats_down_body->points)
+                        if (pt.intensity < 400.f) body_mid_only->push_back(pt);
+                    body_for_map = body_mid_only;
+                }
+                transformLidar(state_point, body_for_map, world_lidar);
+                {
+                    std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
+                    *global_cloud_map += *world_lidar;
+                }
 
-            for (size_t i = 0; i < body_for_map->size(); i++) {
-                pointWithCov pv;
-                pv.point << body_for_map->points[i].x, body_for_map->points[i].y, body_for_map->points[i].z;
-                M3D cov_lidar = calcBodyCov(pv.point, ranging_cov, angle_cov);
-                M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
+                for (size_t i = 0; i < body_for_map->size(); i++) {
+                    pointWithCov pv;
+                    pv.point << body_for_map->points[i].x, body_for_map->points[i].y, body_for_map->points[i].z;
+                    M3D cov_lidar = calcBodyCov(pv.point, ranging_cov, angle_cov);
+                    M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
 
-                pv.cov = cov_world;
-                pv.point << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
-                pv_list.push_back(pv);
+                    pv.cov = cov_world;
+                    pv.point << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
+                    pv_list.push_back(pv);
+                }
+
+                t_update_start = omp_get_wtime();
+                std::sort(pv_list.begin(), pv_list.end(), var_contrast);
+                updateVoxelMapOMP(pv_list, max_voxel_size, max_layer, layer_size,
+                               max_points_size, max_points_size, min_eigen_value,
+                               voxel_map);
+                t_update_end = omp_get_wtime();
+                sum_update_time += t_update_end - t_update_start;
             }
-
-            t_update_start = omp_get_wtime();
-            std::sort(pv_list.begin(), pv_list.end(), var_contrast);
-            updateVoxelMapOMP(pv_list, max_voxel_size, max_layer, layer_size,
-                           max_points_size, max_points_size, min_eigen_value,
-                           voxel_map);
-            t_update_end = omp_get_wtime();
-            sum_update_time += t_update_end - t_update_start;
 
             scan_index++;
             if (scan_index % 20 == 0) {

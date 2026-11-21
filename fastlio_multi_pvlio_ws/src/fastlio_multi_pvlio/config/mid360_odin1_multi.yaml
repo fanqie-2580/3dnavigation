@@ -1,18 +1,16 @@
 /**:
   ros__parameters:
     # FAST-LIO-MULTI Bundle semantics on PV-LIO voxel map (Mid360 + Odin1).
-    # Always-on joint IEKF when L2 pairs; mapping backend = PV-LIO voxels (not ikd-Tree).
     common:
       lid_topic: "/livox/lidar"
       lid_topic2: "/odin1/cloud_raw"
       imu_topic: "/livox/imu"
       time_sync_en: false
       multi_lidar: true
-      # Short soft-wait so Odin can enter Bundle (0 → Mid-only, RViz looks Mid-only).
       lidar2_soft_wait_sec: 0.08
 
     preprocess:
-      lidar_type: 1                # Mid360 Livox CustomMsg
+      lidar_type: 1
       scan_line: 4
       scan_rate: 10
       blind: 0.15
@@ -20,7 +18,7 @@
       min_range: 0.15
       max_range: 40.0
       feature_extract_enable: false
-      lidar_type2: 6               # Odin1 PointCloud2
+      lidar_type2: 6
       point_filter_num2: 2
       blind2: 0.3
       min_range2: 0.3
@@ -30,7 +28,6 @@
     mapping:
       down_sample_size: 0.15
       max_iteration: 4
-      # PV-LIO voxel map (replaces FAST-LIO ikd-Tree)
       voxel_size: 0.25
       max_layer: 4
       layer_point_size: [5.0, 5.0, 5.0, 5.0, 5.0]
@@ -42,31 +39,30 @@
       extrinsic_est_en: false
       extrinsic_T: [0.0, 0.0, 0.0]
       extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      # L2→L1 from dual ground calib (row-major R)
-      # Match FAST_LIO_MULTI_ROS2_mid_odin mid360_odin1.yaml (CAD+Ry)
       extrinsic_T_L2_wrt_L1: [0.13245180, -0.01039588, 0.1587]
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # OFF: hard Z hijack breaks Bundle map/XY (run11). Use residual_z instead.
+      # Hard Z replace OFF (run11 tore XY). Soft Odin Δz factor ON.
       odin_z_replace_en: false
+      # Soft like run25 (good stairs+early XY); |err|>2 drop floors; |err|>3 snap.
+      odin_z_factor_en: true
+      odin_z_factor_alpha: 0.55
+      odin_z_factor_max_step: 0.06
+      odin_z_factor_max_dt: 0.35
       odin_odom_topic: "/odin1/odometry"
-      # OFF: band followed sinking pose → death spiral (run9 z→-2900). Was 1.8.
       odin_bundle_z_band: 0.0
-      # After fixing Odin end_time=max(curvature), same-stamp end_dt~6ms.
       bundle_end_dt_max: 0.10
-      # dual-style corridor Z (run12 best so far). run15 ml_h_min=0.75 +
-      # map_mid_only sank stairs (peak z 5.9) then blew up (z→-34) — reverted.
       residual_z_en: true
       residual_z_floor_info_scale: 0.45
       residual_z_h_dampen: 0.50
       residual_z_multilevel_h_min: 1.0
-      residual_z_multilevel_thr: 1.5
-      odin_floor_info_scale: 0.35
+      # 1.5 fired on early Mid false-climb (run24); real stairs span ~3–4 m.
+      residual_z_multilevel_thr: 2.8
+      odin_floor_info_scale: 0.30
       odin_wall_info_boost: 1.6
       odin_max_residual: 0.35
       bundle_map_mid_only: false
-      # Slightly looser than 0.12 to reduce return thrashing (run14).
       bundle_l2_dz_reject: 0.16
       bundle_l2_d_reject: 0.35
 
