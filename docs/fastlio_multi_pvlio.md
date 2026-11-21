@@ -57,6 +57,23 @@ y≈−40 Δx≈0.89 / Δz≈−2.51。截图 `rviz_shot{1,2,3}.png`。
 
 **run32**：官方 MULTI Bundle（`end_time=max(curvature)`、每 Mid 只拼 1 帧 Odin）+ 轻度楼面残差软化；无 odin_z/xy factor。
 
+## 三源对照（同 bag `multifloor_20261120_1031_1037`，~360s @1×）
+
+数据目录：`/tmp/compare_mid_odin_bundle/`（`mid_only/`、`odin_onboard_traj.csv`、`bundle_run32_traj.csv`、`ROOTCAUSE.txt`）。
+
+| 源 | 算法 | path2d | Z 范围 | 上楼 \|z\|>0.5 时刻 |
+|--|--|--|--|--|
+| Mid-only | PV-LIO `mapping_mid360_go2` | 199.4 m | [−1.81, **3.56**] | **t≈54 s** |
+| Odin 自带 | bag `/odin1/odometry` | 199.0 m | [−0.07, **3.87**] | **t≈53 s** |
+| Bundle run32 | Mid+Odin 紧耦合 | 195.6 m | [−4.90, **9.17**] | **t≈14 s**（提前 ~40 s） |
+
+对齐：Odin→Mid yaw≈**+13.5°** 后，Odin↔Mid `RMSE_xy≈0.80 m`、`RMSE_z≈1.05 m`（两套单雷达一致）。  
+Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
+
+**吸烟枪（t=15~50，尚未上楼）**：Mid Z≈0、Odin Z≈0.2，Bundle Z 已拉到 ~5 m。楼梯段 Bundle 峰高 ≈ Mid/Odin 的 **2.5×**。
+
+**根因**：不在 Mid 单雷达，也不在 Odin 自带建图。虚假 +Z 来自 Bundle 拼帧（Odin 经 `extrinsic_*_L2_wrt_L1` → Mid IMU 去畸变 → 一次 IEKF）产生的双雷达楼面/墙面残差冲突。下一步应先核 L2→L1 外参（尤其 pitch≈13° 的 `extrinsic_R_L2`）与拼帧几何，**不要**再上 odin_z/xy factor。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。
