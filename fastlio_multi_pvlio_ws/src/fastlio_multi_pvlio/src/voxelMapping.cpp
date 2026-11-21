@@ -140,7 +140,11 @@ bool residual_z_en = true;
 double residual_z_floor_nz_thr = 0.85;
 double residual_z_floor_info_scale = 0.45;
 double residual_z_h_dampen = 0.50;
+double residual_z_multilevel_h_min = 1.0; // full H_z after stairs (run15=0.75 under-climbed)
 double residual_z_dz_tol = 0.06;
+bool bundle_map_mid_only = false; // run15 mid-only map worsened Z sink
+double bundle_l2_dz_reject = 0.16;
+double bundle_l2_d_reject = 0.35;
 double residual_z_floor_ratio_thr = 0.03;
 double residual_z_multilevel_thr = 1.5;
 double residual_z_flat_z_alpha = 0.22;
@@ -1115,11 +1119,10 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
             const double move = std::fabs(dz_floor);
             const double stable =
                 std::exp(-0.5 * (move / tol) * (move / tol));
-            // Bundle differs from dual S1/S2: joint map includes Odin floors, so
-            // full H_z after stairs still sinks on long corridors (run12 z→-4.8).
-            // Keep a mild H_z floor even in multilevel; walls still constrain XY.
+            // Bundle: joint IEKF + Odin can bias floors. Full H_z after stairs
+            // sank Z on long corridors (run12); too-low H_z hurt re-lock (run14).
             const double zmin = residual_z_multilevel
-                                    ? std::max(0.55, residual_z_h_dampen)
+                                    ? std::max(0.0, std::min(1.0, residual_z_multilevel_h_min))
                                     : std::max(0.0, std::min(1.0, residual_z_h_dampen));
             const double zdamp = zmin + (1.0 - zmin) * (1.0 - stable);
             if (zdamp < 0.999)
@@ -1228,10 +1231,14 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("mapping.residual_z_en", residual_z_en);
     node->declare_parameter<double>("mapping.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->declare_parameter<double>("mapping.residual_z_h_dampen", residual_z_h_dampen);
+    node->declare_parameter<double>("mapping.residual_z_multilevel_h_min", residual_z_multilevel_h_min);
     node->declare_parameter<double>("mapping.residual_z_multilevel_thr", residual_z_multilevel_thr);
     node->declare_parameter<double>("mapping.odin_floor_info_scale", odin_floor_info_scale);
     node->declare_parameter<double>("mapping.odin_wall_info_boost", odin_wall_info_boost);
     node->declare_parameter<double>("mapping.odin_max_residual", odin_max_residual);
+    node->declare_parameter<bool>("mapping.bundle_map_mid_only", bundle_map_mid_only);
+    node->declare_parameter<double>("mapping.bundle_l2_dz_reject", bundle_l2_dz_reject);
+    node->declare_parameter<double>("mapping.bundle_l2_d_reject", bundle_l2_d_reject);
 
     double det_range_d;
     node->get_parameter("mapping.det_range", det_range_d);
@@ -1257,10 +1264,14 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.residual_z_en", residual_z_en);
     node->get_parameter("mapping.residual_z_floor_info_scale", residual_z_floor_info_scale);
     node->get_parameter("mapping.residual_z_h_dampen", residual_z_h_dampen);
+    node->get_parameter("mapping.residual_z_multilevel_h_min", residual_z_multilevel_h_min);
     node->get_parameter("mapping.residual_z_multilevel_thr", residual_z_multilevel_thr);
     node->get_parameter("mapping.odin_floor_info_scale", odin_floor_info_scale);
     node->get_parameter("mapping.odin_wall_info_boost", odin_wall_info_boost);
     node->get_parameter("mapping.odin_max_residual", odin_max_residual);
+    node->get_parameter("mapping.bundle_map_mid_only", bundle_map_mid_only);
+    node->get_parameter("mapping.bundle_l2_dz_reject", bundle_l2_dz_reject);
+    node->get_parameter("mapping.bundle_l2_d_reject", bundle_l2_d_reject);
 
     // noise model params
     node->declare_parameter<double>("noise_model.ranging_cov", 0.02);
@@ -1364,6 +1375,8 @@ int main(int argc, char** argv)
         std::cout << "\033[32;1mMulti LiDAR Bundle on! soft_wait=" << lidar2_soft_wait_sec
                   << "s end_dt_max=" << bundle_end_dt_max
                   << " residual_z=" << residual_z_en
+                  << " map_mid_only=" << bundle_map_mid_only
+                  << " ml_h_min=" << residual_z_multilevel_h_min
                   << " odin_z_replace=" << odin_z_replace_en
                   << " odin_bundle_z_band=" << odin_bundle_z_band
                   << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
@@ -1583,8 +1596,18 @@ int main(int argc, char** argv)
             if (flg_EKF_inited && !init_map) {
                 apply_odin_z_replace();
                 state_point = kf.get_x();
+                PointCloudXYZI::Ptr body_init = feats_undistort;
+                PointCloudXYZI::Ptr body_init_mid;
+                if (bundle_map_mid_only)
+                {
+                    body_init_mid.reset(new PointCloudXYZI());
+                    body_init_mid->reserve(feats_undistort->size());
+                    for (const auto &pt : feats_undistort->points)
+                        if (pt.intensity < 400.f) body_init_mid->push_back(pt);
+                    body_init = body_init_mid;
+                }
                 PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
-                transformLidar(state_point, feats_undistort, world_lidar);
+                transformLidar(state_point, body_init, world_lidar);
 
                 {
                     std::lock_guard<std::mutex> lck(global_cloud_map_mtx);
@@ -1599,9 +1622,9 @@ int main(int argc, char** argv)
                     pointWithCov pv;
                     pv.point << world_lidar->points[i].x, world_lidar->points[i].y,
                             world_lidar->points[i].z;
-                    V3D point_this(feats_undistort->points[i].x,
-                                   feats_undistort->points[i].y,
-                                   feats_undistort->points[i].z);
+                    V3D point_this(body_init->points[i].x,
+                                   body_init->points[i].y,
+                                   body_init->points[i].z);
                     if (point_this[2] == 0) {
                         point_this[2] = 0.001;
                     }
@@ -1682,7 +1705,8 @@ int main(int argc, char** argv)
             const double d_upd = (state_point.pos - state_before_update.pos).norm();
             const double dz_upd = state_point.pos(2) - state_before_update.pos(2);
             const double vel_n = state_point.vel.norm();
-            if (!state_bad && had_l2 && (d_upd > 0.30 || std::fabs(dz_upd) > 0.12))
+            if (!state_bad && had_l2 &&
+                (d_upd > bundle_l2_d_reject || std::fabs(dz_upd) > bundle_l2_dz_reject))
             {
                 state_bad = true;
                 RCLCPP_WARN(node->get_logger(),
@@ -1763,12 +1787,13 @@ int main(int argc, char** argv)
             geoQuat.w = state_point.rot.coeffs()[3];
 
             /*** add the points to the voxel map ***/
-            // On Bundle reject: insert Mid-only (intensity<=150) so the map keeps matching.
+            // Default: Mid-only map (Bundle IEKF still joint). Inserting Odin into
+            // the voxel map caused corridor ghost walls (run14 RViz).
             std::vector<pointWithCov> pv_list;
             PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI);
             PointCloudXYZI::Ptr body_for_map(feats_down_body);
             PointCloudXYZI::Ptr body_mid_only;
-            if (state_bad && had_l2)
+            if (bundle_map_mid_only || (state_bad && had_l2))
             {
                 body_mid_only.reset(new PointCloudXYZI());
                 body_mid_only->reserve(feats_down_body->size());

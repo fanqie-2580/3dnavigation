@@ -40,10 +40,18 @@ run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）
 2. Bundle 无楼面残差抑制 → 同走廊去/回程 Δz≈数米（run7 y≈−40：4.9 vs 1.0）。
 3. 硬 `odin_z_replace` / `z_band` 分别破坏一致性或跟随错误 Z 下沉。
 
-**run12（residual_z + max-span end_time，odin_z_replace=0）**：
+**run12（residual_z + max-span end_time，odin_z_replace=0，floor_info=0.45）**：
 - joint≈89%，`end_dt_drop`≈3.5%，NoEff/freeze=0 → 基本全程 Bundle。
 - y≈−40 去/回：Δx≈0.42 m、Δz≈1.42 m（优于 run7 的 Δz≈3.9 / Δx≈1.5）。
-- 仍见远端走廊 Z 下沉（最低≈−4.8）：multilevel 后满 H_z + 联合地图含 Odin 楼面。run13 起 multilevel 仍保留轻度 H_z 压制 + `floor_info_scale=0.30`。
+- 仍见远端走廊 Z 下沉（最低≈−4.8）。
+
+**run14（1× + RViz，floor_info=0.30）**：joint≈86%，y≈−40 Δz≈−3.54（变差）。
+
+**run15（map_mid_only + ml_h_min=0.75）**：失败 — 上楼不足（峰 z≈5.9）后 z→−34。已回退。
+
+**run16（回退 run12 量级 + L2 拒更略松，1×+RViz）**：`/tmp/fastlio_multi_pvlio_run16/`  
+`map_mid_only=0 ml_h_min=1 floor_info=0.45`；joint≈89.5%，z∈[−5.2,9.18]，Reject=2；  
+y≈−40 Δx≈0.89 / Δz≈−2.51。截图 `rviz_shot{1,2,3}.png`。
 
 ## 构建 / 运行
 

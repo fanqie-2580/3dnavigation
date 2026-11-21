@@ -55,14 +55,20 @@
       odin_bundle_z_band: 0.0
       # After fixing Odin end_time=max(curvature), same-stamp end_dt~6ms.
       bundle_end_dt_max: 0.10
-      # dual-style corridor Z: soften floors + multilevel H_z + post vz damp.
+      # dual-style corridor Z (run12 best so far). run15 ml_h_min=0.75 +
+      # map_mid_only sank stairs (peak z 5.9) then blew up (z→-34) — reverted.
       residual_z_en: true
-      residual_z_floor_info_scale: 0.30
-      residual_z_h_dampen: 0.55
+      residual_z_floor_info_scale: 0.45
+      residual_z_h_dampen: 0.50
+      residual_z_multilevel_h_min: 1.0
       residual_z_multilevel_thr: 1.5
       odin_floor_info_scale: 0.35
       odin_wall_info_boost: 1.6
       odin_max_residual: 0.35
+      bundle_map_mid_only: false
+      # Slightly looser than 0.12 to reduce return thrashing (run14).
+      bundle_l2_dz_reject: 0.16
+      bundle_l2_d_reject: 0.35
 
     noise_model:
       ranging_cov: 0.04
