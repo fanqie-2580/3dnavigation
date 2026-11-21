@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    # FAST-LIO-MULTI Bundle semantics on PV-LIO voxel map (Mid360 + Odin1).
+    # FAST-LIO-MULTI Bundle on PV-LIO voxels (Mid360 + Odin1).
     common:
       lid_topic: "/livox/lidar"
       lid_topic2: "/odin1/cloud_raw"
@@ -43,23 +43,18 @@
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # Hard Z replace OFF (run11 tore XY). Soft Odin Δz factor ON.
+      # No Odin pose hijack (replace/factor/xy). Bundle IEKF only.
       odin_z_replace_en: false
-      # Soft like run25 (good stairs+early XY); |err|>2 drop floors; |err|>3 snap.
-      odin_z_factor_en: true
-      odin_z_factor_alpha: 0.55
-      odin_z_factor_max_step: 0.06
-      odin_z_factor_max_dt: 0.35
       odin_odom_topic: "/odin1/odometry"
       odin_bundle_z_band: 0.0
       bundle_end_dt_max: 0.10
+      # Soften floor planes in IEKF (Bundle corridor height); keep mild.
       residual_z_en: true
       residual_z_floor_info_scale: 0.45
       residual_z_h_dampen: 0.50
       residual_z_multilevel_h_min: 1.0
-      # 1.5 fired on early Mid false-climb (run24); real stairs span ~3–4 m.
-      residual_z_multilevel_thr: 2.8
-      odin_floor_info_scale: 0.30
+      residual_z_multilevel_thr: 1.5
+      odin_floor_info_scale: 0.35
       odin_wall_info_boost: 1.6
       odin_max_residual: 0.35
       bundle_map_mid_only: false
@@ -85,5 +80,4 @@
 
     pcd_save:
       pcd_save_en: false
-      save_path: "/home/ll/fastlio_multi_pvlio_ws/maps"
       interval: -1
