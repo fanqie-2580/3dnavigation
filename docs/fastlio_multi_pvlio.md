@@ -114,7 +114,9 @@ Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
 
 **dual_run_z4**：Z replace 同时 **`odin_att_replace`（仅 roll/pitch，保 Mid yaw）**。`odin_R_align=Mid_R0×Odin_R0ᵀ` 把 Mid/Odin 重力系差灌成约 **+14° 假俯仰** → 一楼就往 −X 拉长（path@60 ≈39.6 m vs Odin ≈27.5 m），比 z3 更早漂。
 
-**dual_run_z5**：关 `odin_att_replace`；保留 Odin Δz + `iekf_max_vel` / S2 gyr / pose_hold（同 z3 策略）。
+**dual_run_z5**：关 `odin_att_replace`；保留 Odin Δz + `iekf_max_vel` / S2 gyr / pose_hold（同 z3 策略）。早段 path 对齐 z3；二楼走廊（y≈−17～−25）Mid pitch 爬升→roll 翻面→点云朝下。
+
+**dual_run_z6**：`odin_att_delta`（相对 rp：`mid_rp = mid_rp0+(odin_rp−odin_rp0)`，保 Mid yaw）+ Odin Δz；不用 abs R_align。
 
 ## 构建 / 运行
 

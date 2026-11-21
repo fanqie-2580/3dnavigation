@@ -97,9 +97,11 @@ TUNE = {
     "odin_pose_hold_on_bad": True,       # NoEff/IMU coast → init-aligned Odin XY hold
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,
-    # dual_run_z4: att_replace + R_align baked ~14° pitch → early path stretch.
-    # Keep Mid attitude; Z still from Odin Δz.
+    # dual_run_z4: abs att_replace + R_align → early path stretch.
+    # dual_run_z5: att off → early OK, corridor Mid pitch climb → dive.
+    # dual_run_z6: relative Δatt (mid_rp0 + Δodin_rp), keep Mid yaw; Z still Δz.
     "odin_att_replace_en": False,
+    "odin_att_delta_en": True,
     "odin_att_rp_only": True,
     "odin_odom_topic": "/odin1/odometry",
     "odin_z_factor_alpha": 0.0,

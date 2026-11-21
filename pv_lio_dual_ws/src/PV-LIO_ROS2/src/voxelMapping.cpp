@@ -220,8 +220,10 @@ bool odin_z_flat_hold_en = true;
 double odin_z_flat_vz_thr = 0.03; // m/s; stairs ~0.1, upper-floor sink ~0.002
 // Multifloor: Z-only Odin left Mid roll/pitch → tilted cloud.
 // Full att replace also overwrites yaw → Mid rays miss Mid map → NEP/drift.
-// Default: take Odin roll/pitch (init-aligned), keep Mid yaw.
+// Abs R_align (att_replace) baked Mid/Odin gravity mismatch → early pitch bias.
+// Δatt (like Δz): mid_rp = mid_rp0 + (odin_rp − odin_rp0), keep Mid yaw.
 bool odin_att_replace_en = false; // dual_run_z4: R_align pitch bias → early drift
+bool odin_att_delta_en = false;   // dual_run_z6: relative rp; corridor dive fix
 bool odin_att_rp_only = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
@@ -248,6 +250,12 @@ bool odin_odom_have = false;
 bool odin_att_align_valid = false;
 Eigen::Matrix3d odin_R_align = Eigen::Matrix3d::Identity();
 long long n_odin_att_replace = 0;
+bool odin_att_delta_valid = false;
+double odin_att_mid_p0 = 0.0;   // Mid pitch/roll (deg) at Δatt init
+double odin_att_mid_r0 = 0.0;
+double odin_att_odin_p0 = 0.0;  // Odin pitch/roll (deg) at Δatt init
+double odin_att_odin_r0 = 0.0;
+long long n_odin_att_delta = 0;
 double last_pf_mid_z = 0.0;
 double last_pf_odin_z = 0.0;
 double last_pf_odin_stamp = -1.0;
@@ -412,8 +420,60 @@ Eigen::Matrix3d odin_odom_R_locked()
     return q.toRotationMatrix();
 }
 
+static double wrap_deg180(double a)
+{
+    while (a > 180.0) a -= 360.0;
+    while (a < -180.0) a += 360.0;
+    return a;
+}
+
+// Relative roll/pitch (Δz-style). Keeps Mid init rp bias; tracks Odin Δrp; Mid yaw.
+bool apply_odin_att_delta(state_ikfom &s)
+{
+    if (!odin_att_delta_en)
+        return false;
+    Eigen::Matrix3d R_o;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return false;
+        R_o = odin_odom_R_locked();
+    }
+    const Eigen::Vector3d ypr_o = R2ypr(R_o); // yaw,pitch,roll deg
+    const Eigen::Vector3d ypr_m = R2ypr(s.rot.toRotationMatrix());
+    if (!odin_att_delta_valid)
+    {
+        odin_att_mid_p0 = ypr_m(1);
+        odin_att_mid_r0 = ypr_m(2);
+        odin_att_odin_p0 = ypr_o(1);
+        odin_att_odin_r0 = ypr_o(2);
+        odin_att_delta_valid = true;
+        std::cout << "[pv-z] odin_att_delta init mid_pr=(" << odin_att_mid_p0
+                  << "," << odin_att_mid_r0 << ") odin_pr=("
+                  << odin_att_odin_p0 << "," << odin_att_odin_r0 << ")"
+                  << std::endl;
+        return false;
+    }
+    const double p_new =
+        odin_att_mid_p0 + wrap_deg180(ypr_o(1) - odin_att_odin_p0);
+    const double r_new =
+        odin_att_mid_r0 + wrap_deg180(ypr_o(2) - odin_att_odin_r0);
+    const double y_keep = ypr_m(0);
+    Eigen::Matrix3d R_new = ypr2R(Eigen::Vector3d(y_keep, p_new, r_new));
+    Eigen::Quaterniond qm(R_new);
+    qm.normalize();
+    s.rot = SO3(qm);
+    ++n_odin_att_delta;
+    if ((n_odin_att_delta % 50) == 1)
+        std::cout << "[pv-z] odin_att_delta ypr=(" << y_keep << "," << p_new
+                  << "," << r_new << ") odin_pr=(" << ypr_o(1) << ","
+                  << ypr_o(2) << ") n=" << n_odin_att_delta << std::endl;
+    return true;
+}
+
 // Level fusion to Odin gravity while keeping Mid heading in the horizontal plane.
 // (Euler roll/pitch+yaw mix was wrong: flat start printed pitch~50°.)
+// dual_run_z4: abs R_align → early path stretch; prefer odin_att_delta_en.
 bool apply_odin_att_replace(state_ikfom &s)
 {
     if (!odin_att_replace_en)
@@ -543,7 +603,10 @@ void apply_odin_z_replace(double /*stamp*/)
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
-    // Attitude stays Mid (att_replace off): dual_run_z4 R_align caused ~14° pitch.
+    // Corridor: Mid-only + hard Z dumped residual into pitch → dive (z3/z5).
+    // Relative Δatt tracks Odin rp change without R_align absolute hijack (z4).
+    apply_odin_att_delta(s);
+    apply_odin_att_replace(s);
     kf.change_x(s);
     ++n_odin_z_factor;
     last_pf_mid_z = z_new;
@@ -677,6 +740,7 @@ bool apply_odin_pose_hold_on_bad()
         last_pf_odin_stamp = t_o;
     }
     s.vel.setZero();
+    apply_odin_att_delta(s);
     apply_odin_att_replace(s);
     kf.change_x(s);
     ++n_odin_pose_hold;
@@ -1981,6 +2045,7 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->declare_parameter<double>("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->declare_parameter<bool>("dual_tune.odin_att_replace_en", odin_att_replace_en);
+    node->declare_parameter<bool>("dual_tune.odin_att_delta_en", odin_att_delta_en);
     node->declare_parameter<bool>("dual_tune.odin_att_rp_only", odin_att_rp_only);
     node->declare_parameter<std::string>("dual_tune.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
@@ -2088,6 +2153,7 @@ int main(int argc, char** argv)
     node->get_parameter("dual_tune.odin_z_flat_hold_en", odin_z_flat_hold_en);
     node->get_parameter("dual_tune.odin_z_flat_vz_thr", odin_z_flat_vz_thr);
     node->get_parameter("dual_tune.odin_att_replace_en", odin_att_replace_en);
+    node->get_parameter("dual_tune.odin_att_delta_en", odin_att_delta_en);
     node->get_parameter("dual_tune.odin_att_rp_only", odin_att_rp_only);
     node->get_parameter("dual_tune.odin_odom_topic", odin_odom_topic);
     node->get_parameter("dual_tune.odin_z_factor_alpha", odin_z_factor_alpha);
@@ -2138,6 +2204,7 @@ int main(int argc, char** argv)
               << " flat_hold=" << odin_z_flat_hold_en
               << " flat_vz_thr=" << odin_z_flat_vz_thr
               << " odin_att_replace=" << odin_att_replace_en
+              << " odin_att_delta=" << odin_att_delta_en
               << " att_rp_only=" << odin_att_rp_only
               << " band=" << odin_z_factor_band
               << " one_sided=" << odin_z_factor_one_sided
