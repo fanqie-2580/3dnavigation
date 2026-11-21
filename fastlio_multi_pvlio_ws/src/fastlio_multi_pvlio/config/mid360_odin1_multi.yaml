@@ -48,11 +48,21 @@
       extrinsic_R_L2_wrt_L1: [0.9743697955, 0.0007368238, -0.2249509889,
                              -0.0007179391, 0.9999997285, 0.0001657493,
                               0.22495105, 0.0, 0.97437006]
-      # ON: pose Z := /odin1/odometry (init-aligned). Mid Bundle keeps XY/att.
-      odin_z_replace_en: true
+      # OFF: hard Z hijack breaks Bundle map/XY (run11). Use residual_z instead.
+      odin_z_replace_en: false
       odin_odom_topic: "/odin1/odometry"
       # OFF: band followed sinking pose → death spiral (run9 z→-2900). Was 1.8.
       odin_bundle_z_band: 0.0
+      # After fixing Odin end_time=max(curvature), same-stamp end_dt~6ms.
+      bundle_end_dt_max: 0.10
+      # dual-style corridor Z: soften floors + multilevel H_z + post vz damp.
+      residual_z_en: true
+      residual_z_floor_info_scale: 0.30
+      residual_z_h_dampen: 0.55
+      residual_z_multilevel_thr: 1.5
+      odin_floor_info_scale: 0.35
+      odin_wall_info_boost: 1.6
+      odin_max_residual: 0.35
 
     noise_model:
       ranging_cov: 0.04

@@ -110,10 +110,9 @@ bool   multi_lidar = false;
 double lidar2_soft_wait_sec = 0.18;
 double bundle_l1_push_wall = -1.0;
 
-// Root cause of corridor Δz meters: Bundle IEKF lets Mid floor + Odin near
-// planes pull Z; wrong Z then enters voxel map and reinforces. Fix: XY/att
-// stay from PV-LIO Bundle; pose Z := Odin /odin1/odometry (init-aligned).
-bool odin_z_replace_en = true;
+// Hard Z replace (pose Z := Odin odom) breaks Bundle map/XY consistency
+// (run11). Prefer residual_z floor dampening like dual go2 instead.
+bool odin_z_replace_en = false;
 std::string odin_odom_topic = "/odin1/odometry";
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
@@ -132,6 +131,34 @@ int force_mid_only_scans = 0;
 state_ikfom last_good_state;
 bool have_last_good_state = false;
 int consecutive_neff = 0;
+// Drop L2 from IEKF when Mid↔Odin end-time mismatch exceeds this (sec).
+double bundle_end_dt_max = 0.10;
+long long n_bundle_joint = 0, n_bundle_mid_only = 0, n_bundle_end_dt_drop = 0;
+
+// dual-style residual_z: soften floor info + multilevel H_z; post vz/ba damp.
+bool residual_z_en = true;
+double residual_z_floor_nz_thr = 0.85;
+double residual_z_floor_info_scale = 0.45;
+double residual_z_h_dampen = 0.50;
+double residual_z_dz_tol = 0.06;
+double residual_z_floor_ratio_thr = 0.03;
+double residual_z_multilevel_thr = 1.5;
+double residual_z_flat_z_alpha = 0.22;
+double residual_z_flat_vz_alpha = 1.0;
+double residual_z_flat_ba_z_alpha = 0.25;
+double residual_z_flat_max_step = 0.015;
+double residual_z_vz_alpha = 0.75;
+double odin_wall_nz_thr = 0.40;
+double odin_wall_info_boost = 1.6;
+double odin_floor_info_scale = 0.35;
+double odin_max_residual = 0.35;
+bool residual_z_multilevel = false;
+bool residual_z_flat_ref_init = false;
+double residual_z_flat_z_ref = 0.0;
+bool last_floor_valid = false;
+double last_floor_z = 0.0;
+int last_floor_n = 0;
+double last_floor_ratio = 0.0;
 
 
 vector<vector<int>>  pointSearchInd_surf;
@@ -224,8 +251,7 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
-// z_fusion = z_fusion0 + (z_odin - z_odin0). XY/attitude stay from Mid Bundle.
-// Soft per-frame step avoids map tears when Odin Z moves faster than Mid XY.
+// z_fusion = z_fusion0 + (z_odin - z_odin0). Optional only; default OFF.
 void apply_odin_z_replace()
 {
     if (!odin_z_replace_en)
@@ -238,7 +264,6 @@ void apply_odin_z_replace()
         z_o = odin_odom_z;
         t_o = odin_odom_stamp;
     }
-    // Stale Odin odom (bag gap / drop) → skip.
     if (lidar_end_time > 0.0 && t_o > 0.0 && std::fabs(lidar_end_time - t_o) > 0.5)
         return;
     state_ikfom s = kf.get_x();
@@ -254,7 +279,7 @@ void apply_odin_z_replace()
     const double z_target = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     double z_new = z_target;
     const double dz = z_target - s.pos(2);
-    const double max_step = 0.12; // m/frame @~10 Hz ≈ 1.2 m/s vertical
+    const double max_step = 0.12;
     if (std::fabs(dz) > max_step)
         z_new = s.pos(2) + std::copysign(max_step, dz);
     s.pos(2) = z_new;
@@ -267,6 +292,70 @@ void apply_odin_z_replace()
                   << " odin_z=" << z_o
                   << " dz_odin=" << (z_o - odin_z_anchor_odin)
                   << " n=" << n_odin_z_replace << std::endl;
+}
+
+// go2 residual_z post-update (ported from dual): single-level flat pull;
+// multilevel → soft vz/ba only (H_z already full in observation).
+void apply_residual_z_flat()
+{
+    if (!residual_z_en)
+        return;
+    state_ikfom s = kf.get_x();
+    if (!last_floor_valid)
+    {
+        const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
+        const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
+        s.vel(2) *= (1.0 - 0.5 * av);
+        s.ba(2) *= (1.0 - 0.5 * ab);
+        kf.change_x(s);
+        return;
+    }
+    static double floor_z_ema = 0.0;
+    static bool hold_init = false;
+    if (!hold_init)
+    {
+        floor_z_ema = last_floor_z;
+        hold_init = true;
+        std::cout << "[pv-z] residual_z Bundle post: multilevel_thr="
+                  << residual_z_multilevel_thr << std::endl;
+    }
+    const double dz_floor = last_floor_z - floor_z_ema;
+    floor_z_ema = 0.90 * floor_z_ema + 0.10 * last_floor_z;
+    const double tol = std::max(1e-3, residual_z_dz_tol);
+    const double move = std::fabs(dz_floor);
+    const double stable = std::exp(-0.5 * (move / tol) * (move / tol));
+    double w = 0.0;
+    if (last_floor_n >= 12 || last_floor_ratio >= residual_z_floor_ratio_thr)
+        w = stable * std::min(1.0, std::max(last_floor_ratio / 0.08,
+                                            last_floor_n / 80.0));
+
+    if (!residual_z_multilevel)
+    {
+        if (!residual_z_flat_ref_init)
+        {
+            residual_z_flat_z_ref = s.pos(2);
+            residual_z_flat_ref_init = true;
+            std::cout << "[pv-z] residual_z flat_z_ref=" << residual_z_flat_z_ref
+                      << " (single-level)" << std::endl;
+        }
+        const double av = std::max(0.0, std::min(1.0, residual_z_flat_vz_alpha));
+        const double az = std::max(0.0, std::min(1.0, residual_z_flat_z_alpha));
+        const double ab = std::max(0.0, std::min(1.0, residual_z_flat_ba_z_alpha));
+        s.vel(2) *= (1.0 - av);
+        s.ba(2) *= (1.0 - ab);
+        double step = az * (residual_z_flat_z_ref - s.pos(2));
+        if (residual_z_flat_max_step > 0.0 &&
+            std::fabs(step) > residual_z_flat_max_step)
+            step = std::copysign(residual_z_flat_max_step, step);
+        s.pos(2) += step;
+    }
+    else
+    {
+        const double a = std::max(0.0, std::min(0.90, residual_z_vz_alpha));
+        s.vel(2) *= (1.0 - w * a);
+        s.ba(2) *= (1.0 - 0.35 * w * a);
+    }
+    kf.change_x(s);
 }
 
 const bool var_contrast(pointWithCov &x, pointWithCov &y) {
@@ -514,8 +603,17 @@ static void push_lidar2_into_meas(MeasureGroup &meas)
     // Tag >> Mid reflectivity (0..255) so Bundle filters do not confuse Mid/Odin.
     for (auto &pt : meas.lidar2->points) pt.intensity = 500.f;
     meas.lidar_beg_time2 = time_buffer2[best];
-    fill_lidar_end_time(meas.lidar2, meas.lidar_beg_time2, lidar_end_time2,
-                        lidar_mean_scantime2, scan_num2, "lidar2");
+    // Root cause: fill_lidar_end_time used points.back().curvature, but Odin
+    // clouds are NOT time-sorted → end_time often ≈ beg → end_dt~100ms → drop L2.
+    // Dual pairs by max curvature span; do the same here.
+    double span2 = 0.0;
+    for (const auto &pt : meas.lidar2->points)
+        span2 = std::max(span2, double(pt.curvature) / 1000.0);
+    if (span2 < 1e-4)
+        span2 = (lidar_mean_scantime > 1e-3) ? lidar_mean_scantime : 0.10;
+    scan_num2++;
+    lidar_end_time2 = meas.lidar_beg_time2 + span2;
+    lidar_mean_scantime2 += (span2 - lidar_mean_scantime2) / scan_num2;
     meas.lidar_end_time2 = lidar_end_time2;
 }
 
@@ -849,6 +947,8 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D cov_world = transformLiDARCovToWorld(pv.point, kf, cov_lidar);
         pv.cov = cov_world;
         pv.cov_lidar = cov_lidar;
+        // intensity tag 500 = Odin (set in push_lidar2_into_meas).
+        pv.lidar_src = (feats_down_body->points[i].intensity >= 400.f) ? 1 : 0;
         pv_list[i] = pv;
     }
 
@@ -858,6 +958,7 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
     BuildResidualListOMP(voxel_map, max_voxel_size, 3.0, max_layer, pv_list,
                          ptpl_list, non_match_list);
     double match_end = omp_get_wtime();
+    (void)match_start; (void)match_end;
 
     effct_feat_num = ptpl_list.size();
     if (effct_feat_num < 1){
@@ -883,6 +984,10 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         point_crossmat<<SKEW_SYM_MATRX(point_this);
 
         V3D norm_vec(ptpl_list[i].normal);
+        const bool is_odin_pt = (ptpl_list[i].lidar_src == 1);
+        const bool is_floor =
+            residual_z_en && !is_odin_pt &&
+            std::fabs(norm_vec.z()) > residual_z_floor_nz_thr;
 
         V3D C(s.rot.conjugate() *norm_vec);
         V3D A(point_crossmat * C);
@@ -900,7 +1005,21 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + norm_vec.y() * ptpl_list[i].point_world.y()
                 + norm_vec.z() * ptpl_list[i].point_world.z()
                 + ptpl_list[i].d;
+
+        // Bundle: clip large Odin residuals (ghost floor / far plane).
+        if (is_odin_pt && std::fabs(pd2) > odin_max_residual)
+        {
+            ekfom_data.h(i) = 0.0;
+            ekfom_data.h_x.row(i).setZero();
+            ekfom_data.R(i) = 1e-12;
+            continue;
+        }
+
         ekfom_data.h(i) = -pd2;
+#ifdef MP_EN
+#pragma omp atomic
+#endif
+        total_residual += std::fabs(pd2);
 
         V3D point_world = ptpl_list[i].point_world;
         Eigen::Matrix<double, 1, 6> J_nq;
@@ -912,10 +1031,103 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
         M3D R_cov_Rt = s.rot * s.offset_R_L_I * cov_lidar * s.offset_R_L_I.conjugate() * s.rot.conjugate();
         double R_inv = 1.0 / (sigma_l + norm_vec.transpose() * R_cov_Rt * norm_vec);
 
+        if (is_floor)
+        {
+            const double sc =
+                std::max(0.05, std::min(1.0, residual_z_floor_info_scale));
+            R_inv *= sc;
+        }
+        if (is_odin_pt)
+        {
+            const double nz = std::fabs(norm_vec.z());
+            if (nz < odin_wall_nz_thr)
+                R_inv *= std::max(1.0, odin_wall_info_boost);
+            else if (nz > residual_z_floor_nz_thr)
+                R_inv *= std::max(0.05, std::min(1.0, odin_floor_info_scale));
+        }
+
         ekfom_data.R(i) = R_inv;
     }
 
-    res_mean_last = total_residual / effct_feat_num;
+    // Floor plane under robot → multilevel H_z policy (dual residual_z).
+    last_floor_valid = false;
+    last_floor_n = 0;
+    last_floor_ratio = 0.0;
+    if (residual_z_en && effct_feat_num > 0)
+    {
+        double z_sum = 0.0;
+        int n_floor = 0;
+        for (int i = 0; i < effct_feat_num; ++i)
+        {
+            if (ptpl_list[i].lidar_src == 1) continue;
+            const double nz = ptpl_list[i].normal.z();
+            if (std::fabs(nz) <= residual_z_floor_nz_thr) continue;
+            const double z_map =
+                -(ptpl_list[i].d + ptpl_list[i].normal.x() * s.pos(0) +
+                  ptpl_list[i].normal.y() * s.pos(1)) /
+                nz;
+            if (z_map > s.pos(2) - 0.15) continue;
+            if (z_map < s.pos(2) - 2.5) continue;
+            z_sum += z_map;
+            ++n_floor;
+        }
+        last_floor_n = n_floor;
+        last_floor_ratio =
+            static_cast<double>(n_floor) / static_cast<double>(effct_feat_num);
+        last_floor_valid = (n_floor >= 12);
+        if (last_floor_valid)
+            last_floor_z = z_sum / static_cast<double>(n_floor);
+
+        if (last_floor_valid && ekfom_data.h_x.cols() > 2)
+        {
+            static double floor_z_ema_h = 0.0;
+            static bool floor_z_ema_h_init = false;
+            static double floor_z_min_seen_h = 0.0;
+            static double floor_z_max_seen_h = 0.0;
+            static bool floor_span_init_h = false;
+            if (!floor_z_ema_h_init)
+            {
+                floor_z_ema_h = last_floor_z;
+                floor_z_ema_h_init = true;
+            }
+            if (!floor_span_init_h)
+            {
+                floor_z_min_seen_h = last_floor_z;
+                floor_z_max_seen_h = last_floor_z;
+                floor_span_init_h = true;
+            }
+            const double dz_floor = last_floor_z - floor_z_ema_h;
+            floor_z_ema_h = 0.90 * floor_z_ema_h + 0.10 * last_floor_z;
+            floor_z_min_seen_h = std::min(floor_z_min_seen_h, last_floor_z);
+            floor_z_max_seen_h = std::max(floor_z_max_seen_h, last_floor_z);
+            if ((floor_z_max_seen_h - floor_z_min_seen_h) >=
+                residual_z_multilevel_thr)
+            {
+                if (!residual_z_multilevel)
+                {
+                    residual_z_multilevel = true;
+                    std::cout << "[pv-z] multi-level floor span="
+                              << (floor_z_max_seen_h - floor_z_min_seen_h)
+                              << " → full H_z, flat z_ref OFF" << std::endl;
+                }
+            }
+            const double tol = std::max(1e-3, residual_z_dz_tol);
+            const double move = std::fabs(dz_floor);
+            const double stable =
+                std::exp(-0.5 * (move / tol) * (move / tol));
+            // Bundle differs from dual S1/S2: joint map includes Odin floors, so
+            // full H_z after stairs still sinks on long corridors (run12 z→-4.8).
+            // Keep a mild H_z floor even in multilevel; walls still constrain XY.
+            const double zmin = residual_z_multilevel
+                                    ? std::max(0.55, residual_z_h_dampen)
+                                    : std::max(0.0, std::min(1.0, residual_z_h_dampen));
+            const double zdamp = zmin + (1.0 - zmin) * (1.0 - stable);
+            if (zdamp < 0.999)
+                ekfom_data.h_x.col(2) *= zdamp;
+        }
+    }
+
+    res_mean_last = (effct_feat_num > 0) ? (total_residual / effct_feat_num) : 0.0;
 }
 
 bool saveMapToFile(const std::string &dir) {
@@ -1012,6 +1224,14 @@ int main(int argc, char** argv)
     node->declare_parameter<bool>("mapping.odin_z_replace_en", odin_z_replace_en);
     node->declare_parameter<std::string>("mapping.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("mapping.odin_bundle_z_band", odin_bundle_z_band);
+    node->declare_parameter<double>("mapping.bundle_end_dt_max", bundle_end_dt_max);
+    node->declare_parameter<bool>("mapping.residual_z_en", residual_z_en);
+    node->declare_parameter<double>("mapping.residual_z_floor_info_scale", residual_z_floor_info_scale);
+    node->declare_parameter<double>("mapping.residual_z_h_dampen", residual_z_h_dampen);
+    node->declare_parameter<double>("mapping.residual_z_multilevel_thr", residual_z_multilevel_thr);
+    node->declare_parameter<double>("mapping.odin_floor_info_scale", odin_floor_info_scale);
+    node->declare_parameter<double>("mapping.odin_wall_info_boost", odin_wall_info_boost);
+    node->declare_parameter<double>("mapping.odin_max_residual", odin_max_residual);
 
     double det_range_d;
     node->get_parameter("mapping.det_range", det_range_d);
@@ -1033,6 +1253,14 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.odin_z_replace_en", odin_z_replace_en);
     node->get_parameter("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->get_parameter("mapping.odin_odom_topic", odin_odom_topic);
+    node->get_parameter("mapping.bundle_end_dt_max", bundle_end_dt_max);
+    node->get_parameter("mapping.residual_z_en", residual_z_en);
+    node->get_parameter("mapping.residual_z_floor_info_scale", residual_z_floor_info_scale);
+    node->get_parameter("mapping.residual_z_h_dampen", residual_z_h_dampen);
+    node->get_parameter("mapping.residual_z_multilevel_thr", residual_z_multilevel_thr);
+    node->get_parameter("mapping.odin_floor_info_scale", odin_floor_info_scale);
+    node->get_parameter("mapping.odin_wall_info_boost", odin_wall_info_boost);
+    node->get_parameter("mapping.odin_max_residual", odin_max_residual);
 
     // noise model params
     node->declare_parameter<double>("noise_model.ranging_cov", 0.02);
@@ -1134,7 +1362,9 @@ int main(int argc, char** argv)
         LiDAR2_wrt_LiDAR1.block<3, 3>(0, 0) = R_L2;
         LiDAR2_wrt_LiDAR1.block<3, 1>(0, 3) = T_L2;
         std::cout << "\033[32;1mMulti LiDAR Bundle on! soft_wait=" << lidar2_soft_wait_sec
-                  << "s odin_z_replace=" << odin_z_replace_en
+                  << "s end_dt_max=" << bundle_end_dt_max
+                  << " residual_z=" << residual_z_en
+                  << " odin_z_replace=" << odin_z_replace_en
                   << " odin_bundle_z_band=" << odin_bundle_z_band
                   << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
     }
@@ -1251,19 +1481,28 @@ int main(int argc, char** argv)
 
             // Keep a copy for /cloud_odin_body viz even if we drop L2 from IEKF.
             PointCloudXYZI::Ptr odin_body_viz(new PointCloudXYZI());
+            double frame_end_dt_ms = -1.0;
+            bool frame_joint = false;
             if (multi_lidar && Measures.lidar2 && !Measures.lidar2->empty())
             {
                 *odin_body_viz = *Measures.lidar2;
                 const double end_dt =
                     std::fabs(Measures.lidar_end_time - Measures.lidar_end_time2);
+                frame_end_dt_ms = end_dt * 1000.0;
                 // Bad Mid↔Odin phase → Mid-only IEKF this frame (still show Odin).
-                if (end_dt > 0.05)
+                if (end_dt > bundle_end_dt_max)
                 {
-                    static int n_drop = 0;
-                    if ((++n_drop % 50) == 1)
+                    ++n_bundle_end_dt_drop;
+                    if ((n_bundle_end_dt_drop % 50) == 1)
                         std::cout << "[bundle] drop L2 IEKF end_dt_ms="
-                                  << end_dt * 1000.0 << " n=" << n_drop << std::endl;
+                                  << frame_end_dt_ms
+                                  << " max_ms=" << bundle_end_dt_max * 1000.0
+                                  << " n=" << n_bundle_end_dt_drop << std::endl;
                     Measures.lidar2->clear();
+                }
+                else
+                {
+                    frame_joint = true;
                 }
             }
             // After matching failure / jump reject: stay Mid-only briefly.
@@ -1271,8 +1510,10 @@ int main(int argc, char** argv)
             {
                 if (Measures.lidar2 && !Measures.lidar2->empty())
                     Measures.lidar2->clear();
+                frame_joint = false;
                 --force_mid_only_scans;
             }
+            if (frame_joint) ++n_bundle_joint; else ++n_bundle_mid_only;
 
             p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
 
@@ -1501,10 +1742,16 @@ int main(int argc, char** argv)
                 have_last_good_state = true;
             }
 
-            // Pose Z from Odin onboard odom (init-aligned); Mid keeps XY/att.
+            // Optional hard Z replace (default OFF). Prefer residual_z below.
             if (odin_z_replace_en && !state_bad)
             {
                 apply_odin_z_replace();
+                state_point = kf.get_x();
+            }
+            // Soft Z / vz damp (dual residual_z) — keeps Bundle map consistent.
+            if (residual_z_en && !state_bad)
+            {
+                apply_residual_z_flat();
                 state_point = kf.get_x();
             }
 
@@ -1558,11 +1805,17 @@ int main(int argc, char** argv)
             if (scan_index % 20 == 0) {
                 static double z0 = state_point.pos(2);
                 if (scan_index == 20) z0 = state_point.pos(2);
+                const long long tot = n_bundle_joint + n_bundle_mid_only;
+                size_t n_l2 = 0;
+                for (const auto &pt : feats_down_body->points)
+                    if (pt.intensity >= 400.f) ++n_l2;
                 RCLCPP_INFO(node->get_logger(),
-                    "[multi] scan=%d xyz=(%.3f,%.3f,%.3f) Δz=%.3f l2_pts=%zu",
+                    "[multi] scan=%d xyz=(%.3f,%.3f,%.3f) Δz=%.3f joint=%lld/%lld "
+                    "end_dt_drop=%lld end_dt_ms=%.1f floor_n=%d ml=%d l2_pts=%zu",
                     scan_index, state_point.pos(0), state_point.pos(1), state_point.pos(2),
                     state_point.pos(2) - z0,
-                    (Measures.lidar2 ? Measures.lidar2->points.size() : 0));
+                    n_bundle_joint, tot, n_bundle_end_dt_drop, frame_end_dt_ms,
+                    last_floor_n, (int)residual_z_multilevel, n_l2);
             }
 
             /******* Publish odometry *******/

@@ -18,7 +18,7 @@
 | | dual (`pv_lio_dual_ws`) | 本树 |
 |--|--|--|
 | IEKF | Mid S1 → 可选 Odin S2 + 门控 | 设计为合并点云一次 Bundle；实践上 Mid↔Odin `end_dt>50ms` 会本帧 Mid-only |
-| densify / residual_z | 有 | 无（纯 Bundle+体素） |
+| densify / residual_z | 有 | 有 residual_z（楼面 info 软化 + multilevel H_z；无 densify） |
 | 地图 | PV 体素 | PV 体素 |
 
 ## 注意（RViz 图/路径对不齐）
@@ -33,7 +33,17 @@
 
 run7 数据：同走廊 y≈−40 去程 z≈4.9 / 回程 z≈1.0（Δz≈3.9）、横向偏≈1.5 m → 叠影。曾加 `odin_bundle_z_band`，但 run9 中 band 跟着错误 Z 下沉 → `No Effective Points` → IMU 自由落体（z→−2900）。现默认 band=0；匹配失效时冻结 last_good 并短暂 Mid-only。
 
-高度：`odin_z_replace_en` 用 Odin 自带 `/odin1/odometry` 的 Z（初始对齐 + 每帧 ≤0.12 m 软限幅）；XY/姿态仍由 Mid Bundle。
+高度：默认 **关** `odin_z_replace`（硬改 Z 会撕裂 Bundle 图/XY，见 run11）。改为 dual 同款 `residual_z`：软化 Mid/Odin 楼面信息、单层压 H_z、跨层后恢复满 H_z。
+
+**根因（运行数据）**：
+1. Odin `lidar_end_time` 误用未排序的 `points.back().curvature` → end≈beg → `end_dt~100ms` 误丢 L2；应取 `max(curvature)`（与 dual 一致）。
+2. Bundle 无楼面残差抑制 → 同走廊去/回程 Δz≈数米（run7 y≈−40：4.9 vs 1.0）。
+3. 硬 `odin_z_replace` / `z_band` 分别破坏一致性或跟随错误 Z 下沉。
+
+**run12（residual_z + max-span end_time，odin_z_replace=0）**：
+- joint≈89%，`end_dt_drop`≈3.5%，NoEff/freeze=0 → 基本全程 Bundle。
+- y≈−40 去/回：Δx≈0.42 m、Δz≈1.42 m（优于 run7 的 Δz≈3.9 / Δx≈1.5）。
+- 仍见远端走廊 Z 下沉（最低≈−4.8）：multilevel 后满 H_z + 联合地图含 Odin 楼面。run13 起 multilevel 仍保留轻度 H_z 压制 + `floor_info_scale=0.30`。
 
 ## 构建 / 运行
 
