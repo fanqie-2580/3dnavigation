@@ -27,7 +27,8 @@ TUNE = {
     "odin_info_weight": 0.12,
     "odin_range_ref": 8.0,
     "odin_max_residual": 0.05,
-    "odin_s2_gyr_gate": 0.22,
+    # Was 0.22 → walk often ok_map_gyr (no S2); dual_run_z2 blew at corridor.
+    "odin_s2_gyr_gate": 0.40,
     "odin_s2_max_clip_ratio": 0.35,
     "shallow_s1_en": True,
     "shallow_s1_end_dt": 0.05,
@@ -48,10 +49,10 @@ TUNE = {
     # --- Jump / freeze (same as mid360_go2) ---
     "iekf_max_upd": 10.0,
     "iekf_max_rot": 10.0,
-    "iekf_max_vel": 0.0,
+    "iekf_max_vel": 1.2,                 # dual_run_z2 corridor v→3.6; Mid/Odin ~0.9
     "iekf_s2_max_upd": 0.15,
     "iekf_s2_max_rot": 0.08,
-    "consec_bad_freeze": 5,
+    "consec_bad_freeze": 3,
 
     # --- Densify: Mid always; Odin full on S2/still; walk → floor-only (fill gaps) ---
     "map_jump_upd": 10.0,
@@ -93,9 +94,11 @@ TUNE = {
     "odin_xy_factor_en": False,
     "odin_xy_factor_alpha": 0.30,
     "odin_xy_factor_max_step": 0.05,
-    "odin_pose_hold_on_bad": False,
+    "odin_pose_hold_on_bad": True,       # NoEff/IMU coast → init-aligned Odin XY hold
     "odin_z_flat_hold_en": False,
     "odin_z_flat_vz_thr": 0.03,
+    # dual_run_z4: att_replace + R_align baked ~14° pitch → early path stretch.
+    # Keep Mid attitude; Z still from Odin Δz.
     "odin_att_replace_en": False,
     "odin_att_rp_only": True,
     "odin_odom_topic": "/odin1/odometry",

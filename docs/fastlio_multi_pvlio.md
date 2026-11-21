@@ -104,6 +104,18 @@ Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
 
 **dual_run_z2**：dual 建图不变；Z 用 **Odin Δz**（`z=z_mid0+(z_odin−z_odin0)`），跟楼梯、不撕 Mid 楼面锚点。
 
+**固定点开始漂（dual_run_z2 根因）**：约 **t≈123s / dual y≈−18~−24**（二楼走廊）。
+1. 行走 `gyr` 触发 `skip=ok_map_gyr` → **关 S2**，只剩 Mid S1。
+2. 每帧 `odin_z_replace` 硬改 Z，与 Mid 楼面高度不一致 → Mid 沿走廊错配，**v 飙到 ~3.6 m/s**（同段 Mid-only/Odin 仅 ~0.9）。
+3. tune 里 **`iekf_max_vel=0`（不限速）** + **`odin_pose_hold_on_bad=false`** → 无法兜底。
+4. 随后大量 `No Effective Points`，`d_frame≈4.9 m` IMU 滑行，y 冲到 −195（path@180：dual 274 m vs Mid/Odin ~102 m）。
+
+**dual_run_z3**：`iekf_max_vel=1.2`、`odin_s2_gyr_gate=0.40`、`odin_pose_hold_on_bad=true`、`consec_bad_freeze=3`；仍 Odin Δz replace。XY 控住，但走廊段姿态被拧翻（live roll≈168° vs Odin≈0°）→ 点云朝下。
+
+**dual_run_z4**：Z replace 同时 **`odin_att_replace`（仅 roll/pitch，保 Mid yaw）**。`odin_R_align=Mid_R0×Odin_R0ᵀ` 把 Mid/Odin 重力系差灌成约 **+14° 假俯仰** → 一楼就往 −X 拉长（path@60 ≈39.6 m vs Odin ≈27.5 m），比 z3 更早漂。
+
+**dual_run_z5**：关 `odin_att_replace`；保留 Odin Δz + `iekf_max_vel` / S2 gyr / pose_hold（同 z3 策略）。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。

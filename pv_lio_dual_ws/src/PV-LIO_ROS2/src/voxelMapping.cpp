@@ -221,7 +221,7 @@ double odin_z_flat_vz_thr = 0.03; // m/s; stairs ~0.1, upper-floor sink ~0.002
 // Multifloor: Z-only Odin left Mid roll/pitch → tilted cloud.
 // Full att replace also overwrites yaw → Mid rays miss Mid map → NEP/drift.
 // Default: take Odin roll/pitch (init-aligned), keep Mid yaw.
-bool odin_att_replace_en = true;
+bool odin_att_replace_en = false; // dual_run_z4: R_align pitch bias → early drift
 bool odin_att_rp_only = true;
 std::string odin_odom_topic = "/odin1/odometry";
 double odin_z_factor_alpha = 0.50;
@@ -543,6 +543,7 @@ void apply_odin_z_replace(double /*stamp*/)
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
+    // Attitude stays Mid (att_replace off): dual_run_z4 R_align caused ~14° pitch.
     kf.change_x(s);
     ++n_odin_z_factor;
     last_pf_mid_z = z_new;
