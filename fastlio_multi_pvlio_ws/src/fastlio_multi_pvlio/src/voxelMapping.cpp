@@ -1010,13 +1010,21 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
                 + norm_vec.z() * ptpl_list[i].point_world.z()
                 + ptpl_list[i].d;
 
-        // Bundle: clip large Odin residuals (ghost floor / far plane).
-        if (is_odin_pt && std::fabs(pd2) > odin_max_residual)
+        // Bundle: drop Odin floor planes when scale<=0 (tri-source compare:
+        // early +Z slope ≈ L2 pitch ~13° while Mid/Odin singles stay flat).
+        // Keep Odin walls for XY; Mid owns height. Also clip large Odin residuals.
+        if (is_odin_pt)
         {
-            ekfom_data.h(i) = 0.0;
-            ekfom_data.h_x.row(i).setZero();
-            ekfom_data.R(i) = 1e-12;
-            continue;
+            const double nz = std::fabs(norm_vec.z());
+            const bool odin_floor = nz > residual_z_floor_nz_thr;
+            if ((odin_floor && odin_floor_info_scale <= 0.0) ||
+                std::fabs(pd2) > odin_max_residual)
+            {
+                ekfom_data.h(i) = 0.0;
+                ekfom_data.h_x.row(i).setZero();
+                ekfom_data.R(i) = 1e-12;
+                continue;
+            }
         }
 
         ekfom_data.h(i) = -pd2;
@@ -1047,7 +1055,7 @@ void observation_model_share(state_ikfom &s, esekfom::dyn_share_datastruct<doubl
             if (nz < odin_wall_nz_thr)
                 R_inv *= std::max(1.0, odin_wall_info_boost);
             else if (nz > residual_z_floor_nz_thr)
-                R_inv *= std::max(0.05, std::min(1.0, odin_floor_info_scale));
+                R_inv *= std::max(0.0, std::min(1.0, odin_floor_info_scale));
         }
 
         ekfom_data.R(i) = R_inv;
@@ -1384,6 +1392,7 @@ int main(int argc, char** argv)
                   << "s end_dt_max=" << bundle_end_dt_max
                   << " residual_z=" << residual_z_en
                   << " map_mid_only=" << bundle_map_mid_only
+                  << " odin_floor_sc=" << odin_floor_info_scale
                   << " ml_h_min=" << residual_z_multilevel_h_min
                   << " odin_z_replace=" << odin_z_replace_en
                   << " odin_bundle_z_band=" << odin_bundle_z_band
@@ -1662,9 +1671,35 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            /*** downsample the feature points in a scan ***/
-            downSizeFilterSurf.setInputCloud(feats_undistort);
-            downSizeFilterSurf.filter(*feats_down_body);
+            /*** downsample Mid / Odin separately (joint VoxelGrid averages intensity
+             * and strips Odin tag 500 → floor-residual gates never fire → Z climbs
+             * at ~L2 pitch). Re-tag Odin after its own leaf filter. ***/
+            {
+                PointCloudXYZI::Ptr mid_raw(new PointCloudXYZI());
+                PointCloudXYZI::Ptr odin_raw(new PointCloudXYZI());
+                mid_raw->reserve(feats_undistort->size());
+                odin_raw->reserve(feats_undistort->size() / 2);
+                for (const auto &pt : feats_undistort->points)
+                {
+                    if (pt.intensity >= 400.f) odin_raw->push_back(pt);
+                    else mid_raw->push_back(pt);
+                }
+                PointCloudXYZI::Ptr mid_ds(new PointCloudXYZI());
+                PointCloudXYZI::Ptr odin_ds(new PointCloudXYZI());
+                if (!mid_raw->empty())
+                {
+                    downSizeFilterSurf.setInputCloud(mid_raw);
+                    downSizeFilterSurf.filter(*mid_ds);
+                }
+                if (!odin_raw->empty())
+                {
+                    downSizeFilterSurf.setInputCloud(odin_raw);
+                    downSizeFilterSurf.filter(*odin_ds);
+                    for (auto &pt : odin_ds->points) pt.intensity = 500.f;
+                }
+                feats_down_body->clear();
+                *feats_down_body = *mid_ds + *odin_ds;
+            }
 
             sort(feats_down_body->points.begin(), feats_down_body->points.end(), time_list);
 

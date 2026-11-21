@@ -72,7 +72,21 @@ Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
 
 **吸烟枪（t=15~50，尚未上楼）**：Mid Z≈0、Odin Z≈0.2，Bundle Z 已拉到 ~5 m。楼梯段 Bundle 峰高 ≈ Mid/Odin 的 **2.5×**。
 
-**根因**：不在 Mid 单雷达，也不在 Odin 自带建图。虚假 +Z 来自 Bundle 拼帧（Odin 经 `extrinsic_*_L2_wrt_L1` → Mid IMU 去畸变 → 一次 IEKF）产生的双雷达楼面/墙面残差冲突。下一步应先核 L2→L1 外参（尤其 pitch≈13° 的 `extrinsic_R_L2`）与拼帧几何，**不要**再上 odin_z/xy factor。
+**根因**：不在 Mid 单雷达，也不在 Odin 自带建图。Bundle 在 Mid `extrinsic_R=I` 时仍对 Odin 乘 CAD `Ry(-13°)`，相对重力对齐的 Mid 多了一层 pitch → 路径上 Z 以 ≈tan(13°) 假爬升。合并 `VoxelGrid` 还会平均掉 Odin intensity=500 标签。
+
+**run35 修复（紧耦合 + Odin 进地图）**：
+1. Mid IMU↔L1 改为官方链 `Ry(+13°)` + Unitree `T≈[0.187,0,0.0803]`；L2 保持 `Ry(-13°)` / dual `Tz=0.078`。
+2. Mid/Odin **分开** downsample 后再拼接，保留 Odin 标签。
+3. `bundle_map_mid_only=false`（Odin 点云进体素图）；IEKF 仍联合（joint≈89.5%）。
+4. 暂 `odin_floor_info_scale=0`（楼面残差仍偏敏感）；无 odin_z/xy factor。
+
+| | Z 峰 | \|z\|>0.5 时刻 | Mid↔Bundle RMSE_z | RMSE_xy |
+|--|--|--|--|--|
+| run32 | 9.17 | t≈14 s | 3.42 | 1.54 |
+| **run35** | **4.39** | t≈26 s | **1.75** | **0.74** |
+| Mid / Odin | 3.56 / 3.87 | t≈54 / 53 s | — | — |
+
+数据：`/tmp/fastlio_multi_pvlio_run35/`。末段仍有走廊 Z 下沉（z_min≈−5），后续可再调 residual_z。
 
 ## 构建 / 运行
 
