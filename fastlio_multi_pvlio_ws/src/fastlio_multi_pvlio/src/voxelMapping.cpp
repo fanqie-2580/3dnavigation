@@ -111,8 +111,15 @@ double lidar2_soft_wait_sec = 0.18;
 double bundle_l1_push_wall = -1.0;
 
 // Hard Z replace (pose Z := Odin odom) breaks Bundle map/XY consistency
-// (run11). Prefer residual_z floor dampening like dual go2 instead.
+// (run11). Soft Δz factor aligns height to /odin1/odometry (best Z on this bag).
 bool odin_z_replace_en = false;
+bool odin_z_factor_en = false;
+double odin_z_factor_alpha = 0.45;
+double odin_z_factor_max_innov = 0.08;
+double odin_z_factor_max_dt = 0.35;
+double odin_z_factor_catch_err = 0.30;
+double odin_z_factor_catch_max = 0.15;
+double odin_z_factor_catch_alpha = 0.70;
 std::string odin_odom_topic = "/odin1/odometry";
 std::mutex mtx_odin_odom;
 double odin_odom_stamp = -1.0;
@@ -122,6 +129,7 @@ bool odin_z_anchor_ok = false;
 double odin_z_anchor_mid = 0.0;
 double odin_z_anchor_odin = 0.0;
 long long n_odin_z_replace = 0;
+long long n_odin_z_factor = 0;
 // Keep Odin Bundle points within |world_z - pose_z| band so IEKF cannot match
 // other floors (run7: same corridor y≈-40 outbound z≈4.9 vs return z≈1.0).
 double odin_bundle_z_band = 0.0; // 0=off; >0 filters Odin by |world_z-pose_z|
@@ -255,7 +263,7 @@ void odin_odom_cbk(const nav_msgs::msg::Odometry::SharedPtr msg)
     odin_odom_have = true;
 }
 
-// z_fusion = z_fusion0 + (z_odin - z_odin0). Optional only; default OFF.
+// Pose Z := Odin odometry Z (absolute). XY/att untouched.
 void apply_odin_z_replace()
 {
     if (!odin_z_replace_en)
@@ -276,26 +284,73 @@ void apply_odin_z_replace()
         odin_z_anchor_mid = s.pos(2);
         odin_z_anchor_odin = z_o;
         odin_z_anchor_ok = true;
-        std::cout << "[pv-z] odin_z_replace init fusion_z=" << odin_z_anchor_mid
-                  << " odin_z=" << odin_z_anchor_odin << std::endl;
-        return;
+        std::cout << "[pv-z] odin_z_replace ABS init fusion_z=" << odin_z_anchor_mid
+                  << " odin_z=" << odin_z_anchor_odin
+                  << " → use absolute /odin1/odometry.z" << std::endl;
     }
-    const double z_target = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
-    double z_new = z_target;
-    const double dz = z_target - s.pos(2);
-    const double max_step = 0.12;
-    if (std::fabs(dz) > max_step)
-        z_new = s.pos(2) + std::copysign(max_step, dz);
-    s.pos(2) = z_new;
+    s.pos(2) = z_o;
     s.vel(2) = 0.0;
     kf.change_x(s);
     ++n_odin_z_replace;
     if ((n_odin_z_replace % 50) == 1)
-        std::cout << "[pv-z] odin_z_replace z=" << z_new
-                  << " target=" << z_target
-                  << " odin_z=" << z_o
-                  << " dz_odin=" << (z_o - odin_z_anchor_odin)
+        std::cout << "[pv-z] odin_z_replace ABS z=" << z_o
                   << " n=" << n_odin_z_replace << std::endl;
+}
+
+// Soft-follow Odin Δz (no flat band — band pinned stairs in dual). XY untouched.
+void apply_odin_z_factor(double mid_stamp)
+{
+    if (!odin_z_factor_en)
+        return;
+    double t_o = -1.0, z_o = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_odin_odom);
+        if (!odin_odom_have)
+            return;
+        t_o = odin_odom_stamp;
+        z_o = odin_odom_z;
+    }
+    if (odin_z_factor_max_dt > 0.0 &&
+        std::fabs(t_o - mid_stamp) > odin_z_factor_max_dt)
+        return;
+
+    state_ikfom s = kf.get_x();
+    if (!odin_z_anchor_ok)
+    {
+        odin_z_anchor_mid = s.pos(2);
+        odin_z_anchor_odin = z_o;
+        odin_z_anchor_ok = true;
+        std::cout << "[pv-z] odin_z_factor init fusion_z=" << odin_z_anchor_mid
+                  << " odin_z=" << odin_z_anchor_odin << std::endl;
+        return;
+    }
+    const double z_target = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
+    const double raw = z_target - s.pos(2);
+    const double abs_err = std::fabs(raw);
+    if (abs_err < 1e-6)
+        return;
+    const bool catching =
+        odin_z_factor_catch_err > 0.0 && abs_err > odin_z_factor_catch_err;
+    double max_step = odin_z_factor_max_innov;
+    double a = odin_z_factor_alpha;
+    if (catching)
+    {
+        max_step = std::max(max_step, odin_z_factor_catch_max);
+        a = std::max(a, odin_z_factor_catch_alpha);
+    }
+    double innov = raw;
+    if (max_step > 0.0 && abs_err > max_step)
+        innov = std::copysign(max_step, raw);
+    a = std::max(0.0, std::min(1.0, a));
+    s.pos(2) += a * innov;
+    s.vel(2) *= 0.5;
+    kf.change_x(s);
+    ++n_odin_z_factor;
+    if ((n_odin_z_factor % 50) == 1)
+        std::cout << "[pv-z] odin_z_factor innov=" << innov
+                  << " tgt=" << z_target << " z=" << s.pos(2)
+                  << " raw=" << raw << " odin_z=" << z_o
+                  << " n=" << n_odin_z_factor << std::endl;
 }
 
 // go2 residual_z post-update (ported from dual): single-level flat pull;
@@ -1233,6 +1288,13 @@ int main(int argc, char** argv)
                             0.0000000, 1.0000000, 0.0000000,
                             0.2385335, 0.0000000, 0.9711343});
     node->declare_parameter<bool>("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->declare_parameter<bool>("mapping.odin_z_factor_en", odin_z_factor_en);
+    node->declare_parameter<double>("mapping.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->declare_parameter<double>("mapping.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->declare_parameter<double>("mapping.odin_z_factor_max_dt", odin_z_factor_max_dt);
+    node->declare_parameter<double>("mapping.odin_z_factor_catch_err", odin_z_factor_catch_err);
+    node->declare_parameter<double>("mapping.odin_z_factor_catch_max", odin_z_factor_catch_max);
+    node->declare_parameter<double>("mapping.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->declare_parameter<std::string>("mapping.odin_odom_topic", odin_odom_topic);
     node->declare_parameter<double>("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->declare_parameter<double>("mapping.bundle_end_dt_max", bundle_end_dt_max);
@@ -1270,6 +1332,13 @@ int main(int argc, char** argv)
     node->get_parameter("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2);
     node->get_parameter("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2);
     node->get_parameter("mapping.odin_z_replace_en", odin_z_replace_en);
+    node->get_parameter("mapping.odin_z_factor_en", odin_z_factor_en);
+    node->get_parameter("mapping.odin_z_factor_alpha", odin_z_factor_alpha);
+    node->get_parameter("mapping.odin_z_factor_max_innov", odin_z_factor_max_innov);
+    node->get_parameter("mapping.odin_z_factor_max_dt", odin_z_factor_max_dt);
+    node->get_parameter("mapping.odin_z_factor_catch_err", odin_z_factor_catch_err);
+    node->get_parameter("mapping.odin_z_factor_catch_max", odin_z_factor_catch_max);
+    node->get_parameter("mapping.odin_z_factor_catch_alpha", odin_z_factor_catch_alpha);
     node->get_parameter("mapping.odin_bundle_z_band", odin_bundle_z_band);
     node->get_parameter("mapping.odin_odom_topic", odin_odom_topic);
     node->get_parameter("mapping.bundle_end_dt_max", bundle_end_dt_max);
@@ -1395,6 +1464,7 @@ int main(int argc, char** argv)
                   << " odin_floor_sc=" << odin_floor_info_scale
                   << " ml_h_min=" << residual_z_multilevel_h_min
                   << " odin_z_replace=" << odin_z_replace_en
+                  << " odin_z_factor=" << odin_z_factor_en
                   << " odin_bundle_z_band=" << odin_bundle_z_band
                   << "\nL2 wrt L1:\n" << LiDAR2_wrt_LiDAR1 << "\033[0m" << std::endl;
     }
@@ -1426,13 +1496,16 @@ int main(int argc, char** argv)
         imu_topic, imu_qos, imu_cbk);
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odin_odom;
-    if (odin_z_replace_en)
+    if (odin_z_replace_en || odin_z_factor_en)
     {
         auto odin_odom_qos = rclcpp::QoS(rclcpp::KeepLast(50)).reliable();
         sub_odin_odom = node->create_subscription<nav_msgs::msg::Odometry>(
             odin_odom_topic, odin_odom_qos, odin_odom_cbk);
         std::cout << "[pv-z] subscribe " << odin_odom_topic
-                  << " replace=1 (pose Z from Odin odom)" << std::endl;
+                  << " replace=" << odin_z_replace_en
+                  << " factor=" << odin_z_factor_en
+                  << " a=" << odin_z_factor_alpha
+                  << " max_innov=" << odin_z_factor_max_innov << std::endl;
     }
 
     auto pubLaserCloudFull = node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -1612,6 +1685,8 @@ int main(int argc, char** argv)
 
             if (flg_EKF_inited && !init_map) {
                 apply_odin_z_replace();
+                if (odin_z_factor_en)
+                    apply_odin_z_factor(Measures.lidar_end_time);
                 state_point = kf.get_x();
                 PointCloudXYZI::Ptr body_init = feats_undistort;
                 PointCloudXYZI::Ptr body_init_mid;
@@ -1809,14 +1884,20 @@ int main(int argc, char** argv)
                 have_last_good_state = true;
             }
 
-            // Optional hard Z replace (default OFF). Prefer residual_z below.
+            // Optional hard Z replace (default OFF).
             if (odin_z_replace_en && !state_bad)
             {
                 apply_odin_z_replace();
                 state_point = kf.get_x();
             }
-            // Soft Z / vz damp (dual residual_z) — keeps Bundle map consistent.
-            if (residual_z_en && !state_bad)
+            // Soft-follow Odin Δz to match onboard Z (best on this bag). No XY.
+            if (odin_z_factor_en && !state_bad)
+            {
+                apply_odin_z_factor(Measures.lidar_end_time);
+                state_point = kf.get_x();
+            }
+            // residual_z flat Z-pull fights Odin Z → skip when replace/factor on.
+            if (residual_z_en && !odin_z_replace_en && !odin_z_factor_en && !state_bad)
             {
                 apply_residual_z_flat();
                 state_point = kf.get_x();
@@ -1897,11 +1978,15 @@ int main(int argc, char** argv)
                                                  publish_frame_world(pubLaserCloudFull);
 
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
-            // Always publish Odin body cloud for RViz (even if dropped from IEKF).
+            // Odin viz: L2 is Mid-lidar frame; convert L1→IMU like Mid body cloud
+            // so Fixed Frame=body does not show Mid pitched vs Odin (run36).
             if (odin_body_viz && !odin_body_viz->empty())
             {
+                PointCloudXYZI::Ptr odin_imu(new PointCloudXYZI(odin_body_viz->size(), 1));
+                for (size_t i = 0; i < odin_body_viz->size(); ++i)
+                    RGBpointBodyLidarToIMU(&odin_body_viz->points[i], &odin_imu->points[i]);
                 sensor_msgs::msg::PointCloud2 odin_msg;
-                pcl::toROSMsg(*odin_body_viz, odin_msg);
+                pcl::toROSMsg(*odin_imu, odin_msg);
                 odin_msg.header.stamp = sec_to_stamp(lidar_end_time);
                 odin_msg.header.frame_id = "body";
                 pubOdinBody->publish(odin_msg);

@@ -88,6 +88,10 @@ Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
 
 数据：`/tmp/fastlio_multi_pvlio_run35/`。末段仍有走廊 Z 下沉（z_min≈−5），后续可再调 residual_z。
 
+**run43–44（相对 Δz replace）**：`z = z0_mid + (z_odin − z0_odin)` 可跟楼梯节奏，但全程比 Odin 低约 **0.20 m**（锚在 Mid 初值≈0）。观感高度偏矮。
+
+**run45**：改为 **绝对** `pose.z = /odin1/odometry.z`（XY/姿态仍由 Bundle IEKF），对齐 Odin 自带高度数字。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。
