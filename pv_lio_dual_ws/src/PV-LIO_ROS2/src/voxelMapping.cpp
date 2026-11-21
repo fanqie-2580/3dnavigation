@@ -517,84 +517,38 @@ void absorb_odin_z_flat(double z_o, double t_o, double fusion_z)
     ++n_odin_z_flat_hold;
 }
 
-// Hard replace fusion Z with Odin onboard odom Z (only an initial offset).
-// z_fusion = z_fusion0 + (z_odin - z_odin0). Optional flat-hold absorbs sink.
+// Dual XY/map unchanged. Z follows Odin Δz (keeps Mid map anchor; abs Z shears).
+// z = z_mid0 + (z_odin - z_odin0)
 void apply_odin_z_replace(double /*stamp*/)
 {
     if (!odin_z_replace_en)
         return;
-    double x_o = 0.0, y_o = 0.0, z_o = 0.0, t_o = -1.0;
+    double z_o = 0.0;
     {
         std::lock_guard<std::mutex> lk(mtx_odin_odom);
         if (!odin_odom_have)
             return;
-        x_o = odin_odom_x;
-        y_o = odin_odom_y;
         z_o = odin_odom_z;
-        t_o = odin_odom_stamp;
     }
     state_ikfom s = kf.get_x();
     if (!last_pf_z_valid)
     {
+        last_pf_z_valid = true;
         odin_z_anchor_mid = s.pos(2);
         odin_z_anchor_odin = z_o;
-        odin_xy_anchor_mid_x = s.pos(0);
-        odin_xy_anchor_mid_y = s.pos(1);
-        odin_xy_anchor_odin_x = x_o;
-        odin_xy_anchor_odin_y = y_o;
-        odin_xy_anchor_valid = true;
-        last_pf_z_valid = true;
-        last_pf_mid_z = s.pos(2);
-        last_pf_odin_z = z_o;
-        last_pf_odin_stamp = t_o;
-        std::cout << "[pv-z] odin_z_replace init fusion_z=" << odin_z_anchor_mid
-                  << " odin_z=" << odin_z_anchor_odin
-                  << " flat_hold=" << odin_z_flat_hold_en
-                  << " vz_thr=" << odin_z_flat_vz_thr << std::endl;
-        return;
-    }
-    if (!odin_xy_anchor_valid)
-    {
-        odin_xy_anchor_mid_x = s.pos(0);
-        odin_xy_anchor_mid_y = s.pos(1);
-        odin_xy_anchor_odin_x = x_o;
-        odin_xy_anchor_odin_y = y_o;
-        odin_xy_anchor_valid = true;
-    }
-    double vz = 0.0;
-    if (odin_z_is_flat_vz(z_o, t_o, &vz))
-    {
-        absorb_odin_z_flat(z_o, t_o, s.pos(2));
-        s.vel(2) = 0.0;
-        kf.change_x(s);
-        if ((n_odin_z_flat_hold % 50) == 1)
-            std::cout << "[pv-z] odin_z_flat_hold z=" << s.pos(2)
-                      << " odin_z=" << z_o << " vz=" << vz
-                      << " n=" << n_odin_z_flat_hold << std::endl;
+        std::cout << "[pv-z] odin_z_replace Δz init mid=" << odin_z_anchor_mid
+                  << " odin=" << odin_z_anchor_odin << std::endl;
         return;
     }
     const double z_new = odin_z_anchor_mid + (z_o - odin_z_anchor_odin);
-    if (odin_xyz_replace_en)
-    {
-        s.pos(0) = odin_xy_anchor_mid_x + (x_o - odin_xy_anchor_odin_x);
-        s.pos(1) = odin_xy_anchor_mid_y + (y_o - odin_xy_anchor_odin_y);
-        s.vel.setZero();
-    }
     s.pos(2) = z_new;
     s.vel(2) = 0.0;
-    apply_odin_att_replace(s);
     kf.change_x(s);
     ++n_odin_z_factor;
     last_pf_mid_z = z_new;
     last_pf_odin_z = z_o;
-    last_pf_odin_stamp = t_o;
-    if ((n_odin_z_factor % 50) == 1)
-        std::cout << "[pv-z] odin_z_replace"
-                  << (odin_xyz_replace_en ? "_xyz" : "")
-                  << " xyz=(" << s.pos(0) << "," << s.pos(1) << "," << z_new << ")"
-                  << " odin_z=" << z_o
-                  << " dz_odin=" << (z_o - odin_z_anchor_odin)
-                  << " vz=" << vz
+    if ((n_odin_z_factor % 100) == 1)
+        std::cout << "[pv-z] odin_dz z=" << z_new << " odin=" << z_o
                   << " n=" << n_odin_z_factor << std::endl;
 }
 
@@ -3171,31 +3125,17 @@ int main(int argc, char** argv)
                 }
             }
 
-            // Force Z from Odin on good frames. On bad frames pose hold already
-            // set XYZ — do not z-only replace after XY freeze (desync).
+            // Final Z from Odin odom (good or bad frame).
             if (odin_z_replace_en)
             {
+                apply_odin_z_replace(lidar_end_time);
+                state_point = kf.get_x();
                 if (!state_bad)
                 {
-                    state_ikfom s = kf.get_x();
-                    const double dz_iekf = s.pos(2) - state_before_update.pos(2);
-                    s.pos(2) = state_before_update.pos(2);
-                    s.vel(2) = 0.0;
-                    kf.change_x(s);
-                    static int n_mid_drop_z = 0;
-                    if ((++n_mid_drop_z % 50) == 1)
-                        std::cout << "[pv-z] drop_iekf_z dz=" << dz_iekf
-                                  << " replace=1 n=" << n_mid_drop_z << std::endl;
-                    apply_odin_z_replace(lidar_end_time);
-                    state_point = kf.get_x();
                     last_good_lidar_state = state_point;
                     last_good_P = kf.get_P();
                     have_last_good_lidar = true;
                     have_last_good_P = true;
-                }
-                else
-                {
-                    state_point = kf.get_x();
                 }
             }
 

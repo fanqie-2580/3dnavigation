@@ -92,6 +92,18 @@ Mid↔Bundle：`RMSE_xy≈1.54 m`、`RMSE_z≈3.42 m`（**Z 是主矛盾**）。
 
 **run45**：改为 **绝对** `pose.z = /odin1/odometry.z`（XY/姿态仍由 Bundle IEKF），对齐 Odin 自带高度数字。
 
+**run47（最小）**：PV-LIO Bundle 照常；**仅**在更新末尾 `pose.z = /odin1/odometry.z`。去掉 H_z 清零 / 预锁 Z / `ba_z` 等防御改动。
+
+**截图根因（坐标/外参，非 odom 数字）**：`/Odometry.z` 已跟 Odin，但 RViz 楼面叠层。同帧 `/cloud_registered`：Mid 近地 z≈3.45、Odin≈3.10（Δ≈0.35 m）。`Mid Ry(+13°)` 相对 go2/`dual` 的 `R=I` 把 Mid 楼面抬斜；远端约 `x·sin(13°)`。
+
+**run48**：外参改回 **dual/go2**（Mid `R=I` + 原 L2），仍只 `pose.z←Odin`。图仍叠层——Odin 点云进 Bundle 与 Mid 外参/俯仰不一致。
+
+**run49**：按“Z 用 Odin、其它用 PV-LIO”→ **`multi_lidar: false`**（纯 Mid 建图）+ `pose.z←/odin1/odometry`；关 residual_z；噪声对齐 go2。
+
+**dual_run_z**：dual + 绝对 Odin Z → 图被剪开（与 tune 注释一致）。
+
+**dual_run_z2**：dual 建图不变；Z 用 **Odin Δz**（`z=z_mid0+(z_odin−z_odin0)`），跟楼梯、不撕 Mid 楼面锚点。
+
 ## 构建 / 运行
 
 见 `/home/ll/fastlio_multi_pvlio_ws/README.md`。
